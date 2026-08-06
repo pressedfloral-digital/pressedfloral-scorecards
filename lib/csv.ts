@@ -76,7 +76,7 @@ export function parseRipplingEmployees(text: string): Employee[] {
     const annualPay = Number(getColumn(row, ["Annual Base Pay", "Annual Pay", "Salary", "annual_base_pay"]).replace(/[$,]/g, "")) || undefined;
     const hourlyRate = Number(getColumn(row, ["Hourly Rate", "Base Hourly Rate", "hourly_rate"]).replace(/[$,]/g, "")) || undefined;
     const grossEarnings = Number(getColumn(row, ["Gross Earnings", "Gross Pay", "Base Pay"]).replace(/[$,]/g, "")) || undefined;
-    const hoursWorked = Number(getColumn(row, ["Hours Worked", "Total hours worked", "Hours"]).replace(/[$,]/g, "")) || undefined;
+    const hoursWorked = Number(getColumn(row, ["Base pay hours", "Hours Worked", "Total hours worked", "Hours"]).replace(/[$,]/g, "")) || undefined;
     const payType: PayType = annualPay ? "salary" : "hourly";
     return {
       id: `csv-employee-${index}`,
