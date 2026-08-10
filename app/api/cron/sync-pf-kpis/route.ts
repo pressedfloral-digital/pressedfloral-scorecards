@@ -154,8 +154,70 @@ export async function GET(request: NextRequest) {
         .map((r) => [[r.goal_tier, r.location || "", r.department || "", r.goal_name].join("|"), r.actual_value])
     );
 
-    const diffPct = (computed: number, manual: number) =>
-      manual !== 0 ? Math.round((Math.abs(computed - manual) / manual) * 10000) / 100 : null;
+    // A percentage difference is undefined when manual is exactly 0 — except the special case
+    // where computed is also exactly 0, which is a genuine exact match (e.g. a flex-department
+    // goal correctly resolving to "no work there this period" on both sides), not a null/unknown.
+    const diffPct = (computed: number, manual: number) => {
+      if (manual === 0) return computed === 0 ? 0 : null;
+      return Math.round((Math.abs(computed - manual) / manual) * 10000) / 100;
+    };
+
+    // Already-submitted scorecards whose frozen goal.actual no longer matches what Ops
+    // Dashboard now computes — e.g. submitted before a mapping fix landed, or before a
+    // correction was pushed into the actuals table. A submitted scorecard renders from this
+    // frozen snapshot, never from the live actuals table, so a corrected value sitting in
+    // actuals has zero visible effect here until the scorecard is explicitly reopened.
+    //
+    // Scoped to `pending_review` only — approved (or legacy no-reviewer "submitted") scorecards
+    // are treated as final/already paid out, so they're deliberately left out of this automatic
+    // check. An admin can still reopen one of those by hand from its own card if truly needed.
+    const { data: pendingScorecardRows, error: pendingError } = await sb
+      .from("scorecards")
+      .select("id,employee_name,goals")
+      .eq("scorecard_month", period)
+      .eq("review_status", "pending_review");
+    if (pendingError) throw pendingError;
+
+    interface PendingScorecardGoal { name: string; goalTier: string; location?: string; department?: string; actual: number | null; }
+    const pendingScorecards = (pendingScorecardRows ?? []) as {
+      id: string; employee_name: string; goals: PendingScorecardGoal[];
+    }[];
+
+    const submittedMismatches = uniqueWrites.flatMap((w) => {
+      if (w.goalTier === "individual") {
+        // personalActualKey embeds the specific employee as "<goal name>::<employee name>".
+        const sepIdx = w.goalName.lastIndexOf("::");
+        if (sepIdx === -1) return [];
+        const plainName = w.goalName.slice(0, sepIdx);
+        const employeeName = w.goalName.slice(sepIdx + 2);
+        const sc = pendingScorecards.find((s) => s.employee_name === employeeName);
+        const g = sc?.goals.find((gg) => gg.name === plainName && gg.goalTier === "individual");
+        if (!sc || !g || g.actual === null || g.actual === undefined) return [];
+        const pct = diffPct(w.value, g.actual);
+        if (pct !== null && pct < MATCH_TOLERANCE_PCT) return [];
+        return [{
+          scorecardId: sc.id, employeeName,
+          goalTier: w.goalTier, location: w.location, department: w.department, goalName: w.goalName,
+          frozenValue: g.actual, computedValue: w.value, diffPct: pct,
+        }];
+      }
+      // Department/company tier: shared across everyone that goal appears on — check every
+      // pending scorecard's snapshot for a matching goal, not just one.
+      return pendingScorecards.flatMap((sc) => {
+        const g = sc.goals.find(
+          (gg) => gg.name === w.goalName && gg.goalTier === w.goalTier &&
+            (gg.department || "") === w.department && (gg.location || "") === w.location
+        );
+        if (!g || g.actual === null || g.actual === undefined) return [];
+        const pct = diffPct(w.value, g.actual);
+        if (pct !== null && pct < MATCH_TOLERANCE_PCT) return [];
+        return [{
+          scorecardId: sc.id, employeeName: sc.employee_name,
+          goalTier: w.goalTier, location: w.location, department: w.department, goalName: w.goalName,
+          frozenValue: g.actual, computedValue: w.value, diffPct: pct,
+        }];
+      });
+    });
 
     if (audit) {
       // Every goal we know how to map, compared against whatever's already in
@@ -199,6 +261,7 @@ export async function GET(request: NextRequest) {
         mapped: uniqueWrites.length,
         comparisons,
         unmatchedManualEntries,
+        submittedMismatches,
       });
     }
 
@@ -250,6 +313,7 @@ export async function GET(request: NextRequest) {
       skippedExisting: uniqueWrites.length - toWrite.length,
       unmapped: considered - writes.length,
       reviewRecommended,
+      submittedMismatches,
     });
   } catch (e) {
     console.error("sync-pf-kpis error:", e);

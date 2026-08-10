@@ -97,6 +97,12 @@ type PfSyncWrite = { goalTier: string; location: string; department: string; goa
 // A cell that already had a manual value which disagrees with what pf-dashboard now
 // computes — surfaced for a human to double-check, never auto-overwritten.
 type PfSyncReviewItem = { goalTier: string; location: string; department: string; goalName: string; manualValue: number; computedValue: number; diffPct: number | null };
+// A pending-review scorecard whose frozen actual no longer matches what Ops Dashboard now
+// computes — distinct from PfSyncReviewItem, which is about the shared actuals-table cell.
+type PfSubmittedMismatch = {
+  scorecardId: string; employeeName: string; goalTier: string; location: string; department: string;
+  goalName: string; frozenValue: number; computedValue: number; diffPct: number | null;
+};
 
 /** Derive a "First Last" candidate name from an email like kanon.foote@domain.com */
 function nameFromEmail(email: string): string {
@@ -1485,7 +1491,7 @@ export default function ScorecardsApp() {
   // made in Ops Dashboard after the automatic run, or backfilling a past
   // month. Fill-only-if-empty still applies: this can only add values into
   // currently-blank cells, never overwrite one that's already set.
-  async function syncPfDashboardKpis(month: string): Promise<{ synced: number; reviewRecommended: PfSyncReviewItem[] } | null> {
+  async function syncPfDashboardKpis(month: string): Promise<{ synced: number; reviewRecommended: PfSyncReviewItem[]; submittedMismatches: PfSubmittedMismatch[]; period: string } | null> {
     if (!sb) { showToast("Supabase is not connected.", "error"); return null; }
     const sessionResult = await sb.auth.getSession();
     const token = sessionResult.data.session?.access_token;
@@ -1506,9 +1512,9 @@ export default function ScorecardsApp() {
       return null;
     }
 
+    const period = body.period as string;
     const synced: PfSyncWrite[] = body.synced ?? [];
     if (synced.length > 0) {
-      const period = body.period as string;
       const nextActuals = { ...(appData.actuals[period] || {}) };
       for (const w of synced) {
         nextActuals[[w.goalTier, w.location, w.department, w.goalName].join("|")] = w.value;
@@ -1518,13 +1524,43 @@ export default function ScorecardsApp() {
     }
 
     const reviewRecommended: PfSyncReviewItem[] = body.reviewRecommended ?? [];
+    const submittedMismatches: PfSubmittedMismatch[] = body.submittedMismatches ?? [];
     const parts = [`Synced ${synced.length} value${synced.length === 1 ? "" : "s"} from Ops Dashboard.`];
     if (reviewRecommended.length > 0) {
       parts.push(`${reviewRecommended.length} already-filled value${reviewRecommended.length === 1 ? "" : "s"} may need review.`);
     }
+    if (submittedMismatches.length > 0) {
+      parts.push(`${submittedMismatches.length} submitted scorecard value${submittedMismatches.length === 1 ? "" : "s"} no longer match${submittedMismatches.length === 1 ? "es" : ""}.`);
+    }
     showToast(parts.join(" "));
 
-    return { synced: synced.length, reviewRecommended };
+    return { synced: synced.length, reviewRecommended, submittedMismatches, period };
+  }
+
+  // Overwrites one cell with the value Ops Dashboard currently computes — used from the
+  // "review recommended" list to accept a specific correction instead of leaving a stale
+  // manual/prior-sync value in place. Unlike the sync itself, this always writes (no
+  // fill-only-if-empty guard), since the whole point here is replacing an existing value.
+  async function applyPfSyncValue(item: PfSyncReviewItem, period: string): Promise<boolean> {
+    const key = [item.goalTier, item.location, item.department, item.goalName].join("|");
+    const nextActuals = { ...(appData.actuals[period] || {}), [key]: item.computedValue };
+    if (!isFixture && sb) {
+      const result = await sb.from("actuals").upsert({
+        period,
+        goal_tier: item.goalTier,
+        location: item.location || null,
+        department: item.department || null,
+        goal_name: item.goalName,
+        actual_value: item.computedValue,
+      }, { onConflict: "period,goal_tier,location,department,goal_name" });
+      if (result.error) {
+        showSupabaseError(result.error, "Actual could not be updated.");
+        return false;
+      }
+    }
+    setAppData((current) => ({ ...current, actuals: { ...current.actuals, [period]: nextActuals } }));
+    persistActuals(period, nextActuals);
+    return true;
   }
 
   async function saveMonthTarget(goal: Goal, period: string, type: "target" | "min", value: string) {
@@ -1822,6 +1858,7 @@ export default function ScorecardsApp() {
               editingGoal={editingGoal}
               teamEmployees={scopedEmployeesForProfile(latestRipplingEmployees, effectiveProfile, allRipplingEmployees)}
               allGoals={appData.goals}
+              scorecards={appData.scorecards}
               onMonth={setBankMonth}
               onFilters={setBankFilters}
               onActual={saveActual}
@@ -1833,6 +1870,8 @@ export default function ScorecardsApp() {
               onToggleMonth={toggleGoalForMonth}
               onAssignGoal={(goalId, employeeNames, startMonth) => employeeNames.forEach((name) => createGoalAssignment(goalId, name, startMonth))}
               onSyncPfKpis={syncPfDashboardKpis}
+              onApplyPfSyncValue={applyPfSyncValue}
+              onReopenScorecard={returnScorecard}
               isAdmin={effectiveProfile?.role === "admin"}
               companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
               allowedDepartments={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.departments || [])}
@@ -3143,6 +3182,7 @@ function GoalsScreen(props: {
   editingGoal: Goal | null;
   teamEmployees?: Employee[];
   allGoals?: Goal[];
+  scorecards?: Scorecard[];
   readonly?: boolean;
   onMonth: (value: string) => void;
   onFilters: (value: { types: string[]; location: string; departments: string[]; sort: string; showInactive: boolean }) => void;
@@ -3154,7 +3194,9 @@ function GoalsScreen(props: {
   onToggle: (goal: Goal) => void;
   onToggleMonth: (goal: Goal) => void;
   onAssignGoal?: (goalId: string, employeeNames: string[], startMonth: string) => void;
-  onSyncPfKpis?: (month: string) => Promise<{ synced: number; reviewRecommended: PfSyncReviewItem[] } | null>;
+  onSyncPfKpis?: (month: string) => Promise<{ synced: number; reviewRecommended: PfSyncReviewItem[]; submittedMismatches: PfSubmittedMismatch[]; period: string } | null>;
+  onApplyPfSyncValue?: (item: PfSyncReviewItem, period: string) => Promise<boolean>;
+  onReopenScorecard?: (scorecardId: string, note: string) => Promise<void>;
   isAdmin?: boolean;
   companyGoalAccess?: boolean;
   allowedDepartments?: string[];
@@ -3169,16 +3211,139 @@ function GoalsScreen(props: {
   const [assignStartMonth, setAssignStartMonth] = useState(props.month);
   const [pfSyncLoading, setPfSyncLoading] = useState(false);
   const [pfSyncReview, setPfSyncReview] = useState<PfSyncReviewItem[] | null>(null);
+  const [pfSubmittedMismatches, setPfSubmittedMismatches] = useState<PfSubmittedMismatch[] | null>(null);
+  const [pfSyncPeriod, setPfSyncPeriod] = useState<string | null>(null);
+  const [pfApplyingKeys, setPfApplyingKeys] = useState<Set<string>>(new Set());
+  const [pfApplyingAll, setPfApplyingAll] = useState(false);
+  const [pfMismatchApplyingIds, setPfMismatchApplyingIds] = useState<Set<string>>(new Set());
+  const [pfMismatchApplyingAll, setPfMismatchApplyingAll] = useState(false);
+
+  const pfReviewKey = (r: Pick<PfSyncReviewItem, "goalTier" | "location" | "department" | "goalName">) =>
+    [r.goalTier, r.location, r.department, r.goalName].join("|");
+
+  // Which already-submitted scorecards an "Update" for this item would silently NOT reach.
+  // Once a scorecard is submitted (and not returned) it renders from its own frozen snapshot,
+  // never from the live actuals table — so writing a corrected value here has zero visible
+  // effect until that scorecard is explicitly reopened and resubmitted.
+  const frozenScorecardsForReviewItem = (r: PfSyncReviewItem): Scorecard[] => {
+    if (!pfSyncPeriod || !props.scorecards) return [];
+    const isFrozen = (sc: Scorecard) => sc.scorecardMonth === pfSyncPeriod && sc.reviewStatus !== "returned";
+    if (r.goalTier === "individual") {
+      // personalActualKey embeds the specific employee as "<goal name>::<employee name>".
+      const sepIdx = r.goalName.lastIndexOf("::");
+      if (sepIdx === -1) return [];
+      const employeeName = r.goalName.slice(sepIdx + 2);
+      const sc = props.scorecards.find((s) => s.employeeName === employeeName && isFrozen(s));
+      return sc ? [sc] : [];
+    }
+    // Department/company tier: shared across everyone that goal appears on — some may have
+    // already submitted while others haven't, so check every frozen scorecard for a matching goal.
+    return props.scorecards.filter((sc) => isFrozen(sc) && sc.goals.some((g) => g.name === r.goalName && g.goalTier === r.goalTier));
+  };
+
+  // Reopens every already-submitted scorecard an item's value wouldn't otherwise reach, then
+  // applies the corrected value. Deliberately stops there — reopened cards land in "Returned"
+  // status for a person to review and resubmit themselves, never auto-resubmitted, so a
+  // corrected number is never silently locked back into someone's bonus without a human look.
+  const reopenAndApplyItems = async (items: PfSyncReviewItem[], reopenFirst: boolean) => {
+    if (!props.onApplyPfSyncValue || !pfSyncPeriod) return items;
+    const reopenedIds = new Set<string>();
+    const remaining: PfSyncReviewItem[] = [];
+    for (const item of items) {
+      if (reopenFirst && props.onReopenScorecard) {
+        for (const sc of frozenScorecardsForReviewItem(item)) {
+          if (reopenedIds.has(sc.id)) continue;
+          reopenedIds.add(sc.id);
+          await props.onReopenScorecard(sc.id, "Reopened to apply an Ops Dashboard correction.");
+        }
+      }
+      const ok = await props.onApplyPfSyncValue(item, pfSyncPeriod);
+      if (!ok) remaining.push(item);
+    }
+    return remaining;
+  };
 
   const handleSyncPfKpis = async () => {
     if (!props.onSyncPfKpis || pfSyncLoading) return;
     setPfSyncLoading(true);
     setPfSyncReview(null);
+    setPfSubmittedMismatches(null);
+    setPfSyncPeriod(null);
     try {
       const result = await props.onSyncPfKpis(props.month);
       setPfSyncReview(result?.reviewRecommended ?? null);
+      setPfSubmittedMismatches(result?.submittedMismatches ?? null);
+      setPfSyncPeriod(result?.period ?? null);
     } finally {
       setPfSyncLoading(false);
+    }
+  };
+
+  const handleApplyPfSyncValue = async (item: PfSyncReviewItem, reopenFirst = false) => {
+    if (!props.onApplyPfSyncValue || !pfSyncPeriod) return;
+    const key = pfReviewKey(item);
+    setPfApplyingKeys((prev) => new Set(prev).add(key));
+    try {
+      const remaining = await reopenAndApplyItems([item], reopenFirst);
+      if (remaining.length === 0) setPfSyncReview((prev) => (prev ? prev.filter((r) => pfReviewKey(r) !== key) : prev));
+    } finally {
+      setPfApplyingKeys((prev) => { const next = new Set(prev); next.delete(key); return next; });
+    }
+  };
+
+  const handleApplyAllPfSyncValues = async (reopenFirst = false) => {
+    if (!props.onApplyPfSyncValue || !pfSyncPeriod || !pfSyncReview || pfApplyingAll) return;
+    setPfApplyingAll(true);
+    try {
+      setPfSyncReview(await reopenAndApplyItems(pfSyncReview, reopenFirst));
+    } finally {
+      setPfApplyingAll(false);
+    }
+  };
+
+  // Always reopens (that's the entire point of this list) then applies the corrected value —
+  // stops at "Returned" status, same as the plain review-list reopen flow, so a person still
+  // reviews and resubmits before it counts toward bonus again.
+  const applyMismatch = async (m: PfSubmittedMismatch): Promise<boolean> => {
+    if (!props.onApplyPfSyncValue || !pfSyncPeriod) return false;
+    if (props.onReopenScorecard) {
+      await props.onReopenScorecard(m.scorecardId, "Reopened — submitted value no longer matched Ops Dashboard.");
+    }
+    return props.onApplyPfSyncValue(
+      { goalTier: m.goalTier, location: m.location, department: m.department, goalName: m.goalName, manualValue: m.frozenValue, computedValue: m.computedValue, diffPct: m.diffPct },
+      pfSyncPeriod
+    );
+  };
+
+  const handleFixSubmittedMismatch = async (m: PfSubmittedMismatch) => {
+    setPfMismatchApplyingIds((prev) => new Set(prev).add(m.scorecardId + "|" + pfReviewKey(m)));
+    try {
+      const ok = await applyMismatch(m);
+      if (ok) {
+        const key = pfReviewKey(m);
+        setPfSubmittedMismatches((prev) => (prev ? prev.filter((r) => r.scorecardId !== m.scorecardId || pfReviewKey(r) !== key) : prev));
+        setPfSyncReview((prev) => (prev ? prev.filter((r) => pfReviewKey(r) !== key) : prev));
+      }
+    } finally {
+      setPfMismatchApplyingIds((prev) => { const next = new Set(prev); next.delete(m.scorecardId + "|" + pfReviewKey(m)); return next; });
+    }
+  };
+
+  const handleFixAllSubmittedMismatches = async () => {
+    if (!pfSubmittedMismatches || pfMismatchApplyingAll) return;
+    setPfMismatchApplyingAll(true);
+    try {
+      const remaining: PfSubmittedMismatch[] = [];
+      const fixedKeys = new Set<string>();
+      for (const m of pfSubmittedMismatches) {
+        const ok = await applyMismatch(m);
+        if (ok) fixedKeys.add(pfReviewKey(m));
+        else remaining.push(m);
+      }
+      setPfSubmittedMismatches(remaining);
+      setPfSyncReview((prev) => (prev ? prev.filter((r) => !fixedKeys.has(pfReviewKey(r))) : prev));
+    } finally {
+      setPfMismatchApplyingAll(false);
     }
   };
 
@@ -3458,25 +3623,137 @@ function GoalsScreen(props: {
 
         {pfSyncReview && pfSyncReview.length > 0 && (
           <div className="border-t border-border bg-amber-50 px-5 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-            <div className="flex items-center gap-1.5 font-medium">
-              <AlertTriangle className="size-3.5 shrink-0" />
-              {pfSyncReview.length} value{pfSyncReview.length === 1 ? "" : "s"} already filled in for this month, but Ops Dashboard now
-              computes something different — worth a double-check:
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 font-medium">
+                <AlertTriangle className="size-3.5 shrink-0" />
+                {pfSyncReview.length} value{pfSyncReview.length === 1 ? "" : "s"} already filled in for this month, but Ops Dashboard now
+                computes something different — worth a double-check:
+              </div>
+              {props.onApplyPfSyncValue && (() => {
+                const frozenCount = pfSyncReview.filter((r) => frozenScorecardsForReviewItem(r).length > 0).length;
+                return (
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 gap-1 border-amber-300 bg-transparent px-2 text-[11px] text-amber-900 hover:bg-amber-100 dark:text-amber-200"
+                      disabled={pfApplyingAll}
+                      onClick={() => handleApplyAllPfSyncValues(false)}
+                      title={frozenCount > 0
+                        ? `${frozenCount} of ${pfSyncReview.length} won't reach an already-submitted scorecard until it's reopened.`
+                        : undefined}
+                    >
+                      {pfApplyingAll ? "Updating…" : `Update all ${pfSyncReview.length}`}
+                    </Button>
+                    {frozenCount > 0 && props.onReopenScorecard && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 gap-1 border-[#9B2C2C]/40 bg-transparent px-2 text-[11px] text-[#9B2C2C] hover:bg-[#9B2C2C]/10"
+                        disabled={pfApplyingAll}
+                        onClick={() => handleApplyAllPfSyncValues(true)}
+                        title="Reopens every already-submitted scorecard these values affect, then applies all — reopened cards land in Returned status for a person to review and resubmit."
+                      >
+                        {pfApplyingAll ? "Working…" : `Reopen ${frozenCount} & update all`}
+                      </Button>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
             <ul className="mt-1 space-y-0.5 pl-5">
-              {pfSyncReview.map((r) => (
-                <li key={[r.goalTier, r.location, r.department, r.goalName].join("|")} className="list-disc">
-                  <span className="font-medium">{r.goalName}</span> ({locLabel(r.location)}/{r.department}) — entered:{" "}
-                  <span className="tabular-nums">{formatNumber(r.manualValue)}</span>, Ops Dashboard:{" "}
-                  <span className="tabular-nums">{formatNumber(r.computedValue)}</span>
-                </li>
-              ))}
+              {pfSyncReview.map((r) => {
+                const key = pfReviewKey(r);
+                const applying = pfApplyingKeys.has(key);
+                const frozenScorecards = frozenScorecardsForReviewItem(r);
+                const frozenNames = frozenScorecards.map((sc) => sc.employeeName);
+                return (
+                  <li key={key} className="list-disc">
+                    <span className="flex flex-wrap items-center gap-x-1.5">
+                      <span className="font-medium">{r.goalName}</span> ({locLabel(r.location)}/{r.department}) — entered:{" "}
+                      <span className="tabular-nums">{formatNumber(r.manualValue)}</span>, Ops Dashboard:{" "}
+                      <span className="tabular-nums">{formatNumber(r.computedValue)}</span>
+                      {props.onApplyPfSyncValue && (
+                        <button
+                          type="button"
+                          className="ml-1 text-[11px] font-medium underline decoration-dotted disabled:opacity-50"
+                          disabled={applying || pfApplyingAll}
+                          onClick={() => handleApplyPfSyncValue(r)}
+                        >
+                          {applying ? "Updating…" : "Update to Ops Dashboard value"}
+                        </button>
+                      )}
+                      {frozenNames.length > 0 && props.onReopenScorecard && (
+                        <button
+                          type="button"
+                          className="text-[11px] font-medium text-[#9B2C2C] underline decoration-dotted disabled:opacity-50"
+                          disabled={applying || pfApplyingAll}
+                          onClick={() => handleApplyPfSyncValue(r, true)}
+                        >
+                          {applying ? "Working…" : "Reopen & update"}
+                        </button>
+                      )}
+                    </span>
+                    {frozenNames.length > 0 && (
+                      <span className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-[#9B2C2C]">
+                        <AlertTriangle className="size-3 shrink-0" />
+                        Won't reach {frozenNames.join(", ")}'s already-submitted scorecard{frozenNames.length === 1 ? "" : "s"} — reopen to apply.
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         )}
-        {pfSyncReview && pfSyncReview.length === 0 && (
+        {pfSubmittedMismatches && pfSubmittedMismatches.length > 0 && (
+          <div className="border-t border-border bg-[#FDECEC] px-5 py-2 text-[12px] text-[#7A1F1F] dark:bg-[#3a1414] dark:text-[#f2b8b8]">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 font-medium">
+                <AlertTriangle className="size-3.5 shrink-0" />
+                {pfSubmittedMismatches.length} value{pfSubmittedMismatches.length === 1 ? "" : "s"} on an already-submitted scorecard
+                {pfSubmittedMismatches.length === 1 ? "" : "s"} no longer match{pfSubmittedMismatches.length === 1 ? "es" : ""} Ops Dashboard:
+              </div>
+              {props.onReopenScorecard && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 shrink-0 gap-1 border-[#7A1F1F]/40 bg-transparent px-2 text-[11px] text-[#7A1F1F] hover:bg-[#7A1F1F]/10 dark:text-[#f2b8b8]"
+                  disabled={pfMismatchApplyingAll}
+                  onClick={handleFixAllSubmittedMismatches}
+                  title="Reopens each affected scorecard and applies the corrected value — reopened cards land in Returned status for a person to review and resubmit."
+                >
+                  {pfMismatchApplyingAll ? "Working…" : `Reopen & update all ${pfSubmittedMismatches.length}`}
+                </Button>
+              )}
+            </div>
+            <ul className="mt-1 space-y-0.5 pl-5">
+              {pfSubmittedMismatches.map((m) => {
+                const applying = pfMismatchApplyingIds.has(m.scorecardId + "|" + pfReviewKey(m));
+                return (
+                  <li key={m.scorecardId + "|" + pfReviewKey(m)} className="list-disc">
+                    <span className="font-medium">{m.employeeName}</span> — <span className="font-medium">{m.goalName}</span> ({locLabel(m.location)}/{m.department}) — submitted:{" "}
+                    <span className="tabular-nums">{formatNumber(m.frozenValue)}</span>, Ops Dashboard:{" "}
+                    <span className="tabular-nums">{formatNumber(m.computedValue)}</span>
+                    {props.onReopenScorecard && (
+                      <button
+                        type="button"
+                        className="ml-1 text-[11px] font-medium underline decoration-dotted disabled:opacity-50"
+                        disabled={applying || pfMismatchApplyingAll}
+                        onClick={() => handleFixSubmittedMismatch(m)}
+                      >
+                        {applying ? "Working…" : "Reopen & update"}
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+        {pfSyncReview && pfSyncReview.length === 0 && (!pfSubmittedMismatches || pfSubmittedMismatches.length === 0) && (
           <div className="border-t border-border bg-muted/30 px-5 py-1.5 text-[11.5px] text-muted-foreground">
-            Synced from Ops Dashboard — everything already filled in matches.
+            Synced from Ops Dashboard — everything already filled in matches, including submitted scorecards.
           </div>
         )}
       </section>
