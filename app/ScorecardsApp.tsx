@@ -14,7 +14,7 @@ import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
 import { currentMonthValue, formatMonthLabel } from "../lib/periods";
 import { getReportingTree } from "../lib/reportingTree";
-import { computeScorecardCompletion, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   hydrateFromLocalStorage,
@@ -2248,7 +2248,7 @@ function PersonalScorecardPanel({
       ...g,
       scTarget: periodActuals[metaKey("target", g)] != null ? Number(periodActuals[metaKey("target", g)]) : g.goalValue,
       scMin: periodActuals[metaKey("min", g)] != null ? Number(periodActuals[metaKey("min", g)]) : g.minValue,
-      scActual: periodActuals[actualKey(g)] != null ? Number(periodActuals[actualKey(g)]) : null,
+      scActual: periodActuals[personalActualKey(g, myEmployee.name)] != null ? Number(periodActuals[personalActualKey(g, myEmployee.name)]) : null,
       scWeight: weightOverrides[g.name] != null ? weightOverrides[g.name] : (g.weight ?? 0),
     }));
   }, [myEmployee, allGoals, periodActuals, isQuarterly, periodISO, empSettings, goalAssignments]);
@@ -5063,7 +5063,7 @@ function LiveScorecardCard({
       const scWeight = weightOverrides[g.name] !== undefined
         ? (weightOverrides[g.name] === "" ? 0 : Number(weightOverrides[g.name]))
         : defaultWeight;
-      const bankActual = periodActuals[actualKey(g)] != null ? Number(periodActuals[actualKey(g)]) : null;
+      const bankActual = periodActuals[personalActualKey(g, employee.name)] != null ? Number(periodActuals[personalActualKey(g, employee.name)]) : null;
       return {
         ...g,
         scTarget: periodActuals[metaKey("target", g)] != null ? Number(periodActuals[metaKey("target", g)]) : g.goalValue,
