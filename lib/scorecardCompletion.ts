@@ -32,6 +32,21 @@ export function actualKey(goal: Pick<Goal, "goalTier" | "location" | "department
   return [goal.goalTier, goal.location || "", goal.department || "", name].join("|");
 }
 
+// Storage key for an individual-tier goal's *actual* value, scoped to one real employee even
+// when the goal itself is a role template (goal.employeeName unset). Unlike actualKey (which
+// falls back to goal.role and so collapses everyone sharing a role into one cell — correct for
+// target/min, which really are shared per tier, but wrong for an actual result, which is always
+// personal), this always disambiguates by the specific employee the value belongs to. Target/min
+// (metaKey) intentionally keep using actualKey/role — only the achieved number needs this.
+export function personalActualKey(
+  goal: Pick<Goal, "goalTier" | "location" | "department" | "name" | "role" | "employeeName">,
+  employeeName: string
+) {
+  if (goal.goalTier !== "individual") return actualKey(goal);
+  const who = goal.employeeName || employeeName;
+  return [goal.goalTier, goal.location || "", goal.department || "", `${goal.name}::${who}`].join("|");
+}
+
 // Mirrors ScorecardsScreen's goalsForEmployee (app/ScorecardsApp.tsx) — the base set of goals
 // a manager sees auto-attached to an employee's scorecard, before per-employee settings
 // (excluded/added goals) are applied.

@@ -8,7 +8,7 @@
 // the full rationale, including the two cases intentionally left unmapped
 // ("Team Ratio Attainment" for Resin, and any goal outside the patterns below).
 
-import { actualKey } from "./scorecardCompletion";
+import { actualKey, personalActualKey } from "./scorecardCompletion";
 import { formatMonthLabel } from "./periods";
 import type { Goal } from "./types";
 
@@ -45,6 +45,16 @@ interface PfMemberRatio {
 
 interface PfScorecardMonthData {
   memberRatios: PfMemberRatio[];
+}
+
+// A role-templated individual goal (goal.employeeName unset) applies to whoever currently
+// holds that role/department/location — same roster this app's own UI uses to decide who
+// sees the goal on their scorecard (see isGoalApplicable / resolveBaseGoalsForEmployee).
+export interface PfRosterEmployee {
+  name: string;
+  role: string;
+  department: string;
+  location: string;
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -87,16 +97,58 @@ function pickLocation(window: PfWindowResult, location: string): PfPeriodKpis {
 
 // ── Value resolution ─────────────────────────────────────────────────────────
 
-function resolveIndividualValue(goal: Goal, memberRatiosByLoc: Record<string, PfMemberRatio[]>): number | null {
-  if (!goal.employeeName) return null; // role-only template — no specific person to attribute a number to
-  const dept = goal.department || "";
-  if (!PF_DEPTS.has(dept)) return null;
+// Which real employees a given individual-tier goal currently applies to. Mirrors the exact
+// matching rule the app itself uses (LiveScorecardCard.isGoalApplicable /
+// resolveBaseGoalsForEmployee): an employeeName on the goal means it's already scoped to one
+// person; otherwise it's a role template and applies to everyone in the roster holding that
+// role/department/location right now.
+function employeesForIndividualGoal(goal: Goal, roster: PfRosterEmployee[]): string[] {
+  if (goal.employeeName) return [goal.employeeName];
+  return roster
+    .filter(
+      (e) =>
+        e.department === (goal.department || "") &&
+        (!goal.location || e.location === goal.location) &&
+        (!goal.role || e.role === goal.role)
+    )
+    .map((e) => e.name);
+}
+
+// Some individual goals track a person's ratio in a *different* department than the goal's own
+// department field — e.g. "Ratio- Preservation" filed under department=Fulfillment, for someone
+// who occasionally flexes into Preservation. goal.department is where the goal lives on the
+// employee's scorecard (used for roster matching above); the name suffix says which department's
+// ratio to actually pull. Mirrors the identical suffix pattern already used for the Operations
+// department-tier bucket further down.
+const FLEX_DEPT_SUFFIX_RE = /-\s*(Design|Preservation|Fulfillment|Resin)\s*$/i;
+
+function individualLookupDept(goal: Goal): { dept: string; isFlex: boolean } {
+  const suffixMatch = goal.name.match(FLEX_DEPT_SUFFIX_RE);
+  if (suffixMatch) {
+    const dept = suffixMatch[1][0].toUpperCase() + suffixMatch[1].slice(1).toLowerCase();
+    return { dept, isFlex: true };
+  }
+  return { dept: goal.department || "", isFlex: false };
+}
+
+function resolveIndividualValueForEmployee(
+  goal: Goal,
+  employeeName: string,
+  memberRatiosByLoc: Record<string, PfMemberRatio[]>
+): number | null {
   if (!RATIO_RE.test(goal.name)) return null;
+  const { dept, isFlex } = individualLookupDept(goal);
+  if (!PF_DEPTS.has(dept)) return null;
 
   const pool = memberRatiosByLoc[goal.location || ""] || [];
   const norm = (s: string) => s.trim().toLowerCase();
-  const match = pool.find((m) => norm(m.name) === norm(goal.employeeName!) && m.department === dept);
-  return match?.ratio ?? null;
+  const match = pool.find((m) => norm(m.name) === norm(employeeName) && m.department === dept);
+  if (match) return match.ratio ?? (isFlex ? 0 : null);
+  // No record at all for this employee in that department this period. For a flex-department
+  // goal that reliably means "didn't work there this month" — a real, reportable zero. For a
+  // goal's own primary department, absence more likely means missing data, so leave it unmapped
+  // instead of asserting a value.
+  return isFlex ? 0 : null;
 }
 
 function resolveDepartmentValue(goal: Goal, window: PfWindowResult): number | null {
@@ -168,8 +220,9 @@ function resolveCompanyValue(goal: Goal, window: PfWindowResult): number | null 
   return pickLocation(window, goal.location || "").combined.ratio;
 }
 
-function resolveValue(goal: Goal, window: PfWindowResult, memberRatiosByLoc: Record<string, PfMemberRatio[]>): number | null {
-  if (goal.goalTier === "individual") return resolveIndividualValue(goal, memberRatiosByLoc);
+// Company/department tiers only — individual tier is resolved separately, per matching
+// employee, since one goal can now produce several distinct writes (see computePfDashboardSync).
+function resolveValue(goal: Goal, window: PfWindowResult): number | null {
   if (goal.goalTier === "department") return resolveDepartmentValue(goal, window);
   if (goal.goalTier === "company") return resolveCompanyValue(goal, window);
   return null;
@@ -194,8 +247,9 @@ export async function computePfDashboardSync(params: {
   baseUrl: string;
   syncSecret: string;
   goals: Goal[]; // active goals only
+  roster: PfRosterEmployee[]; // this app's rippling_employees for targetMonth
 }): Promise<PfSyncResult> {
-  const { targetMonth, baseUrl, syncSecret, goals } = params;
+  const { targetMonth, baseUrl, syncSecret, goals, roster } = params;
   const period = formatMonthLabel(targetMonth);
 
   const [kpisData, scorecardData] = await Promise.all([
@@ -222,7 +276,19 @@ export async function computePfDashboardSync(params: {
   const writes: PfSyncWrite[] = [];
 
   for (const goal of goals) {
-    const value = resolveValue(goal, targetWindow, memberRatiosByLoc);
+    if (goal.goalTier === "individual") {
+      // A role template can apply to several people at once — write each of them their own
+      // value under their own key instead of guessing which one person it's "for".
+      for (const employeeName of employeesForIndividualGoal(goal, roster)) {
+        const value = resolveIndividualValueForEmployee(goal, employeeName, memberRatiosByLoc);
+        if (value === null || value === undefined || Number.isNaN(value)) continue;
+        const [goalTier, location, department, goalName] = personalActualKey(goal, employeeName).split("|");
+        writes.push({ goalId: goal.id, period, goalTier, location, department, goalName, value });
+      }
+      continue;
+    }
+
+    const value = resolveValue(goal, targetWindow);
     if (value === null || value === undefined || Number.isNaN(value)) continue;
 
     const [goalTier, location, department, goalName] = actualKey(goal).split("|");

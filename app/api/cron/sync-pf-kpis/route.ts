@@ -107,11 +107,27 @@ export async function GET(request: NextRequest) {
     if (goalsError) throw goalsError;
     const goals = (goalRows ?? []).map(goalFromRow);
 
+    // Roster for the target month — needed to resolve role-templated individual goals
+    // (no employeeName on the goal row) to the specific people who currently hold that
+    // role/department/location, same as the app's own scorecard-rendering logic.
+    const { data: rosterRows, error: rosterError } = await sb
+      .from("rippling_employees")
+      .select("full_name,role,department,location")
+      .eq("period", targetMonth);
+    if (rosterError) throw rosterError;
+    const roster = (rosterRows ?? []).map((r) => ({
+      name: r.full_name,
+      role: r.role ?? "",
+      department: r.department ?? "",
+      location: r.location ?? "",
+    }));
+
     const { period, considered, writes } = await computePfDashboardSync({
       targetMonth,
       baseUrl,
       syncSecret,
       goals,
+      roster,
     });
 
     // Multiple goals_bank rows can share the same (tier, location, department,
