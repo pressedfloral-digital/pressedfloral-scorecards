@@ -317,6 +317,13 @@ export default function ScorecardsApp() {
   const [resetLoading, setResetLoading] = useState(false);
   const [sb, setSb] = useState<SupabaseClient | null>(null);
   const [appData, setAppData] = useState<AppData>(() => cloneData(fixtureData));
+  // Full, unscoped goal set for the logged-in user's own Personal Scorecard tab. appData.goals
+  // is scoped to what a manager profile is allowed to *manage* (profile.departments/locations),
+  // which can exclude the manager's own department when they personally sit outside the team(s)
+  // they manage (e.g. a GM who is personally in Operations but manages Design/Preservation/
+  // Fulfillment/Resin) — that scoping is correct for team/goal-bank screens but must not also
+  // hide goals from that person's own scorecard, so it's tracked separately here.
+  const [myGoals, setMyGoals] = useState<Goal[]>(() => cloneData(fixtureData).goals);
   const [toast, setToast] = useState<{ message: string; type?: "success" | "error" } | null>(null);
   const [adminUsers, setAdminUsers] = useState<AdminManagedUser[]>([]);
   const [adminUsersLoading, setAdminUsersLoading] = useState(false);
@@ -698,6 +705,7 @@ export default function ScorecardsApp() {
       const employeeScorecardSettings: EmployeeScorecardSettings[] = dedupeSettings((settingsResult.data || []).map(employeeScorecardSettingsFromRow));
 
       setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
+      setMyGoals(goals);
       return;
     }
 
@@ -742,6 +750,7 @@ export default function ScorecardsApp() {
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
     setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
+    setMyGoals(rawGoals);
   }
 
   async function signIn() {
@@ -1838,7 +1847,7 @@ export default function ScorecardsApp() {
                   employeeName={effectiveProfile?.linkedEmployeeName || ""}
                   myEmployee={myEmployee}
                   periodType={effectiveProfile?.scorecardPeriodType}
-                  allGoals={appData.goals.filter((g) => g.active)}
+                  allGoals={myGoals.filter((g) => g.active)}
                   allActuals={appData.actuals}
                   rippling={appData.rippling}
                   goalAssignments={appData.goalAssignments}
