@@ -1067,6 +1067,15 @@ export default function ScorecardsApp() {
 
   const allRipplingEmployees = useMemo(() => Object.values(appData.rippling).flat(), [appData.rippling]);
 
+  // Employee names in the effective profile's own reporting tree (via Employee.manager) — lets a
+  // manager reopen/resubmit a scorecard for anyone under them, the same admin-only escape hatch
+  // ScorecardCard otherwise gates on isAdmin. Never includes the manager's own name (getReportingTree
+  // excludes the root), so a manager can't reopen their own scorecard through this path.
+  const reopenableEmployeeNames = useMemo(() => {
+    if (!effectiveProfile?.linkedEmployeeName) return new Set<string>();
+    return getReportingTree(effectiveProfile.linkedEmployeeName, allRipplingEmployees);
+  }, [effectiveProfile, allRipplingEmployees]);
+
   // Deduplicated employees: most recent period wins when the same name appears in multiple uploads
   const latestRipplingEmployees = useMemo(() => {
     const periods = Object.keys(appData.rippling).sort().reverse();
@@ -1916,6 +1925,7 @@ export default function ScorecardsApp() {
                 companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
                 allowedDepartments={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.departments || [])}
                 allowedLocations={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.locations || [])}
+                reopenableEmployeeNames={reopenableEmployeeNames}
                 currentUserEmail={currentUserEmail}
                 currentUserProfileId={effectiveProfile?.id}
                 reviewChainIds={reviewChainIds}
@@ -4387,6 +4397,7 @@ function ScorecardsScreen(props: {
   companyGoalAccess?: boolean;
   allowedDepartments?: string[];
   allowedLocations?: string[];
+  reopenableEmployeeNames?: Set<string>;
   currentUserEmail: string;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
@@ -4801,6 +4812,7 @@ function ScorecardsScreen(props: {
                     companyGoalAccess={props.companyGoalAccess}
                     allowedDepartments={props.allowedDepartments}
                     allowedLocations={props.allowedLocations}
+                    reopenableEmployeeNames={props.reopenableEmployeeNames}
                     currentUserEmail={props.currentUserEmail}
                     currentUserProfileId={props.currentUserProfileId}
                     reviewChainIds={props.reviewChainIds}
@@ -4911,6 +4923,7 @@ function ScorecardsScreen(props: {
                         companyGoalAccess={props.companyGoalAccess}
                         allowedDepartments={props.allowedDepartments}
                         allowedLocations={props.allowedLocations}
+                        reopenableEmployeeNames={props.reopenableEmployeeNames}
                         currentUserEmail={props.currentUserEmail}
                         currentUserProfileId={props.currentUserProfileId}
                         reviewChainIds={props.reviewChainIds}
@@ -5103,7 +5116,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, currentUserEmail, currentUserProfileId, reviewChainIds, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5130,6 +5143,7 @@ function LiveScorecardCard({
   companyGoalAccess?: boolean;
   allowedDepartments?: string[];
   allowedLocations?: string[];
+  reopenableEmployeeNames?: Set<string>;
   currentUserEmail: string;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
@@ -5329,7 +5343,7 @@ function LiveScorecardCard({
   // read-only review card takes over again.
   const displayedSubmitted = (submittedScorecard && submittedScorecard.reviewStatus !== "returned") ? submittedScorecard : lastSubmitted;
   if (displayedSubmitted) {
-    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} />;
+    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} />;
   }
   const returnedScorecard = !lastSubmitted && submittedScorecard?.reviewStatus === "returned" ? submittedScorecard : null;
 
@@ -5719,13 +5733,17 @@ function Metric({ label, value, highlight }: { label: string; value: string; hig
   return <div className="metric-card"><div className="mlabel">{label}</div><div className={`mval ${highlight ? "highlight" : ""}`}>{value}</div></div>;
 }
 
-function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, currentUserProfileId, reviewChainIds }: {
+function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds }: {
   scorecard: Scorecard;
   onDeleteGoal: (value: { scorecardId: string; goalName: string }) => void;
   onApprove: (scorecardId: string) => void;
   onReturn: (scorecardId: string, note: string) => void;
   onReopen?: (scorecardId: string, note: string) => void;
   isAdmin?: boolean;
+  // Whether the current viewer can use the Reopen escape hatch on this specific card — true for
+  // admins, or for a manager when this employee is in their reporting tree. Falls back to isAdmin
+  // when omitted so other ScorecardCard call sites (e.g. read-only history) keep prior behavior.
+  canReopen?: boolean;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
 }) {
@@ -5739,6 +5757,7 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
   // department/location and doesn't otherwise enforce the specific reviewer_id.
   const canReview = !!currentUserProfileId && !!scorecard.reviewerId &&
     (scorecard.reviewerId === currentUserProfileId || !!reviewChainIds?.has(scorecard.reviewerId));
+  const canReopenThis = canReopen ?? isAdmin;
   const achColor = scorecard.weightedAchievement >= 100 ? "#2D6B1A" : "var(--brick)";
   const effectiveHourly = scorecard.hours && scorecard.hours > 0
     ? ((scorecard.baseEarnings + scorecard.bonusAmount) / scorecard.hours).toFixed(2)
@@ -5779,7 +5798,7 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
           ) : (
             <Badge variant="success" className="shrink-0 font-medium">Submitted</Badge>
           )}
-          {(scorecard.reviewStatus === "approved" || !scorecard.reviewStatus) && isAdmin && onReopen && (
+          {(scorecard.reviewStatus === "approved" || !scorecard.reviewStatus) && canReopenThis && onReopen && (
             <button
               type="button"
               title={scorecard.reviewStatus === "approved" ? `Approved by ${scorecard.reviewedBy} · reopen to correct and recalculate` : "Reopen to correct and recalculate"}
@@ -5792,13 +5811,14 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
         </span>
       </div>
 
-      {/* Reopen an approved/submitted card — admin-only escape hatch for correcting a scorecard
-          that's already done, e.g. a bonus miscalculation discovered after the fact. Sends it
-          back to "returned" status just like a normal Return, so it recalculates live from
-          current goal/Rippling data and goes through the normal resubmit (+ re-approve, if a
-          reviewer is configured) flow. Trigger lives in the header pill; this only renders the
-          confirm panel on demand, so it doesn't take up a permanent row. */}
-      {reopening && (scorecard.reviewStatus === "approved" || !scorecard.reviewStatus) && isAdmin && onReopen && (
+      {/* Reopen an approved/submitted card — escape hatch for correcting a scorecard that's
+          already done, e.g. a bonus miscalculation discovered after the fact. Available to admins
+          for any card, and to managers for anyone in their reporting tree. Sends it back to
+          "returned" status just like a normal Return, so it recalculates live from current
+          goal/Rippling data and goes through the normal resubmit (+ re-approve, if a reviewer is
+          configured) flow. Trigger lives in the header pill; this only renders the confirm panel
+          on demand, so it doesn't take up a permanent row. */}
+      {reopening && (scorecard.reviewStatus === "approved" || !scorecard.reviewStatus) && canReopenThis && onReopen && (
         <div style={{ borderTop: "1px solid var(--border)", background: "var(--muted)", padding: "10px 16px", display: "flex", flexDirection: "column", gap: "6px" }}>
           <textarea
             autoFocus
