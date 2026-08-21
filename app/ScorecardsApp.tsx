@@ -4944,8 +4944,8 @@ const PROGRESS_STATUS_BADGE: Record<ScorecardCompletionStatus, { label: string; 
   no_scorecard_required: { label: "Not eligible", className: "text-muted-foreground" },
   not_started: { label: "Not started" },
   in_progress: { label: "In progress", style: { background: "#FEF3C7", color: "#92400E", borderColor: "#FDE68A" } },
-  ready: { label: "Ready to submit", style: { background: "#DCFCE7", color: "#166534", borderColor: "#BBF7D0" } },
-  pending_review: { label: "Pending Review", style: { background: "#FEF3C7", color: "#92400E", borderColor: "#FDE68A" } },
+  ready: { label: "Ready to submit", style: { background: "#DBEAFE", color: "#1E40AF", borderColor: "#BFDBFE" } },
+  pending_review: { label: "Pending Review", style: { background: "#F3E8FF", color: "#6B21A8", borderColor: "#E9D5FF" } },
   approved: { label: "Approved", style: { background: "#DCFCE7", color: "#166534", borderColor: "#BBF7D0" } },
   returned: { label: "Returned", style: { background: "#FEE2E2", color: "#991B1B", borderColor: "#FECACA" } },
 };
