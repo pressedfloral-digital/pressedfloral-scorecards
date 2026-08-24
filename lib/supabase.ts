@@ -127,6 +127,7 @@ export function profileFromRow(email: string, row: Record<string, any>): Manager
     departments: Array.isArray(row.departments) ? row.departments : [],
     locations: Array.isArray(row.locations) ? row.locations : [],
     linkedEmployeeName: typeof row.linked_employee_name === "string" && row.linked_employee_name.trim() ? row.linked_employee_name.trim() : undefined,
+    titleOverride: typeof row.title_override === "string" && row.title_override.trim() ? row.title_override.trim() : undefined,
   supervisorId: row.supervisor_id || undefined,
   scorecardPeriodType: row.scorecard_period_type === "quarterly" ? "quarterly" : "monthly",
   companyGoalsGrant: row.company_goals_grant === true

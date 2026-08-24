@@ -25,6 +25,7 @@ export type AdminManagedUser = {
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  titleOverride?: string;
   supervisorId?: string;
   scorecardPeriodType?: "monthly" | "quarterly";
   companyGoalsGrant?: boolean;
@@ -44,6 +45,7 @@ export type AdminUserPayload = {
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  titleOverride?: string;
   supervisorId?: string;
   scorecardPeriodType?: "monthly" | "quarterly";
   companyGoalsGrant?: boolean;
@@ -142,6 +144,7 @@ export function adminProfileToRow(userId: string, payload: AdminUserPayload) {
     departments: payload.departments,
     locations: payload.locations,
     linked_employee_name: payload.linkedEmployeeName || null,
+    title_override: payload.titleOverride || null,
     supervisor_id: payload.supervisorId || null,
     scorecard_period_type: payload.scorecardPeriodType || "monthly",
     company_goals_grant: payload.companyGoalsGrant === true

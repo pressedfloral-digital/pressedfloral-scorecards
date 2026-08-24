@@ -1098,7 +1098,12 @@ export default function ScorecardsApp() {
   const myEmployee = useMemo(() => {
     if (!effectiveProfile?.linkedEmployeeName) return null;
     const fromRippling = latestRipplingEmployees.find((e) => e.name === effectiveProfile.linkedEmployeeName);
-    if (fromRippling) return fromRippling;
+    if (fromRippling) {
+      // Apply title override from manager profile if set
+      return effectiveProfile.titleOverride
+        ? { ...fromRippling, role: effectiveProfile.titleOverride }
+        : fromRippling;
+    }
     // Fall back to most recent submitted scorecard for role/dept/location
     const latestSc = [...appData.scorecards]
       .filter((sc) => sc.employeeName === effectiveProfile.linkedEmployeeName)
@@ -1107,7 +1112,7 @@ export default function ScorecardsApp() {
       return {
         id: latestSc.employeeName,
         name: latestSc.employeeName,
-        role: latestSc.role,
+        role: effectiveProfile.titleOverride ?? latestSc.role,
         department: latestSc.department,
         location: latestSc.location,
         manager: "",
@@ -3007,6 +3012,7 @@ function UserPermissionForm(props: {
       departments: isManager ? (allDepts ? [] : draft.departments) : [],
       locations: isManager ? (allLocs ? [] : draft.locations) : [],
       linkedEmployeeName: draft.linkedEmployeeName || undefined,
+      titleOverride: (draft as AdminUserPayload & { titleOverride?: string }).titleOverride || undefined,
       supervisorId: (draft as AdminUserPayload & { supervisorId?: string }).supervisorId || undefined,
       allDepartments: !isManager || allDepts,
       allLocations: !isManager || allLocs,
@@ -3111,6 +3117,14 @@ function UserPermissionForm(props: {
               </SelectContent>
             </Select>
           </DrawerField>
+          <DrawerField label="Title override" className="flex-1 min-w-[180px]">
+            <Input
+              placeholder="e.g. General Manager (overrides Rippling title)"
+              value={(draft as AdminUserPayload & { titleOverride?: string }).titleOverride || ""}
+              onChange={(e) => setDraft({ ...draft, titleOverride: e.target.value } as typeof draft)}
+              aria-label="Title override"
+            />
+          </DrawerField>
         </div>
       )}
 
@@ -3160,6 +3174,7 @@ function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email:
     departments: isManager ? (allDepts ? [...departments] : user.departments) : [],
     locations: isManager ? (allLocs ? [...locations] : user.locations) : [],
     linkedEmployeeName: user.linkedEmployeeName || "",
+    titleOverride: user.titleOverride || "",
     supervisorId: user.supervisorId || "",
     allDepartments: allDepts,
     allLocations: allLocs,
