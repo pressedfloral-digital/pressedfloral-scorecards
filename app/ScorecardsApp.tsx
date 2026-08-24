@@ -3106,7 +3106,7 @@ function UserPermissionForm(props: {
         </div>
       )}
 
-      {draft.linkedEmployeeName && (
+      {(draft.linkedEmployeeName || draft.role === "manager") && (
         <div className="flex flex-wrap items-end gap-3">
           <DrawerField label="Scorecard period" className="w-[180px]">
             <Select value={(draft as AdminUserPayload).scorecardPeriodType ?? "monthly"} onValueChange={(v) => setDraft({ ...draft, scorecardPeriodType: v as "monthly" | "quarterly" })}>
