@@ -2591,7 +2591,7 @@ function RecentScorecards({ title, items, onMode, emptyText, hideName }: {
                   )}
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-[13.5px] font-medium text-foreground">{hideName ? sc.scorecardMonth : sc.employeeName}</span>
-                    <span className="block truncate text-[12px] text-muted-foreground">{hideName ? `${goalsMet}/${sc.goals.length} goals met` : `${sc.scorecardMonth} · ${sc.role}`}</span>
+                    <span className="block truncate text-[12px] text-muted-foreground">{hideName ? `${goalsMet}/${sc.goals.length} goals met` : ` · `}</span>
                   </span>
                   {sc.flag120 && (
                     <Badge variant="accent" className="hidden sm:inline-flex">
