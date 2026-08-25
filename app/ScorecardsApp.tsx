@@ -349,6 +349,17 @@ export default function ScorecardsApp() {
     [adminUsers]
   );
 
+  const titleOverrideMap = useMemo(
+    () => {
+      const map: Record<string, string> = {};
+      adminUsers.forEach((u) => {
+        if (u.linkedEmployeeName && u.titleOverride) map[u.linkedEmployeeName] = u.titleOverride;
+      });
+      return map;
+    },
+    [adminUsers]
+  );
+
   // Whether targetProfile (any profile, including an admin's "view as" target) can see/manage
   // company-tier goals: admin, granted directly, or a descendant of a granted manager in the
   // Rippling org chart. Falls back to the server-resolved flag for the real session when the
