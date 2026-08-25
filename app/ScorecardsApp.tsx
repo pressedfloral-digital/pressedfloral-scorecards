@@ -5450,7 +5450,7 @@ function LiveScorecardCard({
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13.5px] font-medium text-foreground">{employee.name}</span>
           <span className="block truncate text-[11.5px] text-muted-foreground">
-            {employee.role && titleOverrideMap[employee.name] ? titleOverrideMap[employee.name] : employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
+            {employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
           </span>
         </span>
         {currentGoals.length > 0 ? (
@@ -5803,7 +5803,7 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13.5px] font-medium text-foreground">{scorecard.employeeName}</span>
           <span className="block truncate text-[11.5px] text-muted-foreground">
-            {(titleOverrideMap[scorecard.employeeName] && scorecard.scorecardMonth >= formatMonthLabel(currentMonthValue())) ? titleOverrideMap[scorecard.employeeName] : scorecard.role}{scorecard.department ? ` · ${scorecard.department}` : ""}{scorecard.location ? ` · ${scorecard.location}` : ""}
+            {scorecard.role}{scorecard.department ? ` · ${scorecard.department}` : ""}{scorecard.location ? ` · ${scorecard.location}` : ""}
           </span>
         </span>
         <span className="hidden text-right sm:block">
