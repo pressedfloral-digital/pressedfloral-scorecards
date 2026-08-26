@@ -1076,7 +1076,7 @@ export default function ScorecardsApp() {
     });
   }, [appData.goals, appData.actuals, appData.rippling, bankFilters, bankMonth, effectiveProfile]);
 
-  const allRipplingEmployees = useMemo(() => Object.values(appData.rippling).flat(), [appData.rippling]);
+  const allRipplingEmployees = useMemo(() => { const employees = Object.values(appData.rippling).flat(); if (Object.keys(titleOverrideMap).length === 0) return employees; return employees.map((emp) => titleOverrideMap[emp.name] ? { ...emp, role: titleOverrideMap[emp.name] } : emp); }, [appData.rippling, titleOverrideMap]);
 
   // Employee names in the effective profile's own reporting tree (via Employee.manager) — lets a
   // manager reopen/resubmit a scorecard for anyone under them, the same admin-only escape hatch
