@@ -368,7 +368,7 @@ export default function ScorecardsApp() {
   }
 
   const [bankMonth, setBankMonth] = useState(currentMonthValue);
-  const [bankFilters, setBankFilters] = useState({ types: ["company", "department", "individual"] as string[], location: "", departments: [...departments] as string[], sort: "goalTier", showInactive: false });
+  const [bankFilters, setBankFilters] = useState({ types: ["company", "department", "individual"] as string[], location: "", departments: [...departments] as string[], sort: "goalTier", showInactive: false, search: "" });
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null);
 
   // Rippling uploads always target the previous (completed) month
@@ -1059,6 +1059,10 @@ export default function ScorecardsApp() {
     if (bankFilters.types.length > 0 && bankFilters.types.length < 3) goals = goals.filter((goal) => bankFilters.types.includes(goal.goalTier));
     if (bankFilters.location) goals = goals.filter((goal) => !goal.location || goal.location === bankFilters.location);
     if (bankFilters.departments.length < departments.length) goals = goals.filter((goal) => !goal.department || bankFilters.departments.includes(goal.department));
+    if (bankFilters.search.trim()) {
+      const q = bankFilters.search.trim().toLowerCase();
+      goals = goals.filter((goal) => [goal.name, goal.department, goal.location, goal.employeeName].filter(Boolean).join(" ").toLowerCase().includes(q));
+    }
     return [...goals].sort((a, b) => {
       const field = bankFilters.sort as keyof Goal;
       return String(a[field] || "").localeCompare(String(b[field] || "")) || a.name.localeCompare(b.name);
@@ -3194,7 +3198,7 @@ const ALL_LOCATIONS = "__all__";
 function GoalsScreen(props: {
   month: string;
   months: string[];
-  filters: { types: string[]; location: string; departments: string[]; sort: string; showInactive: boolean };
+  filters: { types: string[]; location: string; departments: string[]; sort: string; showInactive: boolean; search: string };
   goals: Goal[];
   actuals: ActualsByKey;
   allActuals: Record<string, ActualsByKey>;
@@ -3204,7 +3208,7 @@ function GoalsScreen(props: {
   scorecards?: Scorecard[];
   readonly?: boolean;
   onMonth: (value: string) => void;
-  onFilters: (value: { types: string[]; location: string; departments: string[]; sort: string; showInactive: boolean }) => void;
+  onFilters: (value: { types: string[]; location: string; departments: string[]; sort: string; showInactive: boolean; search: string }) => void;
   onActual: (goal: Goal, value: string, period?: string) => void;
   onEdit: (goal: Goal | null) => void;
   onSave: (goal: Goal) => Goal | null | void | Promise<Goal | null | void>;
@@ -3780,6 +3784,10 @@ function GoalsScreen(props: {
       {/* ── Filter bar ── */}
       <section style={{ padding: 0, borderBottom: "1px solid var(--border)" }}>
         <div className="flex flex-wrap items-center gap-2 px-4 py-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input value={props.filters.search} onChange={(e) => props.onFilters({ ...props.filters, search: e.target.value })} placeholder="Search goal, dept, location…" className="h-8 w-[200px] pl-8 text-[12px]" />
+          </div>
           <MultiSelectDropdown
             label="All types"
             triggerClassName="w-auto min-w-[7rem]"
@@ -3821,7 +3829,7 @@ function GoalsScreen(props: {
               <Checkbox id="goal-show-inactive" checked={props.filters.showInactive} onCheckedChange={(c) => props.onFilters({ ...props.filters, showInactive: c === true })} />
               <Label htmlFor="goal-show-inactive" className="cursor-pointer text-[12px] font-normal text-muted-foreground">Show inactive</Label>
             </div>
-            <Button variant="ghost" size="sm" className="text-[12px] font-normal text-muted-foreground" onClick={() => props.onFilters({ types: canManageCompany ? ["company", "department", "individual"] : ["department", "individual"], location: "", departments: [...departments], sort: "goalTier", showInactive: false })}>Reset</Button>
+            <Button variant="ghost" size="sm" className="text-[12px] font-normal text-muted-foreground" onClick={() => props.onFilters({ types: canManageCompany ? ["company", "department", "individual"] : ["department", "individual"], location: "", departments: [...departments], sort: "goalTier", showInactive: false, search: "" })}>Reset</Button>
           </div>
         </div>
       </section>
