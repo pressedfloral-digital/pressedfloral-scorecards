@@ -6,9 +6,9 @@
  * time to land in pf-dashboard). Vercel automatically adds
  * `Authorization: Bearer $CRON_SECRET` to the request.
  *
- * Can also be triggered manually — by an admin from the Scorecards UI (bearer
- * = their Supabase session token) or with `?month=2026-06` to backfill/re-run
- * a specific past month.
+ * Can also be triggered manually — by an admin or manager from the Scorecards
+ * UI (bearer = their Supabase session token) or with `?month=2026-06` to
+ * backfill/re-run a specific past month.
  *
  * Fill-only-if-empty: this route never overwrites a cell that already has a
  * value, whether that value came from a manager typing it in or from a prior
@@ -52,7 +52,7 @@ function bearerToken(request: NextRequest): string {
 
 // Vercel Cron sends CRON_SECRET; the "Sync from Ops Dashboard" button in the
 // UI sends the signed-in user's Supabase session token instead — either is
-// accepted, but a session token must belong to an admin.
+// accepted, but a session token must belong to an admin or manager.
 async function authorizeCaller(request: NextRequest, sb: SupabaseClient): Promise<NextResponse | null> {
   const token = bearerToken(request);
   if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -65,8 +65,8 @@ async function authorizeCaller(request: NextRequest, sb: SupabaseClient): Promis
     return NextResponse.json({ error: "Invalid session." }, { status: 401 });
   }
   const profileResult = await sb.from("manager_profiles").select("role").eq("id", userResult.data.user.id).maybeSingle();
-  if (profileResult.error || profileResult.data?.role !== "admin") {
-    return NextResponse.json({ error: "Admin access required." }, { status: 403 });
+  if (profileResult.error || (profileResult.data?.role !== "admin" && profileResult.data?.role !== "manager")) {
+    return NextResponse.json({ error: "Admin or manager access required." }, { status: 403 });
   }
   return null;
 }
