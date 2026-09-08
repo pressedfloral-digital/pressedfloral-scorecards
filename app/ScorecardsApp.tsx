@@ -1911,6 +1911,7 @@ export default function ScorecardsApp() {
               onApplyPfSyncValue={applyPfSyncValue}
               onReopenScorecard={returnScorecard}
               isAdmin={effectiveProfile?.role === "admin"}
+              canSyncPfKpis={roleAtLeast(effectiveProfile, "manager")}
               companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
               allowedDepartments={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.departments || [])}
               allowedLocations={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.locations || [])}
@@ -3247,6 +3248,7 @@ function GoalsScreen(props: {
   onApplyPfSyncValue?: (item: PfSyncReviewItem, period: string) => Promise<boolean>;
   onReopenScorecard?: (scorecardId: string, note: string) => Promise<void>;
   isAdmin?: boolean;
+  canSyncPfKpis?: boolean;
   companyGoalAccess?: boolean;
   allowedDepartments?: string[];
   allowedLocations?: string[];
@@ -3269,6 +3271,15 @@ function GoalsScreen(props: {
 
   const pfReviewKey = (r: Pick<PfSyncReviewItem, "goalTier" | "location" | "department" | "goalName">) =>
     [r.goalTier, r.location, r.department, r.goalName].join("|");
+
+  // Same dept/location scoping as scopedForProfile — a manager triggering the sync should only
+  // see review/mismatch items for goals they're actually over, not every department company-wide.
+  // allowedDepartments/allowedLocations are undefined (unrestricted) for admins.
+  const inAllowedScope = (item: { department: string; location: string }) => {
+    const deptOk = !props.allowedDepartments?.length || !item.department || props.allowedDepartments.includes(item.department);
+    const locOk = !props.allowedLocations?.length || !item.location || props.allowedLocations.includes(item.location);
+    return deptOk && locOk;
+  };
 
   // Which already-submitted scorecards an "Update" for this item would silently NOT reach.
   // Once a scorecard is submitted (and not returned) it renders from its own frozen snapshot,
@@ -3320,8 +3331,8 @@ function GoalsScreen(props: {
     setPfSyncPeriod(null);
     try {
       const result = await props.onSyncPfKpis(props.month);
-      setPfSyncReview(result?.reviewRecommended ?? null);
-      setPfSubmittedMismatches(result?.submittedMismatches ?? null);
+      setPfSyncReview(result?.reviewRecommended?.filter(inAllowedScope) ?? null);
+      setPfSubmittedMismatches(result?.submittedMismatches?.filter(inAllowedScope) ?? null);
       setPfSyncPeriod(result?.period ?? null);
     } finally {
       setPfSyncLoading(false);
@@ -3648,9 +3659,9 @@ function GoalsScreen(props: {
             </button>
           </div>
 
-          {/* Right: sync-from-Ops-Dashboard (admin only), else spacer to balance tabs */}
+          {/* Right: sync-from-Ops-Dashboard (manager+), else spacer to balance tabs */}
           <div style={{ width: "120px", display: "flex", justifyContent: "flex-end" }}>
-            {props.isAdmin && props.onSyncPfKpis ? (
+            {props.canSyncPfKpis && props.onSyncPfKpis ? (
               <Button
                 variant="outline"
                 size="sm"
