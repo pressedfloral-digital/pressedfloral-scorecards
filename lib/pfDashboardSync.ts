@@ -181,7 +181,7 @@ function resolveDepartmentValue(goal: Goal, window: PfWindowResult): number | nu
   }
 
   if (dept === "Operations") {
-    const suffixMatch = name.match(/-\s*(Design|Fulfillment|Preservation)\s*$/i);
+    const suffixMatch = name.match(/-\s*(Design|Fulfillment|Preservation|Resin)\s*$/i);
     if (suffixMatch) {
       const subDept = suffixMatch[1][0].toUpperCase() + suffixMatch[1].slice(1).toLowerCase();
       const metrics = period[DEPT_KEY[subDept]];
@@ -205,6 +205,10 @@ function resolveDepartmentValue(goal: Goal, window: PfWindowResult): number | nu
     // location's own blended figure (confirmed with the user).
     if (goal.location === "Utah" && name.trim() === "Combined Ratio Attainment") return period.combined.ratio;
     if (goal.location === "Utah" && name.trim() === "Cost Per Order") return period.combined.cpo;
+    // Georgia also has a plain, unsuffixed "Cost Per Order" goal at the
+    // Operations-rollup level — its own blended (Design+Fulfillment+
+    // Preservation) figure, same as Utah's above.
+    if (goal.location === "Georgia" && name.trim() === "Cost Per Order") return period.combined.cpo;
     // "Resin Ratio Attainment" is filed under the Operations bucket, not
     // department=Resin (confirmed against live goals_bank data).
     if (goal.location === "Utah" && name.trim() === "Resin Ratio Attainment") return period.resin.ratio;
