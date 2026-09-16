@@ -3787,6 +3787,11 @@ function GoalsScreen(props: {
                       ({locLabel(r.displayLocation ?? r.location)}/{r.displayDepartment ?? r.department}) — entered:{" "}
                       <span className="tabular-nums">{formatNumber(r.manualValue)}</span>, Ops Dashboard:{" "}
                       <span className="tabular-nums">{formatNumber(r.computedValue)}</span>
+                      {/* Rounded display can make two genuinely different values look identical
+                          (e.g. 0.5661 vs 0.57 both show as "0.57") — the diff makes clear it's real. */}
+                      {r.diffPct !== null && (
+                        <span className="text-[11px] text-amber-700/80 dark:text-amber-300/70">({r.diffPct.toFixed(2)}% diff)</span>
+                      )}
                       {props.onApplyPfSyncValue && (
                         <button
                           type="button"
