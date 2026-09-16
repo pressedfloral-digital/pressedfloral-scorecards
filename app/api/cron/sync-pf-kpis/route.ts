@@ -28,6 +28,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { goalFromRow } from "@/lib/supabase";
 import { computePfDashboardSync } from "@/lib/pfDashboardSync";
+import { currentMonthValue, formatMonthLabel, nextMonthValue } from "@/lib/periods";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -135,24 +136,33 @@ export async function GET(request: NextRequest) {
     // the identical value anyway, so dedupe by conflict-target key up front: a
     // single upsert() batch can't affect the same row twice, and it keeps the
     // synced/skipped counts meaningful (per unique cell, not per raw goal row).
-    const keyOf = (w: { goalTier: string; location: string; department: string; goalName: string }) =>
-      [w.goalTier, w.location, w.department, w.goalName].join("|");
+    // Goal/Min writes (goalTier "__meta__") target the current and next calendar month —
+    // independent of `period`, which is whatever historical month the Actuals half above is
+    // backfilling. Writes now span more than one period, so every key below includes the
+    // period explicitly (previously safe to omit, since every write shared the same `period`).
+    const keyOf = (w: { period: string; goalTier: string; location: string; department: string; goalName: string }) =>
+      [w.period, w.goalTier, w.location, w.department, w.goalName].join("|");
     const uniqueWrites = Array.from(new Map(writes.map((w) => [keyOf(w), w])).values());
 
-    // Existing actuals for this period, regardless of value — used both for
+    const thisMonthPeriod = formatMonthLabel(currentMonthValue());
+    const nextMonthPeriod = formatMonthLabel(nextMonthValue(currentMonthValue()));
+    const periodsToCheck = Array.from(new Set([period, thisMonthPeriod, nextMonthPeriod]));
+
+    // Existing actuals for the relevant periods, regardless of value — used both for
     // fill-only-if-empty (normal mode) and for the manual-vs-computed diff
-    // (audit mode, and the "review recommended" list in normal mode).
+    // (audit mode, and the "review recommended" list in normal mode). Meta (Goal/Min)
+    // rows are included here too — their goal_tier/location/department are always
+    // "__meta__"/null/null, so keyOf can't collide with a normal actual row's key.
     const { data: existingRows, error: existingError } = await sb
       .from("actuals")
-      .select("goal_tier,location,department,goal_name,actual_value")
-      .eq("period", period);
+      .select("period,goal_tier,location,department,goal_name,actual_value")
+      .in("period", periodsToCheck);
     if (existingError) throw existingError;
 
-    const existingByKey = new Map(
-      (existingRows ?? [])
-        .filter((r) => r.goal_tier !== "__meta__")
-        .map((r) => [[r.goal_tier, r.location || "", r.department || "", r.goal_name].join("|"), r.actual_value])
-    );
+    const rowKeyOf = (r: { period: string; goal_tier: string; location: string | null; department: string | null; goal_name: string }) =>
+      [r.period, r.goal_tier, r.location || "", r.department || "", r.goal_name].join("|");
+
+    const existingByKey = new Map((existingRows ?? []).map((r) => [rowKeyOf(r), r.actual_value]));
 
     // A percentage difference is undefined when manual is exactly 0 — except the special case
     // where computed is also exactly 0, which is a genuine exact match (e.g. a flex-department
@@ -184,6 +194,9 @@ export async function GET(request: NextRequest) {
     }[];
 
     const submittedMismatches = uniqueWrites.flatMap((w) => {
+      // Goal/Min (meta) writes target the still-open current/next month, which by definition
+      // can't have an already-submitted scorecard yet — nothing to reconcile against here.
+      if (w.goalTier === "__meta__") return [];
       if (w.goalTier === "individual") {
         // personalActualKey embeds the specific employee as "<goal name>::<employee name>".
         const sepIdx = w.goalName.lastIndexOf("::");
@@ -228,6 +241,7 @@ export async function GET(request: NextRequest) {
           const hasManual = manualValue !== undefined && manualValue !== null;
           const pct = hasManual ? diffPct(w.value, manualValue) : null;
           return {
+            period: w.period,
             goalTier: w.goalTier,
             location: w.location,
             department: w.department,
@@ -236,6 +250,10 @@ export async function GET(request: NextRequest) {
             manualValue: hasManual ? manualValue : null,
             match: hasManual ? pct !== null && pct < MATCH_TOLERANCE_PCT : null,
             diffPct: pct,
+            displayLocation: w.displayLocation,
+            displayDepartment: w.displayDepartment,
+            displayGoalName: w.displayGoalName,
+            variant: w.variant,
           };
         })
         .sort((a, b) => (a.match === b.match ? 0 : a.match ? 1 : -1)); // mismatches first
@@ -251,7 +269,7 @@ export async function GET(request: NextRequest) {
             r.goal_tier !== "__meta__" &&
             r.actual_value !== null &&
             coveredDepts.has(r.department || "") &&
-            !mappedKeys.has([r.goal_tier, r.location || "", r.department || "", r.goal_name].join("|"))
+            !mappedKeys.has(rowKeyOf(r))
         )
         .map((r) => ({ goalTier: r.goal_tier, location: r.location, department: r.department, goalName: r.goal_name, manualValue: r.actual_value }));
 
@@ -280,6 +298,7 @@ export async function GET(request: NextRequest) {
       .map((w) => {
         const manualValue = existingByKey.get(keyOf(w))!;
         return {
+          period: w.period,
           goalTier: w.goalTier,
           location: w.location,
           department: w.department,
@@ -287,6 +306,10 @@ export async function GET(request: NextRequest) {
           manualValue,
           computedValue: w.value,
           diffPct: diffPct(w.value, manualValue),
+          displayLocation: w.displayLocation,
+          displayDepartment: w.displayDepartment,
+          displayGoalName: w.displayGoalName,
+          variant: w.variant,
         };
       })
       .filter((r) => r.diffPct === null || r.diffPct >= MATCH_TOLERANCE_PCT);

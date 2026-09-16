@@ -93,10 +93,20 @@ type Screen = "landing" | "setup" | "scorecard" | "history" | "rippling" | "guid
 type HistoryView = "table" | "scorecard" | "grid" | "chart";
 
 // A value the pf-dashboard KPI sync (app/api/cron/sync-pf-kpis) wrote into `actuals`.
-type PfSyncWrite = { goalTier: string; location: string; department: string; goalName: string; value: number };
+// displayLocation/displayDepartment/displayGoalName/variant are set only for Goal/Min
+// (meta) writes, whose goalName is an opaque metaKey string — they carry the
+// human-readable goal/location/department so the UI doesn't have to decode the key.
+type PfSyncWrite = {
+  period: string; goalTier: string; location: string; department: string; goalName: string; value: number;
+  displayLocation?: string; displayDepartment?: string; displayGoalName?: string; variant?: "goal" | "min";
+};
 // A cell that already had a manual value which disagrees with what pf-dashboard now
 // computes — surfaced for a human to double-check, never auto-overwritten.
-type PfSyncReviewItem = { goalTier: string; location: string; department: string; goalName: string; manualValue: number; computedValue: number; diffPct: number | null };
+type PfSyncReviewItem = {
+  period: string; goalTier: string; location: string; department: string; goalName: string;
+  manualValue: number; computedValue: number; diffPct: number | null;
+  displayLocation?: string; displayDepartment?: string; displayGoalName?: string; variant?: "goal" | "min";
+};
 // A pending-review scorecard whose frozen actual no longer matches what Ops Dashboard now
 // computes — distinct from PfSyncReviewItem, which is about the shared actuals-table cell.
 type PfSubmittedMismatch = {
@@ -1553,12 +1563,28 @@ export default function ScorecardsApp() {
     const period = body.period as string;
     const synced: PfSyncWrite[] = body.synced ?? [];
     if (synced.length > 0) {
-      const nextActuals = { ...(appData.actuals[period] || {}) };
+      // Goal/Min (meta) writes target the current/next calendar month, not necessarily
+      // `period` (whatever historical month Actuals were backfilled for) — group by each
+      // write's own period instead of assuming they all share one.
+      const byPeriod = new Map<string, PfSyncWrite[]>();
       for (const w of synced) {
-        nextActuals[[w.goalTier, w.location, w.department, w.goalName].join("|")] = w.value;
+        if (!byPeriod.has(w.period)) byPeriod.set(w.period, []);
+        byPeriod.get(w.period)!.push(w);
       }
-      setAppData((current) => ({ ...current, actuals: { ...current.actuals, [period]: nextActuals } }));
-      persistActuals(period, nextActuals);
+      const updatedPeriods: [string, ActualsByKey][] = [];
+      for (const [writePeriod, writesForPeriod] of byPeriod) {
+        const nextActuals = { ...(appData.actuals[writePeriod] || {}) };
+        for (const w of writesForPeriod) {
+          const key = w.goalTier === "__meta__" ? w.goalName : [w.goalTier, w.location, w.department, w.goalName].join("|");
+          nextActuals[key] = w.value;
+        }
+        updatedPeriods.push([writePeriod, nextActuals]);
+      }
+      setAppData((current) => ({
+        ...current,
+        actuals: { ...current.actuals, ...Object.fromEntries(updatedPeriods) },
+      }));
+      for (const [writePeriod, nextActuals] of updatedPeriods) persistActuals(writePeriod, nextActuals);
     }
 
     const reviewRecommended: PfSyncReviewItem[] = body.reviewRecommended ?? [];
@@ -1580,7 +1606,7 @@ export default function ScorecardsApp() {
   // manual/prior-sync value in place. Unlike the sync itself, this always writes (no
   // fill-only-if-empty guard), since the whole point here is replacing an existing value.
   async function applyPfSyncValue(item: PfSyncReviewItem, period: string): Promise<boolean> {
-    const key = [item.goalTier, item.location, item.department, item.goalName].join("|");
+    const key = item.goalTier === "__meta__" ? item.goalName : [item.goalTier, item.location, item.department, item.goalName].join("|");
     const nextActuals = { ...(appData.actuals[period] || {}), [key]: item.computedValue };
     if (!isFixture && sb) {
       const result = await sb.from("actuals").upsert({
@@ -3269,8 +3295,20 @@ function GoalsScreen(props: {
   const [pfMismatchApplyingIds, setPfMismatchApplyingIds] = useState<Set<string>>(new Set());
   const [pfMismatchApplyingAll, setPfMismatchApplyingAll] = useState(false);
 
-  const pfReviewKey = (r: Pick<PfSyncReviewItem, "goalTier" | "location" | "department" | "goalName">) =>
-    [r.goalTier, r.location, r.department, r.goalName].join("|");
+  // A single sync run covers this month's and next month's Goal/Min together, so
+  // pfSyncReview can hold items for more than one period at once — scope what's shown
+  // (and what "Update all" affects) to whichever month tab is currently open. Items for
+  // other months stay in state and reappear when that tab is opened instead.
+  const currentBankPeriod = formatMonthLabel(props.month);
+  const visiblePfSyncReview = (pfSyncReview ?? []).filter((r) => r.period === currentBankPeriod);
+  const hiddenPfSyncReview = (pfSyncReview ?? []).filter((r) => r.period !== currentBankPeriod);
+
+  // Includes `period` (when present) so that two meta (Goal/Min) items sharing the same
+  // period-independent metaKey goalName — e.g. this month's vs. next month's synced Goal for
+  // the same goal — don't collide into a single key. PfSubmittedMismatch has no period field
+  // (that flow only ever touches a single period), so it falls back to "" there.
+  const pfReviewKey = (r: Pick<PfSyncReviewItem, "goalTier" | "location" | "department" | "goalName"> & { period?: string }) =>
+    [r.goalTier, r.location, r.department, r.goalName, r.period ?? ""].join("|");
 
   // Same dept/location scoping as scopedForProfile — a manager triggering the sync should only
   // see review/mismatch items for goals they're actually over, not every department company-wide.
@@ -3286,8 +3324,8 @@ function GoalsScreen(props: {
   // never from the live actuals table — so writing a corrected value here has zero visible
   // effect until that scorecard is explicitly reopened and resubmitted.
   const frozenScorecardsForReviewItem = (r: PfSyncReviewItem): Scorecard[] => {
-    if (!pfSyncPeriod || !props.scorecards) return [];
-    const isFrozen = (sc: Scorecard) => sc.scorecardMonth === pfSyncPeriod && sc.reviewStatus !== "returned";
+    if (!props.scorecards) return [];
+    const isFrozen = (sc: Scorecard) => sc.scorecardMonth === r.period && sc.reviewStatus !== "returned";
     if (r.goalTier === "individual") {
       // personalActualKey embeds the specific employee as "<goal name>::<employee name>".
       const sepIdx = r.goalName.lastIndexOf("::");
@@ -3306,7 +3344,7 @@ function GoalsScreen(props: {
   // status for a person to review and resubmit themselves, never auto-resubmitted, so a
   // corrected number is never silently locked back into someone's bonus without a human look.
   const reopenAndApplyItems = async (items: PfSyncReviewItem[], reopenFirst: boolean) => {
-    if (!props.onApplyPfSyncValue || !pfSyncPeriod) return items;
+    if (!props.onApplyPfSyncValue) return items;
     const reopenedIds = new Set<string>();
     const remaining: PfSyncReviewItem[] = [];
     for (const item of items) {
@@ -3317,7 +3355,7 @@ function GoalsScreen(props: {
           await props.onReopenScorecard(sc.id, "Reopened to apply an Ops Dashboard correction.");
         }
       }
-      const ok = await props.onApplyPfSyncValue(item, pfSyncPeriod);
+      const ok = await props.onApplyPfSyncValue(item, item.period);
       if (!ok) remaining.push(item);
     }
     return remaining;
@@ -3340,7 +3378,7 @@ function GoalsScreen(props: {
   };
 
   const handleApplyPfSyncValue = async (item: PfSyncReviewItem, reopenFirst = false) => {
-    if (!props.onApplyPfSyncValue || !pfSyncPeriod) return;
+    if (!props.onApplyPfSyncValue) return;
     const key = pfReviewKey(item);
     setPfApplyingKeys((prev) => new Set(prev).add(key));
     try {
@@ -3352,10 +3390,11 @@ function GoalsScreen(props: {
   };
 
   const handleApplyAllPfSyncValues = async (reopenFirst = false) => {
-    if (!props.onApplyPfSyncValue || !pfSyncPeriod || !pfSyncReview || pfApplyingAll) return;
+    if (!props.onApplyPfSyncValue || visiblePfSyncReview.length === 0 || pfApplyingAll) return;
     setPfApplyingAll(true);
     try {
-      setPfSyncReview(await reopenAndApplyItems(pfSyncReview, reopenFirst));
+      const remaining = await reopenAndApplyItems(visiblePfSyncReview, reopenFirst);
+      setPfSyncReview([...hiddenPfSyncReview, ...remaining]);
     } finally {
       setPfApplyingAll(false);
     }
@@ -3370,7 +3409,7 @@ function GoalsScreen(props: {
       await props.onReopenScorecard(m.scorecardId, "Reopened — submitted value no longer matched Ops Dashboard.");
     }
     return props.onApplyPfSyncValue(
-      { goalTier: m.goalTier, location: m.location, department: m.department, goalName: m.goalName, manualValue: m.frozenValue, computedValue: m.computedValue, diffPct: m.diffPct },
+      { period: pfSyncPeriod, goalTier: m.goalTier, location: m.location, department: m.department, goalName: m.goalName, manualValue: m.frozenValue, computedValue: m.computedValue, diffPct: m.diffPct },
       pfSyncPeriod
     );
   };
@@ -3549,7 +3588,12 @@ function GoalsScreen(props: {
             <Badge variant={on ? "success" : "secondary"} className="font-medium">{on ? "Active" : "Inactive"}</Badge>
           </TableCell>
           <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
-            {canEdit ? (
+            {/* Goal-editing actions (edit/deactivate/assign/delete) need canEdit — locked once a
+                past month's 14-day goal-edit window closes. Entering an actual has its own,
+                longer window (canActual, 21 days) and stays available on its own after that —
+                so the trigger itself must show whenever EITHER permission still allows something,
+                not just when canEdit does, or a still-valid "Enter actual" becomes unreachable. */}
+            {(canEdit || canActual) ? (
               <DropdownMenu>
                 <DropdownMenuTrigger
                   aria-label="Goal actions"
@@ -3558,27 +3602,33 @@ function GoalsScreen(props: {
                   <MoreHorizontal className="size-4" />
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-56">
-                  <DropdownMenuItem onClick={() => props.onEdit(goal)}>Edit goal</DropdownMenuItem>
+                  {canEdit && <DropdownMenuItem onClick={() => props.onEdit(goal)}>Edit goal</DropdownMenuItem>}
                   {canActual && hasTargets ? (
                     <DropdownMenuItem onClick={() => setActualEditId(goal.id)}>Enter actual</DropdownMenuItem>
                   ) : canActual ? (
                     <DropdownMenuItem disabled>Set goal first</DropdownMenuItem>
                   ) : null}
-                  {goal.goalTier === "company" && canManageCompany && props.onAssignGoal && (
+                  {canEdit && goal.goalTier === "company" && canManageCompany && props.onAssignGoal && (
                     <DropdownMenuItem onClick={() => { setAssigningGoal(goal); setAssignEmployeeNames([]); setAssignStartMonth(props.month); }}>
                       Add to individual scorecard
                     </DropdownMenuItem>
                   )}
-                  <DropdownMenuItem onClick={() => activeInMonth ? setConfirmDeactivate(goal) : props.onToggle(goal)}>
-                    {activeInMonth ? "Deactivate goal" : "Reactivate goal"}
-                  </DropdownMenuItem>
-                  {activeInMonth && (
+                  {canEdit && (
+                    <DropdownMenuItem onClick={() => activeInMonth ? setConfirmDeactivate(goal) : props.onToggle(goal)}>
+                      {activeInMonth ? "Deactivate goal" : "Reactivate goal"}
+                    </DropdownMenuItem>
+                  )}
+                  {canEdit && activeInMonth && (
                     <DropdownMenuItem onClick={() => props.onToggleMonth(goal)}>
                       {isMonthlyInactive(goal) ? "Include this month" : "Skip this month only"}
                     </DropdownMenuItem>
                   )}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem variant="destructive" onClick={() => props.onDelete(goal.id)}>Delete from this month forward</DropdownMenuItem>
+                  {canEdit && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem variant="destructive" onClick={() => props.onDelete(goal.id)}>Delete from this month forward</DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : null}
@@ -3681,16 +3731,16 @@ function GoalsScreen(props: {
           <div className="border-t border-border bg-muted/30 px-5 py-1.5 text-[11.5px] text-muted-foreground">{monthStatus}</div>
         )}
 
-        {pfSyncReview && pfSyncReview.length > 0 && (
+        {visiblePfSyncReview.length > 0 && (
           <div className="border-t border-border bg-amber-50 px-5 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 font-medium">
                 <AlertTriangle className="size-3.5 shrink-0" />
-                {pfSyncReview.length} value{pfSyncReview.length === 1 ? "" : "s"} already filled in for this month, but Ops Dashboard now
+                {visiblePfSyncReview.length} value{visiblePfSyncReview.length === 1 ? "" : "s"} already filled in for {currentBankPeriod}, but Ops Dashboard now
                 computes something different — worth a double-check:
               </div>
               {props.onApplyPfSyncValue && (() => {
-                const frozenCount = pfSyncReview.filter((r) => frozenScorecardsForReviewItem(r).length > 0).length;
+                const frozenCount = visiblePfSyncReview.filter((r) => frozenScorecardsForReviewItem(r).length > 0).length;
                 return (
                   <div className="flex shrink-0 items-center gap-1.5">
                     <Button
@@ -3700,10 +3750,10 @@ function GoalsScreen(props: {
                       disabled={pfApplyingAll}
                       onClick={() => handleApplyAllPfSyncValues(false)}
                       title={frozenCount > 0
-                        ? `${frozenCount} of ${pfSyncReview.length} won't reach an already-submitted scorecard until it's reopened.`
+                        ? `${frozenCount} of ${visiblePfSyncReview.length} won't reach an already-submitted scorecard until it's reopened.`
                         : undefined}
                     >
-                      {pfApplyingAll ? "Updating…" : `Update all ${pfSyncReview.length}`}
+                      {pfApplyingAll ? "Updating…" : `Update all ${visiblePfSyncReview.length}`}
                     </Button>
                     {frozenCount > 0 && props.onReopenScorecard && (
                       <Button
@@ -3722,7 +3772,7 @@ function GoalsScreen(props: {
               })()}
             </div>
             <ul className="mt-1 space-y-0.5 pl-5">
-              {pfSyncReview.map((r) => {
+              {visiblePfSyncReview.map((r) => {
                 const key = pfReviewKey(r);
                 const applying = pfApplyingKeys.has(key);
                 const frozenScorecards = frozenScorecardsForReviewItem(r);
@@ -3730,7 +3780,11 @@ function GoalsScreen(props: {
                 return (
                   <li key={key} className="list-disc">
                     <span className="flex flex-wrap items-center gap-x-1.5">
-                      <span className="font-medium">{r.goalName}</span> ({locLabel(r.location)}/{r.department}) — entered:{" "}
+                      <span className="font-medium">
+                        {r.displayGoalName ?? r.goalName}
+                        {r.variant ? ` — ${r.variant === "goal" ? "Goal" : "Min"}` : ""}
+                      </span>{" "}
+                      ({locLabel(r.displayLocation ?? r.location)}/{r.displayDepartment ?? r.department}) — entered:{" "}
                       <span className="tabular-nums">{formatNumber(r.manualValue)}</span>, Ops Dashboard:{" "}
                       <span className="tabular-nums">{formatNumber(r.computedValue)}</span>
                       {props.onApplyPfSyncValue && (
@@ -3811,7 +3865,7 @@ function GoalsScreen(props: {
             </ul>
           </div>
         )}
-        {pfSyncReview && pfSyncReview.length === 0 && (!pfSubmittedMismatches || pfSubmittedMismatches.length === 0) && (
+        {pfSyncReview && visiblePfSyncReview.length === 0 && (!pfSubmittedMismatches || pfSubmittedMismatches.length === 0) && (
           <div className="border-t border-border bg-muted/30 px-5 py-1.5 text-[11.5px] text-muted-foreground">
             Synced from Ops Dashboard — everything already filled in matches, including submitted scorecards.
           </div>
