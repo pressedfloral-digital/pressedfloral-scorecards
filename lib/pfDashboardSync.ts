@@ -9,12 +9,14 @@
 // ("Team Ratio Attainment" for Resin, and any goal outside the patterns below).
 //
 // Alongside the achieved-value sync above, this also fills in the *target*
-// numbers (Goal/Min) for the current and next calendar month, for the same
-// CPO- and production-shaped goals, from pf-dashboard's own forward-looking
-// "goal"/"expected" projections (`estimated.current`/`estimated.next`). Ratio
-// goals are intentionally excluded from this half — pf-dashboard's ratio
-// targets aren't part of this request, only CPO and the two named
-// production goals ("Monthly Frame Goal", "Frames Sealed").
+// numbers (Goal/Min) for the current and next calendar month, for every
+// department/company-tier CPO- or production-shaped goal resolvable above,
+// plus the single ratio-shaped goal named "Combined Ratio Attainment" (any
+// department/location) — see RATIO_GOAL_MIN_NAME below for why it alone.
+// Sourced from pf-dashboard's own forward-looking "goal"/"expected"
+// projections (`estimated.current`/`estimated.next`). Individual-tier goals
+// are still excluded from this half; those are resolved per-employee above
+// and aren't part of this request.
 
 import { actualKey, personalActualKey } from "./scorecardCompletion";
 import { formatMonthLabel, currentMonthValue, nextMonthValue } from "./periods";
@@ -250,8 +252,11 @@ function resolveDepartmentValue(goal: Goal, variant: PfRatioVariant): TierResolu
     if (goal.location === "Utah" && name.trim() === "Cost Per Order") return wrap(period.combined.cpo, "cpo");
     // Georgia also has a plain, unsuffixed "Cost Per Order" goal at the
     // Operations-rollup level — its own blended (Design+Fulfillment+
-    // Preservation) figure, same as Utah's above.
+    // Preservation) figure, same as Utah's above. Georgia's plain, unsuffixed
+    // "Combined Ratio Attainment" is the same story, alongside its own
+    // Design/Fulfillment/Preservation-suffixed siblings (confirmed with the user).
     if (goal.location === "Georgia" && name.trim() === "Cost Per Order") return wrap(period.combined.cpo, "cpo");
+    if (goal.location === "Georgia" && name.trim() === "Combined Ratio Attainment") return wrap(period.combined.ratio, "ratio");
     // "Resin Ratio Attainment" is filed under the Operations bucket, not
     // department=Resin (confirmed against live goals_bank data).
     if (goal.location === "Utah" && name.trim() === "Resin Ratio Attainment") return wrap(period.resin.ratio, "ratio");
@@ -350,11 +355,16 @@ export async function computePfDashboardSync(params: {
   }
 
   // ── Goal/Min sync — this month and next month's forward-looking targets ──
-  // Only department/company-tier, CPO- or production-shaped goals (ratio goals
-  // are out of scope for this — see file header). Sourced from pf-dashboard's
-  // own "goal"/"expected" projections for the current and next calendar month,
-  // independent of whatever historical `targetMonth` the Actuals half above is
-  // backfilling.
+  // Department/company-tier goals only (individual tier is resolved per-employee
+  // elsewhere and isn't part of this). CPO- and production-shaped goals are all in
+  // scope; ratio-shaped goals are scoped down to just the literal "Combined Ratio
+  // Attainment" goal (any department/location) — the other ratio goals ("Company
+  // Ratio attainment", the Operations-rollup "... - Design/Fulfillment/Preservation"
+  // splits, "Resin Ratio Attainment", etc.) are intentionally left out, confirmed
+  // with the user. Sourced from pf-dashboard's own "goal"/"expected" projections for
+  // the current and next calendar month, independent of whatever historical
+  // `targetMonth` the Actuals half above is backfilling.
+  const RATIO_GOAL_MIN_NAME = "Combined Ratio Attainment";
   const estimated: { current?: PfEstimatedMonthResult; next?: PfEstimatedMonthResult } = kpisData.estimated ?? {};
   const thisMonth = currentMonthValue();
   const monthBuckets: { period: string; goalVariant?: PfRatioVariant; expectedVariant?: PfRatioVariant }[] = [
@@ -370,7 +380,8 @@ export async function computePfDashboardSync(params: {
       if (goal.goalTier !== "department" && goal.goalTier !== "company") continue;
 
       const goalResult = resolveTierValue(goal, bucket.goalVariant);
-      if (!goalResult || goalResult.kind === "ratio") continue;
+      if (!goalResult) continue;
+      if (goalResult.kind === "ratio" && goal.name.trim() !== RATIO_GOAL_MIN_NAME) continue;
       const expectedResult = resolveTierValue(goal, bucket.expectedVariant);
       if (!expectedResult) continue;
 
