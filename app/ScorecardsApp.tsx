@@ -342,6 +342,10 @@ export default function ScorecardsApp() {
   // Every profile id anywhere below the current user in the supervisor chain — lets a manager
   // approve/return a scorecard assigned to a subordinate (at any depth) who's unavailable.
   const [reviewChainIds, setReviewChainIds] = useState<Set<string>>(new Set());
+  // Display name of the current user's own supervisor — the person any scorecard the current
+  // user submits (their own, or a direct report's) routes to for review/approval. Shown on
+  // "Pending Review" cards in Team Scorecards so it's clear who a submission is waiting on.
+  const [reviewerName, setReviewerName] = useState<string | null>(null);
   const [employeePeriodTypes, setEmployeePeriodTypes] = useState<Record<string, "monthly" | "quarterly">>({});
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceLoading, setMaintenanceLoading] = useState(false);
@@ -541,6 +545,9 @@ export default function ScorecardsApp() {
         frontier = children;
       }
       setReviewChainIds(chain);
+      // The person any scorecard viewAsProfile submits routes to — their own supervisor.
+      const viewAsReviewer = viewAsProfile.supervisorId ? adminUsers.find((u) => u.id === viewAsProfile.supervisorId) : undefined;
+      setReviewerName(viewAsReviewer ? (viewAsReviewer.linkedEmployeeName || viewAsReviewer.email) : null);
       return;
     }
     // Normal mode: fetch on login so badge count is accurate from the start.
@@ -565,6 +572,12 @@ export default function ScorecardsApp() {
           }
           if (Array.isArray(body.descendantIds)) {
             setReviewChainIds(new Set(body.descendantIds.map((id: unknown) => String(id))));
+          }
+          if (body.reviewer && typeof body.reviewer === "object") {
+            const name = typeof body.reviewer.name === "string" && body.reviewer.name.trim() ? body.reviewer.name.trim() : body.reviewer.email;
+            setReviewerName(typeof name === "string" && name ? name : null);
+          } else {
+            setReviewerName(null);
           }
         })
         .catch(() => {});
@@ -1976,6 +1989,7 @@ export default function ScorecardsApp() {
                 currentUserEmail={currentUserEmail}
                 currentUserProfileId={effectiveProfile?.id}
                 reviewChainIds={reviewChainIds}
+                reviewerName={reviewerName ?? undefined}
                 employeePeriodTypes={employeePeriodTypes}
                 onDeactivateEmployee={roleAtLeast(effectiveProfile, "manager") ? deactivateEmployee : undefined}
                 focusEmployeeKey={scorecardFocus?.employeeKey ?? null}
@@ -4505,6 +4519,8 @@ function ScorecardsScreen(props: {
   currentUserEmail: string;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
+  // Display name of the current user's own supervisor — who a scorecard routes to for review.
+  reviewerName?: string;
   employeePeriodTypes?: Record<string, "monthly" | "quarterly">;
   onDeactivateEmployee?: (employeeName: string, isoMonth: string, mode: "month" | "from" | "reactivate") => void;
   // Set by a "Go to scorecard" to-do link — scrolls to and auto-expands this employee's card.
@@ -4920,6 +4936,7 @@ function ScorecardsScreen(props: {
                     currentUserEmail={props.currentUserEmail}
                     currentUserProfileId={props.currentUserProfileId}
                     reviewChainIds={props.reviewChainIds}
+                    reviewerName={props.reviewerName}
                     autoOpen={!!props.focusEmployeeKey && props.focusEmployeeKey === (emp.id || emp.name)}
                     autoOpenNonce={props.focusNonce}
                   />
@@ -5031,6 +5048,7 @@ function ScorecardsScreen(props: {
                         currentUserEmail={props.currentUserEmail}
                         currentUserProfileId={props.currentUserProfileId}
                         reviewChainIds={props.reviewChainIds}
+                        reviewerName={props.reviewerName}
                       />
                     );
                   })}
@@ -5220,7 +5238,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5251,6 +5269,7 @@ function LiveScorecardCard({
   currentUserEmail: string;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
+  reviewerName?: string;
   autoOpen?: boolean;
   autoOpenNonce?: number;
 }) {
@@ -5447,7 +5466,7 @@ function LiveScorecardCard({
   // read-only review card takes over again.
   const displayedSubmitted = (submittedScorecard && submittedScorecard.reviewStatus !== "returned") ? submittedScorecard : lastSubmitted;
   if (displayedSubmitted) {
-    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} />;
+    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} reviewerName={reviewerName} />;
   }
   const returnedScorecard = !lastSubmitted && submittedScorecard?.reviewStatus === "returned" ? submittedScorecard : null;
 
@@ -5837,7 +5856,7 @@ function Metric({ label, value, highlight }: { label: string; value: string; hig
   return <div className="metric-card"><div className="mlabel">{label}</div><div className={`mval ${highlight ? "highlight" : ""}`}>{value}</div></div>;
 }
 
-function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds }: {
+function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName }: {
   scorecard: Scorecard;
   onDeleteGoal: (value: { scorecardId: string; goalName: string }) => void;
   onApprove: (scorecardId: string) => void;
@@ -5850,6 +5869,10 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
   canReopen?: boolean;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
+  // Name of the manager this scorecard was submitted to for review/approval — the current
+  // viewer's own supervisor, since that's who any scorecard they (or their reports) submit
+  // routes to. Shown on the "Pending Review" state in Team Scorecards.
+  reviewerName?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [returning, setReturning] = useState(false);
@@ -5883,6 +5906,11 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
           <span className="block truncate text-[11.5px] text-muted-foreground">
             {scorecard.role}{scorecard.department ? ` · ${scorecard.department}` : ""}{scorecard.location ? ` · ${scorecard.location}` : ""}
           </span>
+          {scorecard.reviewStatus === "pending_review" && reviewerName && (
+            <span className="block truncate text-[11px] text-muted-foreground">
+              Submitted to {reviewerName} for review and approval
+            </span>
+          )}
         </span>
         <span className="hidden text-right sm:block">
           <span className="block text-[10px] uppercase tracking-wide text-muted-foreground">Achievement</span>
