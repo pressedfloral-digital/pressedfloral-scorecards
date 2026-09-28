@@ -27,6 +27,33 @@ export async function GET(request: NextRequest) {
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
+  // Resolve the caller's own reviewer (their supervisor) — the person any scorecard the caller
+  // submits (their own, or a direct report's) routes to for review/approval. Used to show
+  // "submitted to <name> for review" on Pending Review cards in Team Scorecards.
+  let reviewer: { id: string; name: string | null; email: string } | null = null;
+  const { data: ownProfile } = await client
+    .from("manager_profiles")
+    .select("supervisor_id")
+    .eq("id", user.id)
+    .maybeSingle();
+  const ownSupervisorId = ownProfile?.supervisor_id;
+  if (ownSupervisorId) {
+    const { data: supervisorProfile } = await client
+      .from("manager_profiles")
+      .select("id, email, linked_employee_name")
+      .eq("id", ownSupervisorId)
+      .maybeSingle();
+    if (supervisorProfile) {
+      reviewer = {
+        id: String(supervisorProfile.id),
+        name: typeof supervisorProfile.linked_employee_name === "string" && supervisorProfile.linked_employee_name.trim()
+          ? supervisorProfile.linked_employee_name.trim()
+          : null,
+        email: supervisorProfile.email,
+      };
+    }
+  }
+
   // Also walk the full reporting chain below this user (direct reports, their reports, etc.) so
   // callers can tell "is this reviewer somewhere under me" — used to let a manager approve/return
   // a subordinate's assigned scorecard when that subordinate (the direct reviewer) is unavailable.
@@ -44,5 +71,5 @@ export async function GET(request: NextRequest) {
     frontier = newIds;
   }
 
-  return NextResponse.json({ profiles: data || [], descendantIds: Array.from(descendantIds) });
+  return NextResponse.json({ profiles: data || [], descendantIds: Array.from(descendantIds), reviewer });
 }
