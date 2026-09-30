@@ -2831,7 +2831,7 @@ function UsersScreen(props: {
   const [resendingId, setResendingId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<AdminManagedUser | null>(null);
   const sortedUsers = [...props.users].sort((a, b) => a.email.localeCompare(b.email));
-  const editingUser = editingId ? sortedUsers.find((u) => u.id === editingId) : undefined;
+  const [showDeactivated, setShowDeactivated] = useState(true);   const deactivatedCount = sortedUsers.filter((u) => u.status === "deactivated").length;   const visibleUsers = showDeactivated ? sortedUsers : sortedUsers.filter((u) => u.status !== "deactivated");   const editingUser = editingId ? sortedUsers.find((u) => u.id === editingId) : undefined;
 
   return (
     <div className="screen active">
@@ -2872,7 +2872,7 @@ function UsersScreen(props: {
       </section>
 
       <section style={{ padding: 0 }} className="overflow-hidden">
-        <div className="px-4 pb-2.5 pt-4 text-[11px] font-semibold uppercase tracking-wider text-primary">Current users</div>
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-2.5 pt-4">           <div className="text-[11px] font-semibold uppercase tracking-wider text-primary">Current users</div>           {deactivatedCount > 0 && (             <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground">               <Checkbox checked={showDeactivated} onCheckedChange={(v) => setShowDeactivated(v === true)} />               Show deactivated users ({deactivatedCount})             </label>           )}         </div>
         <Table className="text-[12.5px]">
           <TableHeader className="bg-muted/40 [&_th]:h-9 [&_th]:px-4 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
             <TableRow className="hover:bg-transparent">
@@ -2885,10 +2885,12 @@ function UsersScreen(props: {
             </TableRow>
           </TableHeader>
           <TableBody className="[&_td]:px-4 [&_td]:py-3">
-            {!sortedUsers.length && (
-              <TableRow><TableCell colSpan={6} className="py-6 text-center text-muted-foreground">{props.loading ? "Loading users…" : "No users found."}</TableCell></TableRow>
+                      {!visibleUsers.length && (
+              <TableRow><TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+                {props.loading ? "Loading users…" : !sortedUsers.length ? "No users found." : "All users are deactivated — check \u201cShow deactivated users\u201d above to see them."}
+              </TableCell></TableRow>
             )}
-            {sortedUsers.map((user) => (
+            {visibleUsers.map((user) => (
               <React.Fragment key={user.id}>
                 <TableRow>
                   <TableCell>
