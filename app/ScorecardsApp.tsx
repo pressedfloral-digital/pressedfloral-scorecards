@@ -13,7 +13,8 @@ import {
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
 import { currentMonthValue, formatMonthLabel } from "../lib/periods";
-import { getReportingTree } from "../lib/reportingTree";
+import { getReportingTree, profileNode } from "../lib/reportingTree";
+import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
@@ -52,7 +53,7 @@ import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMe
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetClose, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
@@ -281,17 +282,30 @@ function scopedForProfile<T extends { department?: string; location?: string }>(
   });
 }
 
+// Everyone the profile manages: their Rippling name tree, plus team members the uploader
+// assigned to them (or to anyone below them in the supervisor chain). Mirrors
+// private.scorecards_manages_employee in the database.
+function managedEmployeeNames(profile: ManagerProfile, allEmployees: Employee[]): Set<string> {
+  const roots = [
+    profile.linkedEmployeeName || "",
+    profileNode(profile.id),
+    ...(profile.descendantProfileIds || []).map(profileNode),
+  ];
+  return getReportingTree(roots, allEmployees, profile.knownProfiles || []);
+}
+
 function scopedScorecardsForProfile(scorecards: import("../lib/types").Scorecard[], profile: ManagerProfile | null, allEmployees: Employee[] = []) {
   if (!profile || profile.role === "admin") return scorecards;
   if (profile.role === "user") {
     if (!profile.linkedEmployeeName) return [];
     return scorecards.filter((sc) => sc.employeeName === profile.linkedEmployeeName);
   }
+  const managed = managedEmployeeNames(profile, allEmployees);
   if (profile.linkedEmployeeName) {
-    const tree = getReportingTree(profile.linkedEmployeeName, allEmployees);
-    return scorecards.filter((sc) => tree.has(sc.employeeName));
+    return scorecards.filter((sc) => managed.has(sc.employeeName));
   }
   return scorecards.filter((sc) => {
+    if (managed.has(sc.employeeName)) return true;
     const deptOk = !profile.departments.length || profile.departments.includes(sc.department || "");
     const locOk = !profile.locations.length || profile.locations.includes(sc.location || "");
     return deptOk && locOk;
@@ -301,16 +315,21 @@ function scopedScorecardsForProfile(scorecards: import("../lib/types").Scorecard
 function scopedEmployeesForProfile(employees: Employee[], profile: ManagerProfile | null, allEmployees: Employee[] = []) {
   if (!profile || profile.role === "admin") return employees;
   if (profile.role === "user") return [];
+  const managed = managedEmployeeNames(profile, allEmployees);
+  // Team members the uploader explicitly assigned to this manager (or someone under them)
+  // are always theirs, even outside the manager's department/location scope.
+  const assignedRoots = new Set([profile.id, ...(profile.descendantProfileIds || [])]);
+  const isAssigned = (e: Employee) => !!e.assignedManagerId && assignedRoots.has(e.assignedManagerId);
   if (profile.linkedEmployeeName) {
-    const tree = getReportingTree(profile.linkedEmployeeName, allEmployees);
-    const treeFiltered = employees.filter((e) => tree.has(e.name));
+    const treeFiltered = employees.filter((e) => managed.has(e.name));
     // If the manager also has explicit department restrictions, intersect them
     if (profile.departments.length > 0) {
-      return treeFiltered.filter((e) => profile.departments.includes(e.department || ""));
+      return treeFiltered.filter((e) => isAssigned(e) || profile.departments.includes(e.department || ""));
     }
     return treeFiltered;
   }
-  return scopedForProfile(employees, profile);
+  const scoped = new Set(scopedForProfile(employees, profile));
+  return employees.filter((e) => scoped.has(e) || managed.has(e.name));
 }
 
 export default function ScorecardsApp() {
@@ -360,7 +379,16 @@ export default function ScorecardsApp() {
 
   // When viewing as another user, all display/scoping uses this instead of the real profile.
   // Write operations always use the real `profile` so data is never saved under the wrong user.
-  const effectiveProfile = viewAsProfile ?? profile;
+  const baseEffectiveProfile = viewAsProfile ?? profile;
+  // Attach the supervisor chain below this user so upload-assigned team members of their
+  // sub-managers resolve into their reporting tree.
+  const effectiveProfile = useMemo<ManagerProfile | null>(() => {
+    if (!baseEffectiveProfile) return null;
+    const known = adminUsers.length > 0
+      ? adminUsers.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }))
+      : subordinateProfiles.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }));
+    return { ...baseEffectiveProfile, descendantProfileIds: [...reviewChainIds], knownProfiles: known };
+  }, [baseEffectiveProfile, reviewChainIds, adminUsers, subordinateProfiles]);
 
   // Names of managers an admin has granted company-goal access to (cascades to their Rippling downline).
   const companyGoalGrantedNames = useMemo(
@@ -519,7 +547,7 @@ export default function ScorecardsApp() {
 
   useEffect(() => {
     if (!authenticated || profile?.role !== "admin") return;
-    if (mode !== "users" && !(mode === "todos" && viewAsProfile)) return;
+    if (mode !== "users" && mode !== "rippling" && !(mode === "todos" && viewAsProfile)) return;
     void loadAdminUsers();
   }, [authenticated, profile?.role, mode, viewAsProfile, isFixture, sb]);
 
@@ -781,11 +809,23 @@ export default function ScorecardsApp() {
     const rawGoals = (goalsResult.data || []).map(goalFromRow);
     // Company goals are org-wide and aren't scoped by the viewer's own department/location —
     // access to them is governed separately by resolveCompanyGoalAccess downstream.
+    // Team members assigned to a manager can sit outside the manager's department/location
+    // scope — keep their department/individual goals so their scorecards are complete.
+    const managedEmps = loadedProfile.role === "manager"
+      ? (() => { const names = managedEmployeeNames(loadedProfile, allEmployees); return allEmployees.filter((e) => names.has(e.name)); })()
+      : [];
+    const inScope = new Set(scopedForProfile(rawGoals.filter((g) => g.goalTier !== "company"), loadedProfile));
     const goals = [
       ...rawGoals.filter((g) => g.goalTier === "company"),
-      ...scopedForProfile(rawGoals.filter((g) => g.goalTier !== "company"), loadedProfile)
+      ...rawGoals.filter((g) => g.goalTier !== "company" && (inScope.has(g) || managedEmps.some((e) =>
+        g.goalTier === "individual" && g.employeeName
+          ? g.employeeName === e.name
+          : g.department === e.department && (!g.location || g.location === e.location) && (g.goalTier === "department" || !g.role || g.role === e.role)
+      )))
     ];
-    const scorecards = scopedScorecardsForProfile((scorecardsResult.data || []).map(scorecardFromRow), loadedProfile, allEmployees);
+    // Row-level security already limits which scorecards come back; the screens re-scope by
+    // the viewer (including View As) downstream.
+    const scorecards = (scorecardsResult.data || []).map(scorecardFromRow);
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
     setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
@@ -2017,6 +2057,8 @@ export default function ScorecardsApp() {
           {mode === "rippling" && (
             <RipplingScreen
               defaultMonth={workMonth}
+              users={adminUsers.filter((u) => u.status !== "deactivated")}
+              usersLoading={adminUsersLoading}
               saved={appData.rippling}
               onSaveForMonth={saveRipplingForMonth}
               onClearMonth={(month) => {
@@ -6673,26 +6715,49 @@ function ReportLineChart({
 
 function RipplingScreen(props: {
   defaultMonth: string;
+  users: AssignableUser[];
+  usersLoading: boolean;
   saved: Record<string, Employee[]>;
   onSaveForMonth: (month: string, employees: Employee[]) => void;
   onClearMonth: (month: string) => void;
 }) {
   const [uploadMonth, setUploadMonth] = useState(props.defaultMonth);
-  const [preview, setPreview] = useState<Employee[]>([]);
+  const [parsed, setParsed] = useState<Employee[]>([]);
   const [previewFileName, setPreviewFileName] = useState("");
   const [expandedMonth, setExpandedMonth] = useState<string | null>(null);
+  // Uploader's manager picks for flagged rows, keyed by employee name.
+  const [managerChoices, setManagerChoices] = useState<Record<string, string>>({});
+  const [showManagerIssues, setShowManagerIssues] = useState(false);
+
+  // Re-resolved whenever the user list arrives/changes, so a file dropped before users load
+  // still gets checked.
+  const { employees: preview, issues: managerIssues } = useMemo(
+    () => resolveUploadManagers(parsed, props.users),
+    [parsed, props.users]
+  );
+  const unresolvedCount = managerIssues.filter((i) => !managerChoices[i.employeeName]).length;
 
   async function handleFile(file: File | undefined) {
     if (!file) return;
-    setPreview(parseRipplingEmployees(await file.text()));
+    const rows = parseRipplingEmployees(await file.text());
+    setParsed(rows);
     setPreviewFileName(file.name);
+    setManagerChoices({});
+    setShowManagerIssues(resolveUploadManagers(rows, props.users).issues.length > 0);
+  }
+
+  function discardPreview() {
+    setParsed([]);
+    setPreviewFileName("");
+    setManagerChoices({});
+    setShowManagerIssues(false);
   }
 
   function handleSave() {
-    if (!preview.length) return;
-    props.onSaveForMonth(uploadMonth, preview);
-    setPreview([]);
-    setPreviewFileName("");
+    if (!preview.length || props.usersLoading) return;
+    if (unresolvedCount > 0) { setShowManagerIssues(true); return; }
+    props.onSaveForMonth(uploadMonth, applyManagerChoices(preview, managerChoices, props.users));
+    discardPreview();
   }
 
   function handleDownload(month: string, employees: Employee[]) {
@@ -6745,13 +6810,38 @@ function RipplingScreen(props: {
           <input type="file" accept=".csv" hidden onChange={(e) => handleFile(e.target.files?.[0])} />
         </label>
         {preview.length > 0 && (
-          <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-3 py-2">
-            <span className="text-[12.5px] text-foreground">{preview.length} employees parsed from <span className="font-medium">{previewFileName}</span></span>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-3 py-2">
+            <span className="text-[12.5px] text-foreground">
+              {preview.length} employees parsed from <span className="font-medium">{previewFileName}</span>
+              {props.usersLoading ? (
+                <span className="ml-2 text-muted-foreground">· Checking managers…</span>
+              ) : managerIssues.length > 0 && (
+                <button type="button" onClick={() => setShowManagerIssues(true)} className={`ml-2 font-medium underline-offset-2 hover:underline ${unresolvedCount > 0 ? "text-destructive" : "text-primary"}`}>
+                  {unresolvedCount > 0
+                    ? `⚠ ${unresolvedCount} manager mismatch${unresolvedCount !== 1 ? "es" : ""} to resolve`
+                    : `✓ ${managerIssues.length} manager mismatch${managerIssues.length !== 1 ? "es" : ""} resolved — review`}
+                </button>
+              )}
+            </span>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" className="text-[12px]" onClick={() => { setPreview([]); setPreviewFileName(""); }}>Discard</Button>
-              <Button size="sm" onClick={handleSave}>Save for {formatMonthLabel(uploadMonth)}</Button>
+              <Button variant="outline" size="sm" className="text-[12px]" onClick={discardPreview}>Discard</Button>
+              <Button size="sm" onClick={handleSave} disabled={props.usersLoading}>Save for {formatMonthLabel(uploadMonth)}</Button>
             </div>
           </div>
+        )}
+        {showManagerIssues && managerIssues.length > 0 && (
+          <ManagerIssuesModal
+            issues={managerIssues}
+            users={props.users}
+            choices={managerChoices}
+            onChoose={(employeeName, userId) => setManagerChoices((c) => ({ ...c, [employeeName]: userId }))}
+            onAcceptSuggestions={() => setManagerChoices((c) => {
+              const next = { ...c };
+              for (const issue of managerIssues) if (!next[issue.employeeName] && issue.suggestedIds[0]) next[issue.employeeName] = issue.suggestedIds[0];
+              return next;
+            })}
+            onClose={() => setShowManagerIssues(false)}
+          />
         )}
       </section>
 
@@ -8496,6 +8586,108 @@ function WhatIfScreen(props: {
 function MigrateScreen() {
   return (
     <div className="screen active"><section><div className="section-title">Migrate Local Data to Supabase</div><p>This React version preserves the same legacy localStorage keys. Use this only from a browser that contains the original local data.</p><button className="submit-btn" onClick={() => alert("Migration uses the preserved Supabase table contracts and should be run only after a real Supabase smoke test.")}>Start Migration</button></section></div>
+  );
+}
+
+// Pop-up on the Rippling Data page: every row whose CSV Manager doesn't line up with the app
+// (unknown name, ambiguous name, or a different supervisor on the Users page) must have its
+// manager picked by the uploader before the upload can be saved.
+function ManagerIssuesModal(props: {
+  issues: ManagerIssue[];
+  users: AssignableUser[];
+  choices: Record<string, string>;
+  onChoose: (employeeName: string, userId: string) => void;
+  onAcceptSuggestions: () => void;
+  onClose: () => void;
+}) {
+  const userById = new Map(props.users.map((u) => [u.id, u]));
+  const userLabel = (u: AssignableUser) => u.linkedEmployeeName || u.email;
+  const managers = props.users
+    .filter((u) => u.role === "manager" || u.role === "admin")
+    .sort((a, b) => userLabel(a).localeCompare(userLabel(b)));
+  const resolved = props.issues.filter((i) => props.choices[i.employeeName]).length;
+  const anySuggestionsLeft = props.issues.some((i) => !props.choices[i.employeeName] && i.suggestedIds.length > 0);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-labelledby="manager-issues-title">
+      <div className="flex max-h-[85vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl">
+        <div className="border-b border-border px-5 py-4">
+          <div id="manager-issues-title" className="text-[15px] font-semibold text-foreground">Resolve manager mismatches</div>
+          <p className="mt-1 text-[12.5px] text-muted-foreground">
+            These team members&apos; Manager in the CSV doesn&apos;t line up with the app. Pick who should own each scorecard. That manager (and anyone above them) can then see and edit it.
+          </p>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          <Table className="text-[12.5px]">
+            <TableHeader className="sticky top-0 bg-muted/60 [&_th]:h-9 [&_th]:px-4 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
+              <TableRow className="hover:bg-transparent">
+                <TableHead>Team member</TableHead>
+                <TableHead className="hidden sm:table-cell">CSV manager</TableHead>
+                <TableHead className="hidden sm:table-cell">App supervisor</TableHead>
+                <TableHead className="hidden lg:table-cell">Issue</TableHead>
+                <TableHead className="w-[45%] sm:w-[15rem]">Assign to</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody className="[&_td]:px-4 [&_td]:py-2.5">
+              {props.issues.map((issue) => {
+                const sup = issue.appSupervisorId ? userById.get(issue.appSupervisorId) : undefined;
+                const suggested = issue.suggestedIds.map((id) => userById.get(id)).filter((u): u is AssignableUser => !!u);
+                const others = managers.filter((u) => !issue.suggestedIds.includes(u.id));
+                const choice = props.choices[issue.employeeName];
+                return (
+                  <TableRow key={issue.employeeName} className={choice ? "" : "bg-destructive/5"}>
+                    <TableCell className="whitespace-normal">
+                      <div className="font-medium text-foreground">{issue.employeeName}</div>
+                      <div className="text-[11.5px] text-muted-foreground">{[issue.department, issue.location].filter(Boolean).join(" · ")}</div>
+                      {/* Narrow screens: the hidden columns' details fold in under the name. */}
+                      <div className="mt-1 text-[11.5px] text-muted-foreground sm:hidden">
+                        CSV: {issue.csvManager || "—"}{sup ? ` · App: ${userLabel(sup)}` : ""}
+                      </div>
+                      <div className="mt-0.5 text-[11.5px] text-destructive lg:hidden">{describeIssue(issue)}</div>
+                    </TableCell>
+                    <TableCell className="hidden sm:table-cell">{issue.csvManager || <span className="text-muted-foreground">—</span>}</TableCell>
+                    <TableCell className="hidden sm:table-cell">{sup ? userLabel(sup) : <span className="text-muted-foreground">—</span>}</TableCell>
+                    <TableCell className="hidden whitespace-normal text-[11.5px] text-muted-foreground lg:table-cell">{describeIssue(issue)}</TableCell>
+                    <TableCell>
+                      <Select value={choice || ""} onValueChange={(v) => props.onChoose(issue.employeeName, v)}>
+                        <SelectTrigger className="h-8 w-full min-w-0 text-[12px] [&>span]:truncate" aria-label={`Manager for ${issue.employeeName}`}>
+                          <SelectValue placeholder="Choose manager…" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {suggested.map((u, idx) => (
+                            <SelectItem key={u.id} value={u.id} className="text-[12.5px]">
+                              {userLabel(u)}
+                              <span className="ml-1.5 text-[11px] text-muted-foreground">
+                                {u.id === issue.appSupervisorId ? "app supervisor" : issue.csvMatchIds.includes(u.id) ? "CSV manager" : idx === 0 ? "suggested · dept/location" : "dept/location"}
+                              </span>
+                            </SelectItem>
+                          ))}
+                          {suggested.length > 0 && others.length > 0 && <SelectSeparator />}
+                          {others.map((u) => (
+                            <SelectItem key={u.id} value={u.id} className="text-[12.5px]">{userLabel(u)}</SelectItem>
+                          ))}
+                          <SelectSeparator />
+                          <SelectItem value={LEAVE_UNASSIGNED} className="text-[12.5px] text-muted-foreground">Leave as in CSV (no app manager)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-3">
+          <span className="text-[12.5px] text-muted-foreground">{resolved} of {props.issues.length} resolved</span>
+          <div className="flex gap-2">
+            {anySuggestionsLeft && (
+              <Button variant="outline" size="sm" className="text-[12px]" onClick={props.onAcceptSuggestions}>Use first suggestion for the rest</Button>
+            )}
+            <Button size="sm" onClick={props.onClose}>{resolved === props.issues.length ? "Done" : "Finish later"}</Button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -13,6 +13,10 @@ export type ManagerProfile = {
   supervisorId?: string;   // profile id of this manager's supervisor
   scorecardPeriodType?: "monthly" | "quarterly";
   companyGoalsGrant?: boolean; // grants this manager + their Rippling reporting tree company-goal read/write access
+  // Client-only: users below this one in the supervisor chain, and the user list known to the
+  // client — used to resolve upload-assigned team members in the reporting tree.
+  descendantProfileIds?: string[];
+  knownProfiles?: { id: string; linkedEmployeeName?: string; supervisorId?: string }[];
 };
 
 export type Goal = {
@@ -47,6 +51,7 @@ export type Employee = {
   department: string;
   location: string;
   manager?: string;
+  assignedManagerId?: string; // manager profile matched/confirmed during the Rippling upload
   payType: PayType;
   hourlyRate?: number;
   annualPay?: number;
