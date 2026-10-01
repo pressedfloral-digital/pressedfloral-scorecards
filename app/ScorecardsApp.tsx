@@ -3075,7 +3075,13 @@ function UserPermissionForm(props: {
     setDraft(userDraftFromUser(props.user));
   }, [props.user?.id]);
 
-  const employeeNames = useMemo(() => Array.from(new Set(props.employees.map((employee) => employee.name))).sort(), [props.employees]);
+  // Includes names that only appear in the Rippling Manager column (e.g. owners who aren't on
+  // the payroll export) so those managers can still be linked and matched on upload. Emails
+  // are skipped — the upload writes one there when a picked manager has no linked name.
+  const employeeNames = useMemo(() => Array.from(new Set([
+    ...props.employees.map((employee) => employee.name),
+    ...props.employees.map((employee) => (employee.manager || "").trim()).filter((name) => name && !name.includes("@")),
+  ])).sort(), [props.employees]);
   const departmentOptions = departments.map((department) => ({ value: department, label: department }));
   const locationOptions = locations.map((location) => ({ value: location, label: location }));
 
