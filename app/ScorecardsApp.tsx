@@ -74,6 +74,7 @@ import {
   LayoutDashboard,
   LayoutGrid,
   ListChecks,
+  Lock,
   MoreHorizontal,
   RefreshCw,
   RotateCcw,
@@ -209,8 +210,12 @@ function metaKey(type: "target" | "min", goal: Pick<Goal, "goalTier" | "location
 
 // Employees who worked fewer than this many hours in the period don't need a scorecard —
 // they're excluded from "not submitted" counts/todos and shown as "Not Eligible" rather than
-// flagged as outstanding work. A manager can still submit one manually if there's an exception.
+// flagged as outstanding work. Their scorecard card is locked (can't be opened or edited).
 const MIN_HOURS_FOR_SCORECARD = 40;
+
+function isBelowMinHours(employee: Pick<Employee, "hoursWorked">): boolean {
+  return employee.hoursWorked != null && employee.hoursWorked < MIN_HOURS_FOR_SCORECARD;
+}
 
 // Employee scorecard deactivation helpers — stored in actuals under a special sentinel period.
 const DEACT_PERIOD = "__employee_settings__";
@@ -4439,6 +4444,7 @@ function ScorecardsScreen(props: {
   const [filterLocations, setFilterLocations] = useState<string[]>([]);
   const [globalPeriodType, setGlobalPeriodType] = useState<"monthly" | "quarterly">("monthly");
   const [hideCompleted, setHideCompleted] = useState(false);
+  const [hideIneligible, setHideIneligible] = useState(false);
   const [viewMode, setViewMode] = useState<"cards" | "progress">("cards");
   const [progressStatusFilter, setProgressStatusFilter] = useState<ScorecardCompletionStatus[]>([]);
 
@@ -4551,6 +4557,7 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
+    if (hideIneligible && isBelowMinHours(withActualEarnings(e))) return false;
     if (hideCompleted) {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
       if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -4750,6 +4757,10 @@ function ScorecardsScreen(props: {
             <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
             Hide completed
           </label>
+          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title={`Hides scorecards for team members who worked under ${MIN_HOURS_FOR_SCORECARD} hours in the period`}>
+            <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
+            Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
+          </label>
         </div>
       </section>
 
@@ -4895,6 +4906,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
+                  if (hideIneligible && isBelowMinHours({ hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked })) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
                     if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -5372,6 +5384,9 @@ function LiveScorecardCard({
     return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} />;
   }
   const returnedScorecard = !lastSubmitted && submittedScorecard?.reviewStatus === "returned" ? submittedScorecard : null;
+  // Under the minimum-hours threshold: the card stays visible with a "Not Eligible" badge but
+  // is locked — it can't be expanded, so goals/actuals/weights can't be edited or submitted.
+  const ineligible = isBelowMinHours(employee);
 
   const activeEmployee = cardPeriodType === "quarterly" ? quarterlyEmployee : employee;
   const activeMonth = cardPeriodType === "quarterly" ? quarterKey : month;
@@ -5444,8 +5459,16 @@ function LiveScorecardCard({
 
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card">
-      <button type="button" onClick={() => setOpen(!open)} className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/40">
-        <ChevronRight className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
+      <button
+        type="button"
+        onClick={() => { if (!ineligible) setOpen(!open); }}
+        disabled={ineligible}
+        aria-disabled={ineligible}
+        className={`flex w-full items-center gap-3 px-4 py-3 text-left transition-colors ${ineligible ? "cursor-not-allowed opacity-60" : "hover:bg-muted/40"}`}
+      >
+        {ineligible
+          ? <Lock className="size-4 shrink-0 text-muted-foreground" />
+          : <ChevronRight className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />}
         <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-secondary text-[11px] font-semibold text-foreground">{dashInitials(employee.name)}</span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13.5px] font-medium text-foreground">{employee.name}</span>
@@ -5453,7 +5476,7 @@ function LiveScorecardCard({
             {employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
           </span>
         </span>
-        {currentGoals.length > 0 ? (
+        {currentGoals.length > 0 && !ineligible ? (
           <>
             <span className="hidden text-right sm:block">
               <span className="block text-[10px] uppercase tracking-wide text-muted-foreground">Achievement</span>
@@ -5471,18 +5494,18 @@ function LiveScorecardCard({
             </span>
           </>
         ) : null}
-        {returnedScorecard ? (
-          <Badge variant="secondary" className="shrink-0 font-medium" style={{ background: "#FEE2E2", color: "#991B1B", borderColor: "#FECACA" }}>Returned</Badge>
-        ) : employee.hoursWorked != null && employee.hoursWorked < MIN_HOURS_FOR_SCORECARD ? (
-          <Badge variant="secondary" title={`Worked ${employee.hoursWorked.toFixed(2)} hrs this period — below the ${MIN_HOURS_FOR_SCORECARD}-hour minimum, so no scorecard is required`} className="shrink-0 font-medium text-muted-foreground">
-            Not Eligible ({employee.hoursWorked.toFixed(1)} hrs)
+        {ineligible ? (
+          <Badge variant="secondary" title={`Worked ${employee.hoursWorked!.toFixed(2)} hrs this period — below the ${MIN_HOURS_FOR_SCORECARD}-hour minimum, so this scorecard is locked`} className="shrink-0 font-medium text-muted-foreground">
+            Ineligible due to hours ({employee.hoursWorked!.toFixed(1)} hrs)
           </Badge>
+        ) : returnedScorecard ? (
+          <Badge variant="secondary" className="shrink-0 font-medium" style={{ background: "#FEE2E2", color: "#991B1B", borderColor: "#FECACA" }}>Returned</Badge>
         ) : (
           <Badge variant="secondary" title="This scorecard hasn't been submitted yet" className="shrink-0 font-medium">Not Submitted</Badge>
         )}
       </button>
 
-      {returnedScorecard?.reviewNote && (
+      {returnedScorecard?.reviewNote && !ineligible && (
         <div style={{ borderTop: "1px solid #FECACA", background: "#FEF2F2", padding: "8px 16px" }}>
           <span style={{ fontSize: "11.5px", fontWeight: 600, color: "#991B1B" }}>Returned</span>
           {returnedScorecard.reviewedBy && <span style={{ fontSize: "11.5px", color: "#991B1B" }}> by {returnedScorecard.reviewedBy}</span>}
@@ -5490,7 +5513,7 @@ function LiveScorecardCard({
         </div>
       )}
 
-      {open && (
+      {open && !ineligible && (
         <>
           <div className="flex flex-wrap items-end gap-6 border-t border-border bg-muted/30 px-4 py-2.5">
             <div>
