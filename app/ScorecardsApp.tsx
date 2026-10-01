@@ -22,6 +22,7 @@ import {
   persistActuals,
   persistGoals,
   persistRippling,
+  removePersistedRippling,
   persistScorecard,
   PROFILE_EMAIL_KEY,
   PROFILE_ROLE_KEY
@@ -1779,6 +1780,23 @@ export default function ScorecardsApp() {
     showToast("Rippling data saved");
   }
 
+  async function clearRipplingForMonth(month: string) {
+    if (!isFixture && sb) {
+      const result = await sb.from("rippling_employees").delete().eq("period", month);
+      if (result.error) {
+        showSupabaseError(result.error, "Rippling data could not be removed.");
+        return;
+      }
+    }
+    setAppData((current) => {
+      const next = { ...current.rippling };
+      delete next[month];
+      return { ...current, rippling: next };
+    });
+    removePersistedRippling(month);
+    showToast("Rippling data cleared for " + formatMonthLabel(month));
+  }
+
   async function submitScorecardDirect(scorecard: Scorecard) {
     // Look up the submitting manager's supervisor to determine review routing
     const submittingProfile = profile; // the currently logged-in manager
@@ -2061,14 +2079,7 @@ export default function ScorecardsApp() {
               usersLoading={adminUsersLoading}
               saved={appData.rippling}
               onSaveForMonth={saveRipplingForMonth}
-              onClearMonth={(month) => {
-                setAppData((current) => {
-                  const next = { ...current.rippling };
-                  delete next[month];
-                  return { ...current, rippling: next };
-                });
-                showToast("Rippling data cleared for " + formatMonthLabel(month));
-              }}
+              onClearMonth={clearRipplingForMonth}
             />
           )}
           {mode === "guide" && <GuideScreen profile={effectiveProfile} />}
@@ -6880,7 +6891,9 @@ function RipplingScreen(props: {
                       <Button variant="ghost" size="sm" className="h-7 px-2 text-[11.5px] text-muted-foreground" onClick={() => handleDownload(month, employees)}>
                         <Download className="mr-1 size-3.5" />Download CSV
                       </Button>
-                      <Button variant="ghost" size="sm" className="h-7 px-2 text-[11.5px] text-destructive hover:text-destructive" onClick={() => props.onClearMonth(month)}>
+                      <Button variant="ghost" size="sm" className="h-7 px-2 text-[11.5px] text-destructive hover:text-destructive" onClick={() => {
+                        if (window.confirm(`Remove the ${formatMonthLabel(month)} Rippling data (${employees.length} employee${employees.length !== 1 ? "s" : ""})? You can re-upload the CSV afterwards.`)) props.onClearMonth(month);
+                      }}>
                         Remove
                       </Button>
                     </div>
