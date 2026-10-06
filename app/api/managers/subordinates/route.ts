@@ -22,7 +22,8 @@ export async function GET(request: NextRequest) {
   // Return profiles of managers who list this user as their supervisor
   const { data, error } = await client
     .from("manager_profiles")
-    .select("id, role, departments, locations, linked_employee_name, supervisor_id, company_goals_grant")
+    // "*" rather than a column list so this keeps working before linked_name_aliases exists.
+    .select("*")
     .eq("supervisor_id", user.id);
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
@@ -71,5 +72,15 @@ export async function GET(request: NextRequest) {
     frontier = newIds;
   }
 
-  return NextResponse.json({ profiles: data || [], descendantIds: Array.from(descendantIds), reviewer });
+  const profiles = (data || []).map((row) => ({
+    id: row.id,
+    role: row.role,
+    departments: row.departments,
+    locations: row.locations,
+    linked_employee_name: row.linked_employee_name,
+    linked_name_aliases: row.linked_name_aliases ?? [],
+    supervisor_id: row.supervisor_id,
+    company_goals_grant: row.company_goals_grant
+  }));
+  return NextResponse.json({ profiles, descendantIds: Array.from(descendantIds), reviewer });
 }

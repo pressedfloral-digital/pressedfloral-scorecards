@@ -9,6 +9,7 @@ export type ManagerProfile = {
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  linkedNameAliases?: string[]; // other names this person goes by in Rippling (e.g. a former last name in the Manager column)
   titleOverride?: string;      // overrides the role/title from Rippling on their scorecard
   supervisorId?: string;   // profile id of this manager's supervisor
   scorecardPeriodType?: "monthly" | "quarterly";
@@ -16,7 +17,7 @@ export type ManagerProfile = {
   // Client-only: users below this one in the supervisor chain, and the user list known to the
   // client — used to resolve upload-assigned team members in the reporting tree.
   descendantProfileIds?: string[];
-  knownProfiles?: { id: string; linkedEmployeeName?: string; supervisorId?: string }[];
+  knownProfiles?: { id: string; linkedEmployeeName?: string; linkedNameAliases?: string[]; supervisorId?: string }[];
 };
 
 export type Goal = {

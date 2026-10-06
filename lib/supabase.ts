@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { isConfiguredProfile, parseProfileRole } from "./adminUsers";
+import { isConfiguredProfile, parseNameAliases, parseProfileRole } from "./adminUsers";
 import type { ActualsByKey, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, ManagerProfile, Scorecard } from "./types";
 
 export const dataMode = process.env.NEXT_PUBLIC_SCORECARDS_DATA_MODE === "fixture" ? "fixture" : "supabase";
@@ -131,6 +131,7 @@ export function profileFromRow(email: string, row: Record<string, any>): Manager
     departments: Array.isArray(row.departments) ? row.departments : [],
     locations: Array.isArray(row.locations) ? row.locations : [],
     linkedEmployeeName: typeof row.linked_employee_name === "string" && row.linked_employee_name.trim() ? row.linked_employee_name.trim() : undefined,
+    linkedNameAliases: parseNameAliases(row.linked_name_aliases),
     titleOverride: typeof row.title_override === "string" && row.title_override.trim() ? row.title_override.trim() : undefined,
   supervisorId: row.supervisor_id || undefined,
   scorecardPeriodType: row.scorecard_period_type === "quarterly" ? "quarterly" : "monthly",

@@ -2,7 +2,7 @@ import type { Employee } from "./types";
 
 // App users appear in the tree as "profile:<id>" nodes; employees as their name.
 // Mirrors private.scorecards_manages_employee in the database.
-export type TreeProfile = { id: string; linkedEmployeeName?: string; supervisorId?: string };
+export type TreeProfile = { id: string; linkedEmployeeName?: string; linkedNameAliases?: string[]; supervisorId?: string };
 
 export function profileNode(profileId: string): string {
   return `profile:${profileId}`;
@@ -11,7 +11,7 @@ export function profileNode(profileId: string): string {
 // Returns the set of employee names that report, directly or transitively, to any of the
 // given root nodes — via the Rippling Manager name (Employee.manager), the manager picked
 // during upload (Employee.assignedManagerId), and, when profiles are supplied, users linked
-// to an employee and the Users-page supervisor chain. Does not include the roots themselves.
+// to an employee (or one of their alternate names) and the Users-page supervisor chain. Does not include the roots themselves.
 export function getReportingTree(roots: string | string[], employees: Employee[], profiles: TreeProfile[] = []): Set<string> {
   const childrenOf = new Map<string, string[]>();
   const addEdge = (parent: string | undefined, child: string) => {
@@ -26,6 +26,8 @@ export function getReportingTree(roots: string | string[], employees: Employee[]
   }
   for (const p of profiles) {
     addEdge(p.linkedEmployeeName, profileNode(p.id));
+    // An alternate name (e.g. a former last name still in the Manager column) is the same spot.
+    for (const alias of p.linkedNameAliases || []) addEdge(alias, profileNode(p.id));
     if (p.supervisorId) addEdge(profileNode(p.supervisorId), profileNode(p.id));
   }
 

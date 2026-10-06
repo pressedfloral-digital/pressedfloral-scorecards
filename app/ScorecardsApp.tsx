@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   normalizeAdminUserPayload,
+  parseNameAliases,
   scopeSummary,
   SCORECARD_DEPARTMENTS,
   SCORECARD_LOCATIONS,
@@ -289,6 +290,7 @@ function scopedForProfile<T extends { department?: string; location?: string }>(
 function managedEmployeeNames(profile: ManagerProfile, allEmployees: Employee[]): Set<string> {
   const roots = [
     profile.linkedEmployeeName || "",
+    ...(profile.linkedNameAliases || []),
     profileNode(profile.id),
     ...(profile.descendantProfileIds || []).map(profileNode),
   ];
@@ -386,8 +388,8 @@ export default function ScorecardsApp() {
   const effectiveProfile = useMemo<ManagerProfile | null>(() => {
     if (!baseEffectiveProfile) return null;
     const known = adminUsers.length > 0
-      ? adminUsers.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }))
-      : subordinateProfiles.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }));
+      ? adminUsers.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, linkedNameAliases: u.linkedNameAliases, supervisorId: u.supervisorId }))
+      : subordinateProfiles.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, linkedNameAliases: u.linkedNameAliases, supervisorId: u.supervisorId }));
     return { ...baseEffectiveProfile, descendantProfileIds: [...reviewChainIds], knownProfiles: known };
   }, [baseEffectiveProfile, reviewChainIds, adminUsers, subordinateProfiles]);
 
@@ -600,6 +602,7 @@ export default function ScorecardsApp() {
               departments: Array.isArray(row.departments) ? row.departments : [],
               locations: Array.isArray(row.locations) ? row.locations : [],
               linkedEmployeeName: typeof row.linked_employee_name === "string" && row.linked_employee_name.trim() ? row.linked_employee_name.trim() : undefined,
+              linkedNameAliases: parseNameAliases(row.linked_name_aliases),
               supervisorId: typeof row.supervisor_id === "string" ? row.supervisor_id : undefined,
               companyGoalsGrant: row.company_goals_grant === true,
             })));
@@ -3180,6 +3183,7 @@ function UserPermissionForm(props: {
       departments: isManager ? (allDepts ? [] : draft.departments) : [],
       locations: isManager ? (allLocs ? [] : draft.locations) : [],
       linkedEmployeeName: draft.linkedEmployeeName || undefined,
+      linkedNameAliases: draft.linkedEmployeeName ? draft.aliasesText.split(",").map((name) => name.trim()).filter(Boolean) : [],
       titleOverride: (draft as AdminUserPayload & { titleOverride?: string }).titleOverride || undefined,
       supervisorId: (draft as AdminUserPayload & { supervisorId?: string }).supervisorId || undefined,
       allDepartments: !isManager || allDepts,
@@ -3274,6 +3278,19 @@ function UserPermissionForm(props: {
         </div>
       )}
 
+      {draft.linkedEmployeeName && (
+        <div className="flex flex-wrap items-end gap-3">
+          <DrawerField label="Also appears in Rippling as" className="min-w-[12rem] flex-1">
+            <Input
+              placeholder="e.g. a former last name — separate several with commas"
+              value={draft.aliasesText}
+              onChange={(e) => setDraft({ ...draft, aliasesText: e.target.value })}
+              aria-label="Also appears in Rippling as"
+            />
+          </DrawerField>
+        </div>
+      )}
+
       {(draft.linkedEmployeeName || draft.role === "manager") && (
         <div className="flex flex-wrap items-end gap-3">
           <DrawerField label="Scorecard period" className="w-[180px]">
@@ -3317,7 +3334,7 @@ function UserPermissionForm(props: {
   );
 }
 
-function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email: string; linkedEmployeeName: string; allDepartments: boolean; allLocations: boolean } {
+function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email: string; linkedEmployeeName: string; aliasesText: string; allDepartments: boolean; allLocations: boolean } {
   if (!user) {
     return {
       email: "",
@@ -3325,6 +3342,7 @@ function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email:
       departments: [],
       locations: [],
       linkedEmployeeName: "",
+      aliasesText: "",
       allDepartments: false,
       allLocations: false,
       scorecardPeriodType: "monthly" as const,
@@ -3342,6 +3360,7 @@ function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email:
     departments: isManager ? (allDepts ? [...departments] : user.departments) : [],
     locations: isManager ? (allLocs ? [...locations] : user.locations) : [],
     linkedEmployeeName: user.linkedEmployeeName || "",
+    aliasesText: (user.linkedNameAliases || []).join(", "),
     titleOverride: user.titleOverride || "",
     supervisorId: user.supervisorId || "",
     allDepartments: allDepts,
