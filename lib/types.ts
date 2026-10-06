@@ -61,6 +61,20 @@ export type Employee = {
   isExempt?: boolean;
   isManager?: boolean;
   employmentType?: string;
+  // Set when an EmployeeOverride changed this row: the values Rippling actually uploaded.
+  uploaded?: { department: string; manager?: string; assignedManagerId?: string };
+};
+
+// Manual department/manager correction that survives Rippling uploads. Applies to every
+// month from effectiveFrom (ISO month) onward; earlier months keep their uploaded values.
+export type EmployeeOverride = {
+  employeeName: string;
+  department?: string;
+  managerId?: string;
+  managerName?: string;
+  effectiveFrom: string;
+  updatedBy?: string;
+  updatedAt?: string;
 };
 
 export type ScorecardGoal = {
@@ -143,6 +157,7 @@ export type AppData = {
   scorecards: Scorecard[];
   goalAssignments: GoalAssignment[];
   employeeScorecardSettings: EmployeeScorecardSettings[];
+  employeeOverrides?: EmployeeOverride[];
 };
 
 export type HistoryFilters = {

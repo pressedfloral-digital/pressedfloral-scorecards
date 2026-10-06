@@ -15,6 +15,7 @@ import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
 import { currentMonthValue, formatMonthLabel } from "../lib/periods";
 import { getReportingTree, profileNode } from "../lib/reportingTree";
+import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
@@ -45,7 +46,7 @@ import {
   scorecardToRow,
   supabaseClient
 } from "../lib/supabase";
-import type { ActualsByKey, AppData, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard } from "../lib/types";
+import type { ActualsByKey, AppData, Employee, EmployeeOverride, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard } from "../lib/types";
 import { AppShell, type NavGroup } from "@/components/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -550,7 +551,9 @@ export default function ScorecardsApp() {
 
   useEffect(() => {
     if (!authenticated || profile?.role !== "admin") return;
-    if (mode !== "users" && mode !== "rippling" && !(mode === "todos" && viewAsProfile)) return;
+    // Team Scorecards needs the user list for the manual manager picker.
+    if (mode !== "users" && mode !== "rippling" && mode !== "scorecard" && !(mode === "todos" && viewAsProfile)) return;
+    if (mode === "scorecard" && adminUsers.length > 0) return;
     void loadAdminUsers();
   }, [authenticated, profile?.role, mode, viewAsProfile, isFixture, sb]);
 
@@ -736,7 +739,7 @@ export default function ScorecardsApp() {
         ? client.from("scorecards").select("*").eq("employee_name", linkedName).order("scorecard_month", { ascending: false })
         : client.from("scorecards").select("*").order("scorecard_month", { ascending: false });
 
-      const [scResult, goalsResult, actualsResult, ripplingResult, assignmentsResult, settingsResult] = await Promise.all([
+      const [scResult, goalsResult, actualsResult, ripplingResult, assignmentsResult, settingsResult, overridesResult] = await Promise.all([
         scQuery,
         client.from("goals_bank").select("*").order("goal_tier").order("department").order("name"),
         fetchAllRows(client, "actuals"),
@@ -749,7 +752,12 @@ export default function ScorecardsApp() {
         linkedName
           ? client.from("employee_scorecard_settings").select("*").eq("employee_name", linkedName)
           : client.from("employee_scorecard_settings").select("*"),
+        linkedName
+          ? client.from("employee_overrides").select("*").eq("employee_name", linkedName)
+          : client.from("employee_overrides").select("*"),
       ]);
+      // Empty (not an error) until the employee_overrides migration has run.
+      const employeeOverrides = overridesResult.error ? [] : (overridesResult.data || []).map(employeeOverrideFromRow);
 
       const scorecards = (scResult.data || []).map(scorecardFromRow);
       const goals = (goalsResult.data || []).map(goalFromRow);
@@ -757,7 +765,7 @@ export default function ScorecardsApp() {
       const rippling: Record<string, Employee[]> = {};
       for (const row of ripplingResult.data || []) {
         const period = row.period || fixtureMonth;
-        const emp = employeeFromRow(row);
+        const [emp] = applyEmployeeOverrides(period, [employeeFromRow(row)], employeeOverrides);
         rippling[period] = [...(rippling[period] || []), emp];
       }
 
@@ -775,25 +783,28 @@ export default function ScorecardsApp() {
       const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
       const employeeScorecardSettings: EmployeeScorecardSettings[] = dedupeSettings((settingsResult.data || []).map(employeeScorecardSettingsFromRow));
 
-      setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
+      setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides }));
       setMyGoals(goals);
       return;
     }
 
-    const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult] = await Promise.all([
+    const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult, overridesResult] = await Promise.all([
       client.from("goals_bank").select("*").order("goal_tier").order("department").order("name"),
       client.from("scorecards").select("*").order("scorecard_month", { ascending: false }).order("employee_name"),
       client.from("rippling_employees").select("*").order("period", { ascending: false }),
       fetchAllRows(client, "actuals"),
       client.from("goal_assignments").select("*").order("created_at", { ascending: false }),
-      client.from("employee_scorecard_settings").select("*")
+      client.from("employee_scorecard_settings").select("*"),
+      client.from("employee_overrides").select("*")
     ]);
+    // Empty (not an error) until the employee_overrides migration has run.
+    const employeeOverrides = overridesResult.error ? [] : (overridesResult.data || []).map(employeeOverrideFromRow);
 
     const rippling: Record<string, Employee[]> = {};
     const allEmployees: Employee[] = [];
     for (const row of ripplingResult.data || []) {
       const period = row.period || fixtureMonth;
-      const emp = employeeFromRow(row);
+      const [emp] = applyEmployeeOverrides(period, [employeeFromRow(row)], employeeOverrides);
       rippling[period] = [...(rippling[period] || []), emp];
       allEmployees.push(emp);
     }
@@ -832,7 +843,7 @@ export default function ScorecardsApp() {
     const scorecards = (scorecardsResult.data || []).map(scorecardFromRow);
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
-    setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
+    setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides }));
     setMyGoals(rawGoals);
   }
 
@@ -1778,7 +1789,7 @@ export default function ScorecardsApp() {
         return;
       }
     }
-    setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: employees } }));
+    setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: applyEmployeeOverrides(month, employees, current.employeeOverrides) } }));
     persistRippling(month, employees);
     const refreshed = await refreshSubmittedEarnings(month, { ...appData.rippling, [month]: employees });
     showToast(refreshed > 0
@@ -1844,6 +1855,44 @@ export default function ScorecardsApp() {
     });
     removePersistedRippling(month);
     showToast("Rippling data cleared for " + formatMonthLabel(month));
+  }
+
+  // Manual department/manager correction for one employee, from isoMonth onward. Survives
+  // uploads: rows stay as Rippling sent them and the override is re-applied on top.
+  async function saveEmployeeOverride(employeeName: string, isoMonth: string, patch: { department?: string; managerId?: string }) {
+    const existing = (appData.employeeOverrides || []).find((o) => o.employeeName === employeeName);
+    const manager = patch.managerId ? adminUsers.find((u) => u.id === patch.managerId) : undefined;
+    if (!patch.department && !patch.managerId) return clearEmployeeOverride(employeeName);
+    const override: EmployeeOverride = {
+      employeeName,
+      department: patch.department,
+      managerId: patch.managerId,
+      managerName: manager ? manager.linkedEmployeeName || manager.email : undefined,
+      effectiveFrom: existing && existing.effectiveFrom < isoMonth ? existing.effectiveFrom : isoMonth,
+      updatedBy: currentUserEmail,
+      updatedAt: new Date().toISOString()
+    };
+    if (!isFixture && sb) {
+      const result = await sb.from("employee_overrides").upsert(employeeOverrideToRow(override), { onConflict: "employee_name" });
+      if (result.error) { showSupabaseError(result.error, "Manual change could not be saved."); return; }
+    }
+    setAppData((current) => {
+      const employeeOverrides = [...(current.employeeOverrides || []).filter((o) => o.employeeName !== employeeName), override];
+      return { ...current, employeeOverrides, rippling: applyEmployeeOverridesToAll(current.rippling, employeeOverrides) };
+    });
+    showToast(`Saved — applies to ${employeeName} from ${formatMonthLabel(override.effectiveFrom)} on, including future uploads`);
+  }
+
+  async function clearEmployeeOverride(employeeName: string) {
+    if (!isFixture && sb) {
+      const result = await sb.from("employee_overrides").delete().eq("employee_name", employeeName);
+      if (result.error) { showSupabaseError(result.error, "Manual change could not be removed."); return; }
+    }
+    setAppData((current) => {
+      const employeeOverrides = (current.employeeOverrides || []).filter((o) => o.employeeName !== employeeName);
+      return { ...current, employeeOverrides, rippling: applyEmployeeOverridesToAll(current.rippling, employeeOverrides) };
+    });
+    showToast(`${employeeName} reset to Rippling's department and manager`);
   }
 
   async function submitScorecardDirect(scorecard: Scorecard) {
@@ -2093,6 +2142,13 @@ export default function ScorecardsApp() {
                 onSaveGoal={saveGoal}
                 onSaveTargetPair={(goal, period, target, min) => saveMonthTargetPair(goal, period, target, min)}
                 onSaveProrate={saveProrateDay}
+                employeeOverrides={appData.employeeOverrides}
+                managerOptions={adminUsers
+                  .filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin"))
+                  .map((u) => ({ id: u.id, label: u.linkedEmployeeName || u.email }))
+                  .sort((a, b) => a.label.localeCompare(b.label))}
+                onSaveEmployeeOverride={profile?.role === "admin" ? saveEmployeeOverride : undefined}
+                onClearEmployeeOverride={profile?.role === "admin" ? clearEmployeeOverride : undefined}
                 isAdmin={effectiveProfile?.role === "admin"}
                 companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
                 allowedDepartments={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.departments || [])}
@@ -2126,6 +2182,7 @@ export default function ScorecardsApp() {
               defaultMonth={workMonth}
               users={adminUsers.filter((u) => u.status !== "deactivated")}
               usersLoading={adminUsersLoading}
+              employeeOverrides={appData.employeeOverrides}
               saved={appData.rippling}
               onSaveForMonth={saveRipplingForMonth}
               onClearMonth={clearRipplingForMonth}
@@ -4642,6 +4699,11 @@ function ScorecardsScreen(props: {
   onSaveGoal: (goal: Goal) => Promise<Goal | null>;
   onSaveTargetPair: (goal: Goal, period: string, target: string, min: string) => void;
   onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
+  // Admin-only manual department/manager corrections (see saveEmployeeOverride).
+  employeeOverrides?: EmployeeOverride[];
+  managerOptions?: { id: string; label: string }[];
+  onSaveEmployeeOverride?: (employeeName: string, isoMonth: string, patch: { department?: string; managerId?: string }) => void;
+  onClearEmployeeOverride?: (employeeName: string) => void;
   isAdmin?: boolean;
   companyGoalAccess?: boolean;
   allowedDepartments?: string[];
@@ -4710,13 +4772,23 @@ function ScorecardsScreen(props: {
 
   // Use selected month's data if available, otherwise fall back to latest employees
   const monthRaw = singleMonthMode ? (props.rippling[selectedMonth] || []) : [];
-  const monthEmployees = monthRaw.length > 0 ? monthRaw : (singleMonthMode ? latestEmployees : []);
+  // The fallback rows come from an earlier upload, so apply overrides as of the month shown.
+  const monthEmployees = monthRaw.length > 0 ? monthRaw : (singleMonthMode ? applyEmployeeOverrides(selectedMonth, latestEmployees, props.employeeOverrides) : []);
   const teamEmployees = scopedEmployeesForProfile(monthEmployees, props.profile, props.allEmployees);
 
   // Earnings (hours + gross pay) come from the upload tagged to the same month being scored.
   // payrollAvailable = false for current/future months that have no upload yet.
   const earningsUpload = props.rippling[selectedMonth] || [];
   const payrollAvailable = earningsUpload.length > 0;
+  function overrideControlsFor(employeeName: string, isoMonth: string) {
+    if (!props.isAdmin || !props.onSaveEmployeeOverride) return undefined;
+    return {
+      managerOptions: props.managerOptions || [],
+      override: props.employeeOverrides?.find((o) => o.employeeName === employeeName),
+      onSave: (patch: { department?: string; managerId?: string }) => props.onSaveEmployeeOverride!(employeeName, isoMonth, patch),
+      onClear: () => props.onClearEmployeeOverride?.(employeeName),
+    };
+  }
   function withActualEarnings(emp: Employee): Employee {
     const src = earningsUpload.find((e) => e.name === emp.name);
     // Always override — if no upload for this month, earnings become undefined
@@ -4787,7 +4859,8 @@ function ScorecardsScreen(props: {
     if (forcedPeriod) return forcedPeriod === globalPeriodType;
     // Employees without an explicit designation are treated as monthly-only
     if (globalPeriodType === "quarterly") return false;
-    return goalsForEmployee(e).some((g) => g.periodType !== "quarterly");
+    // Manually edited employees stay visible even without goals, so the edit can be undone.
+    return goalsForEmployee(e).some((g) => g.periodType !== "quarterly") || !!e.uploaded;
   });
 
   // Employees deactivated for the selected month — shown separately with a Reactivate option
@@ -5064,6 +5137,7 @@ function ScorecardsScreen(props: {
                     onSaveGoal={props.onSaveGoal}
                     onSaveTargetPair={props.onSaveTargetPair}
                     onSaveProrate={props.onSaveProrate}
+                    overrideControls={overrideControlsFor(emp.name, selectedMonth)}
                     teamEmployees={teamEmployees}
                     isAdmin={props.isAdmin}
                     companyGoalAccess={props.companyGoalAccess}
@@ -5120,7 +5194,7 @@ function ScorecardsScreen(props: {
               <div className="no-goals-msg" style={{ display: "block" }}>No data available. Upload a Rippling CSV to get started.</div>
             ) : displayMonths.map((m) => {
               const mLabel = formatMonthLabel(m);
-              const mRaw = (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : latestEmployees;
+              const mRaw = (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : applyEmployeeOverrides(m, latestEmployees, props.employeeOverrides);
               const mTeam = scopedEmployeesForProfile(mRaw, props.profile, props.allEmployees);
               const mFiltered = mTeam
                 .filter((e) => {
@@ -5177,6 +5251,7 @@ function ScorecardsScreen(props: {
                         onSaveGoal={props.onSaveGoal}
                         onSaveTargetPair={props.onSaveTargetPair}
                         onSaveProrate={props.onSaveProrate}
+                        overrideControls={overrideControlsFor(emp.name, m)}
                         teamEmployees={mTeam}
                         isAdmin={props.isAdmin}
                         companyGoalAccess={props.companyGoalAccess}
@@ -5376,7 +5451,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5398,6 +5473,12 @@ function LiveScorecardCard({
   onSaveGoal: (goal: Goal) => Promise<Goal | null>;
   onSaveTargetPair: (goal: Goal, period: string, target: string, min: string) => void;
   onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
+  overrideControls?: {
+    managerOptions: { id: string; label: string }[];
+    override?: EmployeeOverride;
+    onSave: (patch: { department?: string; managerId?: string }) => void;
+    onClear: () => void;
+  };
   teamEmployees: Employee[];
   isAdmin?: boolean;
   companyGoalAccess?: boolean;
@@ -5697,6 +5778,7 @@ function LiveScorecardCard({
           <span className="block truncate text-[13.5px] font-medium text-foreground">{employee.name}</span>
           <span className="block truncate text-[11.5px] text-muted-foreground">
             {employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
+            {employee.uploaded ? <span title="Department or manager was changed manually and overrides Rippling" className="font-medium text-foreground"> · Edited</span> : null}
           </span>
         </span>
         {currentGoals.length > 0 && !ineligible ? (
@@ -5773,6 +5855,52 @@ function LiveScorecardCard({
                 </div>
               </div>
             )}
+            {overrideControls && (() => {
+              // Only an override that covers this card's month is shown as the current value.
+              const active = overrideControls.override && isoMonth >= overrideControls.override.effectiveFrom ? overrideControls.override : undefined;
+              const uploaded = employee.uploaded ?? { department: employee.department, manager: employee.manager };
+              const departmentOptions = Array.from(new Set([...SCORECARD_DEPARTMENTS, uploaded.department].filter(Boolean))).sort();
+              return (
+                <div className="flex flex-wrap items-end gap-2" onClick={(e) => e.stopPropagation()}>
+                  <div>
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Department{active?.department ? " · edited" : ""}</div>
+                    <Select
+                      value={active?.department || uploaded.department || undefined}
+                      onValueChange={(v) => overrideControls.onSave({ department: v === uploaded.department ? undefined : v, managerId: active?.managerId })}
+                    >
+                      <SelectTrigger className="h-7 w-[170px] text-[12px]" aria-label="Department override"><SelectValue placeholder="Department" /></SelectTrigger>
+                      <SelectContent>
+                        {departmentOptions.map((d) => <SelectItem key={d} value={d}>{d}{d === uploaded.department ? " (Rippling)" : ""}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Manager{active?.managerId ? " · edited" : ""}</div>
+                    <Select
+                      value={active?.managerId || "__rippling__"}
+                      onValueChange={(v) => overrideControls.onSave({ department: active?.department, managerId: v === "__rippling__" ? undefined : v })}
+                    >
+                      <SelectTrigger className="h-7 w-[190px] text-[12px]" aria-label="Manager override"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__rippling__">{uploaded.manager ? `${uploaded.manager} (Rippling)` : "From Rippling"}</SelectItem>
+                        {overrideControls.managerOptions.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {active && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-[12px]"
+                      title={`Manual change since ${formatMonthLabel(active.effectiveFrom)}${active.updatedBy ? ` by ${active.updatedBy}` : ""}`}
+                      onClick={overrideControls.onClear}
+                    >
+                      Reset to Rippling
+                    </Button>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           {hasNoTarget && (
@@ -6799,6 +6927,7 @@ function RipplingScreen(props: {
   defaultMonth: string;
   users: AssignableUser[];
   usersLoading: boolean;
+  employeeOverrides?: EmployeeOverride[];
   saved: Record<string, Employee[]>;
   onSaveForMonth: (month: string, employees: Employee[]) => void;
   onClearMonth: (month: string) => void;
@@ -6813,9 +6942,15 @@ function RipplingScreen(props: {
 
   // Re-resolved whenever the user list arrives/changes, so a file dropped before users load
   // still gets checked.
+  // Employees with a manual manager override aren't flagged — the override decides their manager.
+  const resolveWithOverrides = (rows: Employee[], month: string) => {
+    const resolved = resolveUploadManagers(rows, props.users);
+    return { ...resolved, issues: resolved.issues.filter((i) => !activeOverride(i.employeeName, month, props.employeeOverrides)?.managerId) };
+  };
   const { employees: preview, issues: managerIssues } = useMemo(
-    () => resolveUploadManagers(parsed, props.users),
-    [parsed, props.users]
+    () => resolveWithOverrides(parsed, uploadMonth),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [parsed, props.users, props.employeeOverrides, uploadMonth]
   );
   const unresolvedCount = managerIssues.filter((i) => !managerChoices[i.employeeName]).length;
 
@@ -6825,7 +6960,7 @@ function RipplingScreen(props: {
     setParsed(rows);
     setPreviewFileName(file.name);
     setManagerChoices({});
-    setShowManagerIssues(resolveUploadManagers(rows, props.users).issues.length > 0);
+    setShowManagerIssues(resolveWithOverrides(rows, uploadMonth).issues.length > 0);
   }
 
   function discardPreview() {
