@@ -17,6 +17,19 @@ import { getReportingTree } from "../lib/reportingTree";
 import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
+  DEFAULT_RATIO_TIER_TARGETS,
+  MIN_SPLIT_SHARE,
+  RATIO_TIERS,
+  RATIO_TIER_LABELS,
+  RATIO_TIER_TARGETS_SETTING_KEY,
+  applyCrossDeptSplit,
+  parseRatioTierTargets,
+  readDeptHours,
+  SPLIT_NOTE,
+  splitSummary,
+  type RatioTierTargets
+} from "../lib/crossDeptRatio";
+import {
   hydrateFromLocalStorage,
   persistActuals,
   persistGoals,
@@ -42,7 +55,7 @@ import {
   scorecardToRow,
   supabaseClient
 } from "../lib/supabase";
-import type { ActualsByKey, AppData, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard } from "../lib/types";
+import type { ActualsByKey, AppData, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard, ScorecardGoal } from "../lib/types";
 import { AppShell, type NavGroup } from "@/components/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -222,6 +235,10 @@ function metaKey(type: "target" | "min", goal: Pick<Goal, "goalTier" | "location
 // flagged as outstanding work. A manager can still submit one manually if there's an exception.
 const MIN_HOURS_FOR_SCORECARD = 40;
 
+// Company-wide ratio targets by department × seniority (admin-editable in Users & Settings),
+// used for the cross-department Individual Ratio split — see lib/crossDeptRatio.ts.
+const RatioTierTargetsContext = React.createContext<RatioTierTargets>(DEFAULT_RATIO_TIER_TARGETS);
+
 // Employee scorecard deactivation helpers — stored in actuals under a special sentinel period.
 const DEACT_PERIOD = "__employee_settings__";
 function deactMonthKey(employeeName: string, isoMonth: string) { return `__inactive_month__|${isoMonth}|${employeeName}`; }
@@ -345,6 +362,7 @@ export default function ScorecardsApp() {
   const [employeePeriodTypes, setEmployeePeriodTypes] = useState<Record<string, "monthly" | "quarterly">>({});
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceLoading, setMaintenanceLoading] = useState(false);
+  const [ratioTierTargets, setRatioTierTargets] = useState<RatioTierTargets>(DEFAULT_RATIO_TIER_TARGETS);
   // Resolved via /api/managers/company-goal-access for the real logged-in profile.
   // Only meaningful when adminUsers isn't loaded (i.e. not an admin session) — see resolveCompanyGoalAccess.
   const [hasCompanyGoalAccess, setHasCompanyGoalAccess] = useState(false);
@@ -484,7 +502,20 @@ export default function ScorecardsApp() {
     loadSetting(client, "maintenance_mode").then((val) => {
       if (val !== null) setMaintenanceMode(val === "true");
     });
+    loadSetting(client, RATIO_TIER_TARGETS_SETTING_KEY).then((val) => {
+      setRatioTierTargets(parseRatioTierTargets(val));
+    });
   }, [sb, isFixture]);
+
+  async function saveRatioTierTargets(next: RatioTierTargets) {
+    try {
+      if (!isFixture) await saveSetting(sb ?? supabaseClient(), RATIO_TIER_TARGETS_SETTING_KEY, JSON.stringify(next));
+      setRatioTierTargets(next);
+      showToast("Ratio targets saved");
+    } catch {
+      showToast("Could not save ratio targets", "error");
+    }
+  }
 
   async function toggleMaintenanceMode(enabled: boolean) {
     setMaintenanceLoading(true);
@@ -1589,7 +1620,8 @@ export default function ScorecardsApp() {
 
     const reviewRecommended: PfSyncReviewItem[] = body.reviewRecommended ?? [];
     const submittedMismatches: PfSubmittedMismatch[] = body.submittedMismatches ?? [];
-    const parts = [`Synced ${synced.length} value${synced.length === 1 ? "" : "s"} from Ops Dashboard.`];
+    const syncedGoalValues = synced.filter((w) => w.goalTier !== "__dept_split__").length;
+    const parts = [`Synced ${syncedGoalValues} value${syncedGoalValues === 1 ? "" : "s"} from Ops Dashboard.`];
     if (reviewRecommended.length > 0) {
       parts.push(`${reviewRecommended.length} already-filled value${reviewRecommended.length === 1 ? "" : "s"} may need review.`);
     }
@@ -1881,7 +1913,7 @@ export default function ScorecardsApp() {
   ) : null;
 
   return (
-    <>
+    <RatioTierTargetsContext.Provider value={ratioTierTargets}>
       <AppShell
         brand={{ title: "Pressed Floral", subtitle: "Scorecards" }}
         groups={navGroups}
@@ -2031,6 +2063,8 @@ export default function ScorecardsApp() {
               maintenanceMode={maintenanceMode}
               maintenanceLoading={maintenanceLoading}
               onToggleMaintenance={toggleMaintenanceMode}
+              ratioTierTargets={ratioTierTargets}
+              onSaveRatioTierTargets={saveRatioTierTargets}
               onRefresh={loadAdminUsers}
               onInvite={inviteAdminUser}
               onUpdate={updateAdminUser}
@@ -2095,7 +2129,7 @@ export default function ScorecardsApp() {
           onCancel={() => setDeleteModal(null)}
         />
       )}
-    </>
+    </RatioTierTargetsContext.Provider>
   );
 }
 
@@ -2300,6 +2334,7 @@ function PersonalScorecardPanel({
 
   // Goals for this employee — mirrors the exact state the manager sees in Team Scorecards.
   // Applies the same settings (excluded/added goals, weight overrides) and goal-assignment logic.
+  const ratioTierTargets = React.useContext(RatioTierTargetsContext);
   const liveGoals: EditableGoal[] = useMemo(() => {
     if (!myEmployee) return [];
     const periodType: "monthly" | "quarterly" = isQuarterly ? "quarterly" : "monthly";
@@ -2349,14 +2384,16 @@ function PersonalScorecardPanel({
 
     // 4. Map to EditableGoal — manager weight overrides take precedence over stored weights
     const weightOverrides: Record<string, number> = settings?.weightOverrides ?? {};
-    return goalList.map((g) => ({
+    const editable: EditableGoal[] = goalList.map((g) => ({
       ...g,
       scTarget: periodActuals[metaKey("target", g)] != null ? Number(periodActuals[metaKey("target", g)]) : g.goalValue,
       scMin: periodActuals[metaKey("min", g)] != null ? Number(periodActuals[metaKey("min", g)]) : g.minValue,
       scActual: periodActuals[personalActualKey(g, myEmployee.name)] != null ? Number(periodActuals[personalActualKey(g, myEmployee.name)]) : null,
       scWeight: weightOverrides[g.name] != null ? weightOverrides[g.name] : (g.weight ?? 0),
     }));
-  }, [myEmployee, allGoals, periodActuals, isQuarterly, periodISO, empSettings, goalAssignments]);
+    if (isQuarterly) return editable;
+    return applyCrossDeptSplit({ goals: editable, isoMonth: periodISO, role: myEmployee.role, deptHours: readDeptHours(periodActuals, myEmployee.name), tierTargets: ratioTierTargets });
+  }, [myEmployee, allGoals, periodActuals, isQuarterly, periodISO, empSettings, goalAssignments, ratioTierTargets]);
 
   const liveComputed = useMemo(() =>
     empWithEarnings && liveGoals.length > 0
@@ -2375,13 +2412,13 @@ function PersonalScorecardPanel({
       ? { earnings: liveComputed.baseEarnings, hours: empWithEarnings?.hoursWorked ?? null, achievement: liveComputed.weightedAchievement, bonus: liveComputed.bonusAmount, capped: liveComputed.scorecardCapped }
       : null;
 
-  type DisplayGoalRow = { id: string; name: string; goalTier: GoalTier; location?: string; department?: string; target: number | null; min: number | null; actual: number | null; weight: number; achievement: number | null; bonusContribution: number | null; metMin: boolean | null; hasTarget: boolean; };
+  type DisplayGoalRow = { id: string; name: string; goalTier: GoalTier; location?: string; department?: string; target: number | null; min: number | null; actual: number | null; weight: number; achievement: number | null; bonusContribution: number | null; metMin: boolean | null; hasTarget: boolean; split?: ScorecardGoal["split"]; };
   const displayGoals: DisplayGoalRow[] = submitted
-    ? submitted.goals.map((g) => ({ id: g.name, name: g.name, goalTier: g.goalTier, location: g.location, department: g.department, target: g.target, min: g.min, actual: g.actual, weight: g.weight, achievement: g.achievement, bonusContribution: g.bonusContribution, metMin: g.metMin, hasTarget: true }))
+    ? submitted.goals.map((g) => ({ id: g.name, name: g.name, goalTier: g.goalTier, location: g.location, department: g.department, target: g.target, min: g.min, actual: g.actual, weight: g.weight, achievement: g.achievement, bonusContribution: g.bonusContribution, metMin: g.metMin, hasTarget: true, split: g.split }))
     : liveGoals.map((g) => {
-        const hasTarget = periodActuals[metaKey("target", g)] != null && periodActuals[metaKey("min", g)] != null;
+        const hasTarget = (g.split && !g.split.isHome) || (periodActuals[metaKey("target", g)] != null && periodActuals[metaKey("min", g)] != null);
         const calc = liveComputed?.goals.find((sg) => sg.name === g.name);
-        return { id: g.id, name: g.name, goalTier: g.goalTier, location: g.location, department: g.department, target: hasTarget ? g.scTarget : null, min: hasTarget ? g.scMin : null, actual: g.scActual, weight: g.scWeight, achievement: calc?.achievement ?? null, bonusContribution: calc?.bonusContribution ?? null, metMin: calc?.metMin ?? null, hasTarget };
+        return { id: g.id, name: g.name, goalTier: g.goalTier, location: g.location, department: g.department, target: hasTarget ? g.scTarget : null, min: hasTarget ? g.scMin : null, actual: g.scActual, weight: g.scWeight, achievement: calc?.achievement ?? null, bonusContribution: calc?.bonusContribution ?? null, metMin: calc?.metMin ?? null, hasTarget, split: g.split };
       });
 
   const dash = <span className="text-muted-foreground/40">—</span>;
@@ -2467,6 +2504,8 @@ function PersonalScorecardPanel({
         )}
       </div>
 
+      <SplitNote goals={displayGoals} />
+
       {/* Goals table */}
       {displayGoals.length > 0 ? (
         <div className="overflow-x-auto">
@@ -2492,6 +2531,11 @@ function PersonalScorecardPanel({
                     {g.name}
                     <GoalScopeTags location={g.location} department={g.department} />
                   </span>
+                  {g.split && (
+                    <span className="mt-0.5 block text-[10.5px] font-normal text-muted-foreground">
+                      {(g.split.share * 100).toFixed(0)}% of production time · {g.split.hours.toFixed(1)} hrs
+                    </span>
+                  )}
                 </TableCell>
                 <TableCell className="text-right tabular-nums">{g.target != null ? formatNumber(g.target) : dash}</TableCell>
                 <TableCell className="text-right tabular-nums">{g.min != null ? formatNumber(g.min) : dash}</TableCell>
@@ -2804,6 +2848,8 @@ function UsersScreen(props: {
   maintenanceMode: boolean;
   maintenanceLoading: boolean;
   onToggleMaintenance: (enabled: boolean) => void;
+  ratioTierTargets: RatioTierTargets;
+  onSaveRatioTierTargets: (next: RatioTierTargets) => void;
   onRefresh: () => void;
   onInvite: (payload: AdminUserPayload) => Promise<boolean>;
   onUpdate: (payload: AdminUserPayload) => Promise<boolean>;
@@ -2842,6 +2888,8 @@ function UsersScreen(props: {
           <Switch checked={props.maintenanceMode} onCheckedChange={(c) => props.onToggleMaintenance(c)} disabled={props.maintenanceLoading} aria-label="Toggle maintenance mode" />
         </div>
       </section>
+
+      <RatioTierTargetsEditor targets={props.ratioTierTargets} onSave={props.onSaveRatioTierTargets} />
 
       <section>
         <div className="mb-3 flex items-center justify-between">
@@ -2994,6 +3042,69 @@ function UsersScreen(props: {
         </SheetContent>
       </Sheet>
     </div>
+  );
+}
+
+function RatioTierTargetsEditor({ targets, onSave }: { targets: RatioTierTargets; onSave: (next: RatioTierTargets) => void }) {
+  const depts = Object.keys(DEFAULT_RATIO_TIER_TARGETS) as (keyof RatioTierTargets)[];
+  const toDraft = (t: RatioTierTargets) =>
+    Object.fromEntries(depts.map((d) => [d, Object.fromEntries(RATIO_TIERS.map((tier) => [tier, String(t[d]?.[tier] ?? "")]))])) as Record<string, Record<string, string>>;
+  const [draft, setDraft] = useState(() => toDraft(targets));
+  useEffect(() => { setDraft(toDraft(targets)); }, [targets]); // eslint-disable-line react-hooks/exhaustive-deps
+  const valid = depts.every((d) => RATIO_TIERS.every((tier) => Number(draft[d]?.[tier]) > 0));
+  const dirty = depts.some((d) => RATIO_TIERS.some((tier) => Number(draft[d]?.[tier]) !== targets[d]?.[tier]));
+
+  return (
+    <section>
+      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-primary">Cross-department ratio targets</div>
+      <div className="mb-3 text-[12px] text-muted-foreground">
+        When someone clocks into another production department, their Individual Ratio is split by hours. The other
+        department&apos;s row uses the Goal for their seniority and the Specialist value as the Min. Departments under{" "}
+        {(MIN_SPLIT_SHARE * 100).toFixed(0)}% of their production hours stay in their home ratio. Same at every location.
+      </div>
+      <div className="overflow-hidden rounded-lg border border-border">
+        <Table className="text-[12px]">
+          <TableHeader className="bg-muted/40 [&_th]:h-8 [&_th]:px-3 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
+            <TableRow className="hover:bg-transparent">
+              <TableHead>Department</TableHead>
+              {RATIO_TIERS.map((tier) => <TableHead key={tier} className="w-[110px] text-center">{RATIO_TIER_LABELS[tier]}</TableHead>)}
+            </TableRow>
+          </TableHeader>
+          <TableBody className="[&_td]:px-3 [&_td]:py-1.5">
+            {depts.map((d) => (
+              <TableRow key={d}>
+                <TableCell className="font-medium text-foreground">{d}</TableCell>
+                {RATIO_TIERS.map((tier) => (
+                  <TableCell key={tier} className="text-center">
+                    <Input
+                      aria-label={`${d} ${RATIO_TIER_LABELS[tier]} ratio target`}
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={draft[d]?.[tier] ?? ""}
+                      onChange={(e) => setDraft((prev) => ({ ...prev, [d]: { ...prev[d], [tier]: e.target.value } }))}
+                      className="mx-auto h-7 w-[80px] text-center text-[12px] tabular-nums"
+                    />
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="mt-2 flex items-center justify-end gap-2">
+        {!valid && <span className="text-[11.5px] text-destructive">Every target must be greater than 0</span>}
+        <Button variant="outline" size="sm" className="text-[12px]" disabled={!dirty} onClick={() => setDraft(toDraft(targets))}>Reset</Button>
+        <Button
+          size="sm"
+          className="text-[12px]"
+          disabled={!dirty || !valid}
+          onClick={() => onSave(Object.fromEntries(depts.map((d) => [d, Object.fromEntries(RATIO_TIERS.map((tier) => [tier, Number(draft[d][tier])]))])) as RatioTierTargets)}
+        >
+          Save targets
+        </Button>
+      </div>
+    </section>
   );
 }
 
@@ -5284,6 +5395,7 @@ function LiveScorecardCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoOpen, autoOpenNonce]);
   const [creatingGoal, setCreatingGoal] = useState<Goal | null>(null);
+  const ratioTierTargets = React.useContext(RatioTierTargetsContext);
   const effectivePeriodType = forcePeriodType ?? globalPeriodType;
 
   // Proration: optional last-day date input, stored as day-of-month in actuals
@@ -5458,8 +5570,7 @@ function LiveScorecardCard({
     const goals = goalIds
       .map((id) => allGoals.find((g) => g.id === id))
       .filter((g): g is Goal => !!g && goalActiveForMonth(g, isoMonth));
-    const n = goals.length;
-    return goals.map((g) => {
+    const editable: EditableGoal[] = goals.map((g) => {
       // Weight comes from Goals Bank. Manager overrides take precedence.
       // Never auto-distribute — if no weight is set the goal shows blank and
       // blocks submission until weights are configured in Goals & Actuals.
@@ -5478,6 +5589,17 @@ function LiveScorecardCard({
         scWeight
       };
     });
+    // Per-department hours are stored per month, so the cross-department split is monthly-only.
+    if (cardPeriodType !== "monthly") return editable;
+    return applyCrossDeptSplit({
+      goals: editable,
+      isoMonth,
+      role: employee.role,
+      deptHours: readDeptHours(periodActuals, employee.name),
+      tierTargets: ratioTierTargets
+    }).map((g) => (g.split && !g.split.isHome && indActuals[g.name] !== undefined
+      ? { ...g, scActual: indActuals[g.name] === "" ? null : Number(indActuals[g.name]) }
+      : g));
   })();
 
   // For quarterly cards, payrollAvailable reflects whether a Rippling upload was found
@@ -5614,6 +5736,8 @@ function LiveScorecardCard({
             </div>
           )}
 
+          <SplitNote goals={currentGoals} />
+
           {cardPeriodType === "quarterly" && quarterlyEstimatedMonths.length > 0 && (
             <div className="flex items-start gap-2 border-t border-[#f0e0a0] bg-[#fffbf0] px-4 py-2 text-[11.5px] text-[#7a5c00]">
               <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
@@ -5657,11 +5781,23 @@ function LiveScorecardCard({
                   const sc = liveScorecard.goals.find((g) => g.name === goal.name);
                   const noTarget = !goal.scTarget;
                   const isInd = goal.goalTier === "individual";
+                  const isSplit = !!goal.split;
+                  const isSplitSlice = isSplit && !goal.split!.isHome;
                   return (
                     <TableRow key={goal.id}>
                       <TableCell><TierBadge tier={goal.goalTier} /></TableCell>
                       <TableCell className="font-medium text-foreground">
                         <span className="flex items-center gap-1.5">{goal.name}<GoalScopeTags location={goal.location} department={goal.department} /></span>
+                        {isSplit && (
+                          <span
+                            className="mt-0.5 block text-[10.5px] font-normal text-muted-foreground"
+                            title={isSplitSlice
+                              ? "Weight split from the home Individual Ratio by production hours. Goal is this department's target for their seniority; Min is its Specialist target."
+                              : "Home share of the Individual Ratio, including any departments under the split threshold."}
+                          >
+                            {(goal.split!.share * 100).toFixed(0)}% of production time · {goal.split!.hours.toFixed(1)} hrs
+                          </span>
+                        )}
                       </TableCell>
                       <TableCell className="text-center tabular-nums">{noTarget ? <span className="text-[10px] text-[var(--text-faint)]">not set</span> : formatNumber(goal.scTarget)}</TableCell>
                       <TableCell className="text-center tabular-nums">{noTarget ? <span className="text-[10px] text-[var(--text-faint)]">not set</span> : formatNumber(goal.scMin)}</TableCell>
@@ -5679,7 +5815,9 @@ function LiveScorecardCard({
                         )}
                       </TableCell>
                       <TableCell className="text-center tabular-nums">
-                        {weightOverrides[goal.name] != null
+                        {isSplit
+                          ? `${goal.scWeight.toFixed(1)}%`
+                          : weightOverrides[goal.name] != null
                           ? `${Number(weightOverrides[goal.name]).toFixed(1)}%`
                           : goal.weight != null && goal.weight > 0
                             ? `${goal.weight.toFixed(1)}%`
@@ -5694,9 +5832,10 @@ function LiveScorecardCard({
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(sc?.bonusContribution ?? 0)}</TableCell>
                       <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
-                        <GoalRowMenu
+                        {!isSplitSlice && <GoalRowMenu
                           goalName={goal.name}
-                          currentWeight={weightOverrides[goal.name] ?? goal.scWeight.toFixed(1)}
+                          // A split home row edits the whole Individual Ratio weight, not just its slice.
+                          currentWeight={weightOverrides[goal.name] ?? (isSplit ? (goal.weight ?? 0) : goal.scWeight).toFixed(1)}
                           onApplyWeight={(w) => {
                             const next = { ...weightOverrides, [goal.name]: w };
                             setWeightOverrides(next);
@@ -5707,7 +5846,7 @@ function LiveScorecardCard({
                             setGoalIds(next);
                             saveSettingsNow(next, weightOverrides, cardPeriodType);
                           }}
-                        />
+                        />}
                       </TableCell>
                     </TableRow>
                   );
@@ -5815,6 +5954,19 @@ function LiveScorecardCard({
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// Shown on any scorecard whose Individual Ratio was split across departments by time spent —
+// live, submitted, and on the employee's own view — so reviewers know why there are extra rows.
+function SplitNote({ goals }: { goals: { department?: string; split?: { share: number; hours: number } }[] }) {
+  const summary = splitSummary(goals);
+  if (!summary) return null;
+  return (
+    <div className="flex items-start gap-2 border-t border-border bg-[#f3f6fb] px-4 py-2 text-[11.5px] text-[#2b4a6f]">
+      <Info className="mt-0.5 size-3.5 shrink-0" />
+      <span><span className="font-semibold">{SPLIT_NOTE}</span> {summary}</span>
     </div>
   );
 }
@@ -6011,6 +6163,7 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
               </div>
             ))}
           </div>
+          <SplitNote goals={scorecard.goals} />
           <Table className="border-t border-border text-[12px]">
             <TableHeader className="bg-muted/40 [&_th]:h-8 [&_th]:px-2.5 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
               <TableRow className="hover:bg-transparent">
@@ -6031,6 +6184,11 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
                   <TableCell><TierBadge tier={goal.goalTier} /></TableCell>
                   <TableCell className="font-medium text-foreground">
                     <span className="flex items-center gap-1.5">{goal.name}<GoalScopeTags location={goal.location} department={goal.department} /></span>
+                    {goal.split && (
+                      <span className="mt-0.5 block text-[10.5px] font-normal text-muted-foreground">
+                        {(goal.split.share * 100).toFixed(0)}% of production time · {goal.split.hours.toFixed(1)} hrs
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell className="text-center tabular-nums">{goal.target ?? "—"}</TableCell>
                   <TableCell className="text-center tabular-nums">{goal.min ?? "—"}</TableCell>
