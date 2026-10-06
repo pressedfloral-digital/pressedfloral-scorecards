@@ -126,9 +126,13 @@ export async function PATCH(request: NextRequest) {
     authUser = emailUpdate.data.user;
   }
 
+  // Clearing every alias has to write an empty list, which is only safe once the column exists.
+  const existingProfile = await admin.client.from("manager_profiles").select("*").eq("id", targetId).maybeSingle();
+  const includeAliases = !!existingProfile.data && "linked_name_aliases" in existingProfile.data;
+
   const profileResult = await admin.client
     .from("manager_profiles")
-    .upsert(adminProfileToRow(targetId, payload.value), { onConflict: "id" })
+    .upsert(adminProfileToRow(targetId, payload.value, { includeAliases }), { onConflict: "id" })
     .select()
     .single();
   if (profileResult.error) return jsonError(profileResult.error.message, 500);

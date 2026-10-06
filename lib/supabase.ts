@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { isConfiguredProfile, parseProfileRole } from "./adminUsers";
+import { isConfiguredProfile, parseNameAliases, parseProfileRole } from "./adminUsers";
 import type { ActualsByKey, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, ManagerProfile, Scorecard } from "./types";
 
 export const dataMode = process.env.NEXT_PUBLIC_SCORECARDS_DATA_MODE === "fixture" ? "fixture" : "supabase";
@@ -106,12 +106,15 @@ export function employeeToRow(period: string, employee: Employee) {
     period,
     full_name: employee.name,
     role: employee.role,
-    department: employee.department,
+    // Rows are stored as Rippling uploaded them; overrides are applied on load.
+    department: employee.uploaded?.department ?? employee.department,
     location: employee.location,
-    manager: employee.manager || null,
+    manager: (employee.uploaded ? employee.uploaded.manager : employee.manager) || null,
     // Only sent when set, so uploads without assignments still work against a database
     // that hasn't run the assigned_manager_id migration yet.
-    ...(employee.assignedManagerId ? { assigned_manager_id: employee.assignedManagerId } : {}),
+    ...((employee.uploaded ? employee.uploaded.assignedManagerId : employee.assignedManagerId)
+      ? { assigned_manager_id: employee.uploaded ? employee.uploaded.assignedManagerId : employee.assignedManagerId }
+      : {}),
     pay_type: employee.payType,
     hourly_rate: employee.hourlyRate || null,
     annual_pay: employee.annualPay || null,
@@ -131,6 +134,7 @@ export function profileFromRow(email: string, row: Record<string, any>): Manager
     departments: Array.isArray(row.departments) ? row.departments : [],
     locations: Array.isArray(row.locations) ? row.locations : [],
     linkedEmployeeName: typeof row.linked_employee_name === "string" && row.linked_employee_name.trim() ? row.linked_employee_name.trim() : undefined,
+    linkedNameAliases: parseNameAliases(row.linked_name_aliases),
     titleOverride: typeof row.title_override === "string" && row.title_override.trim() ? row.title_override.trim() : undefined,
   supervisorId: row.supervisor_id || undefined,
   scorecardPeriodType: row.scorecard_period_type === "quarterly" ? "quarterly" : "monthly",

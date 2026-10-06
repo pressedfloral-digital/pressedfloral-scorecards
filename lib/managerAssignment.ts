@@ -1,7 +1,7 @@
 import type { Employee, ProfileRole } from "./types";
 
 // Matching Rippling upload rows to the app user who manages them. A row whose Manager name
-// matches exactly one app user — and doesn't contradict the team member's own supervisor on
+// matches exactly one app user (by linked employee name or any of their alternate names) — and doesn't contradict the team member's own supervisor on
 // the Users page — is assigned automatically. Everything else becomes an issue the uploader
 // has to resolve before the upload saves.
 
@@ -12,6 +12,7 @@ export type AssignableUser = {
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  linkedNameAliases?: string[];
   supervisorId?: string;
 };
 
@@ -61,9 +62,8 @@ export function scopeMatches(emp: Pick<Employee, "department" | "location">, use
 export function resolveUploadManagers(employees: Employee[], users: AssignableUser[]): { employees: Employee[]; issues: ManagerIssue[] } {
   const byLinkedName = new Map<string, AssignableUser[]>();
   for (const u of users) {
-    const key = normalizePersonName(u.linkedEmployeeName);
-    if (!key) continue;
-    byLinkedName.set(key, [...(byLinkedName.get(key) || []), u]);
+    const keys = new Set([u.linkedEmployeeName, ...(u.linkedNameAliases || [])].map(normalizePersonName).filter(Boolean));
+    for (const key of keys) byLinkedName.set(key, [...(byLinkedName.get(key) || []), u]);
   }
   const userIds = new Set(users.map((u) => u.id));
 
