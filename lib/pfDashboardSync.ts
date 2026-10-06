@@ -20,6 +20,7 @@
 
 import { actualKey, personalActualKey } from "./scorecardCompletion";
 import { formatMonthLabel, currentMonthValue, nextMonthValue } from "./periods";
+import { DEPT_SPLIT_TIER, PRODUCTION_DEPTS, deptSplitGoalName } from "./crossDeptRatio";
 import type { Goal } from "./types";
 
 // ── Minimal shapes of pf-dashboard's API responses (can't import cross-repo) ───
@@ -66,6 +67,8 @@ interface PfEstimatedMonthResult {
 interface PfMemberRatio {
   name: string;
   department: string;
+  hours: number;
+  orders: number;
   ratio: number | null;
 }
 
@@ -168,6 +171,33 @@ function individualLookupDept(goal: Goal): { dept: string; isFlex: boolean } {
     return { dept, isFlex: true };
   }
   return { dept: goal.department || "", isFlex: false };
+}
+
+// Ops Dashboard's schedule names don't always match the Rippling upload exactly — "Cyd Gay" vs
+// "Cyd G", "Sherilyn Taylor" vs "Sher Taylor". Returns the roster (Rippling) name an Ops Dashboard
+// name refers to: an exact (case/space-insensitive) match always wins; otherwise one name's first
+// or last name may be a shortened form of the other's (nickname or initial) as long as the other
+// half matches exactly, the person is at the same location, and exactly one roster person fits.
+export function matchRosterName(opsName: string, location: string, roster: PfRosterEmployee[]): string | null {
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ").replace(/\.$/, "");
+  const target = norm(opsName);
+  const exact = roster.find((e) => norm(e.name) === target);
+  if (exact) return exact.name;
+
+  const split = (s: string) => {
+    const parts = norm(s).replace(/\./g, "").split(" ");
+    return { first: parts[0] ?? "", last: parts.length > 1 ? parts[parts.length - 1] : "" };
+  };
+  const a = split(opsName);
+  if (!a.first || !a.last) return null;
+  const shortForm = (x: string, y: string) => x !== y && (x.startsWith(y) || y.startsWith(x));
+  const candidates = roster.filter((e) => {
+    if (e.location && location && e.location !== location) return false;
+    const b = split(e.name);
+    if (!b.first || !b.last) return false;
+    return (a.first === b.first && shortForm(a.last, b.last)) || (a.last === b.last && shortForm(a.first, b.first));
+  });
+  return candidates.length === 1 ? candidates[0].name : null;
 }
 
 function resolveIndividualValueForEmployee(
@@ -327,9 +357,13 @@ export async function computePfDashboardSync(params: {
   const targetWindow = windows.find((w) => w.periodStart === `${targetMonth}-01`);
 
   const byLocation = scorecardData.byLocation ?? {};
+  // Member names are rewritten to their Rippling roster spelling up front (see matchRosterName),
+  // so every lookup below matches on the same name the scorecards use.
+  const withRosterNames = (loc: string, members: PfMemberRatio[]) =>
+    members.map((m) => ({ ...m, name: matchRosterName(m.name, loc, roster) ?? m.name }));
   const memberRatiosByLoc: Record<string, PfMemberRatio[]> = {
-    Utah: (byLocation.Utah?.[targetMonth] as PfScorecardMonthData | undefined)?.memberRatios ?? [],
-    Georgia: (byLocation.Georgia?.[targetMonth] as PfScorecardMonthData | undefined)?.memberRatios ?? [],
+    Utah: withRosterNames("Utah", (byLocation.Utah?.[targetMonth] as PfScorecardMonthData | undefined)?.memberRatios ?? []),
+    Georgia: withRosterNames("Georgia", (byLocation.Georgia?.[targetMonth] as PfScorecardMonthData | undefined)?.memberRatios ?? []),
   };
 
   const writes: PfSyncWrite[] = [];
@@ -352,6 +386,35 @@ export async function computePfDashboardSync(params: {
 
     const [goalTier, location, department, goalName] = actualKey(goal).split("|");
     writes.push({ goalId: goal.id, period, goalTier, location, department, goalName, value });
+  }
+
+  // ── Per-department hours/orders for the cross-department ratio split ──
+  // Every production-department hour/order count per roster employee, summed across both
+  // locations, so a home Individual Ratio can be split by where the person actually worked
+  // (see lib/crossDeptRatio.ts). All four departments are written — including zeros — for
+  // anyone with any production time, so a corrected-away department doesn't leave a stale row.
+  const norm = (s: string) => s.trim().toLowerCase();
+  const rosterByNorm = new Map(roster.map((e) => [norm(e.name), e.name]));
+  const splitTotals = new Map<string, Record<string, { hours: number; orders: number }>>();
+  for (const m of [...memberRatiosByLoc.Utah, ...memberRatiosByLoc.Georgia]) {
+    if (!(PRODUCTION_DEPTS as readonly string[]).includes(m.department)) continue;
+    const employeeName = rosterByNorm.get(norm(m.name));
+    if (!employeeName) continue;
+    const byDept = splitTotals.get(employeeName) ?? {};
+    const cur = byDept[m.department] ?? { hours: 0, orders: 0 };
+    byDept[m.department] = { hours: cur.hours + (m.hours || 0), orders: cur.orders + (m.orders || 0) };
+    splitTotals.set(employeeName, byDept);
+  }
+  for (const [employeeName, byDept] of splitTotals) {
+    for (const dept of PRODUCTION_DEPTS) {
+      const t = byDept[dept] ?? { hours: 0, orders: 0 };
+      for (const metric of ["hours", "orders"] as const) {
+        writes.push({
+          goalId: "", period, goalTier: DEPT_SPLIT_TIER, location: "", department: dept,
+          goalName: deptSplitGoalName(metric, employeeName), value: t[metric],
+        });
+      }
+    }
   }
 
   // ── Goal/Min sync — this month and next month's forward-looking targets ──

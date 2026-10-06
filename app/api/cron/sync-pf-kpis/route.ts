@@ -28,6 +28,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { goalFromRow } from "@/lib/supabase";
 import { computePfDashboardSync } from "@/lib/pfDashboardSync";
+import { DEPT_SPLIT_TIER } from "@/lib/crossDeptRatio";
 import { currentMonthValue, formatMonthLabel, nextMonthValue } from "@/lib/periods";
 
 export const runtime = "nodejs";
@@ -142,7 +143,12 @@ export async function GET(request: NextRequest) {
     // period explicitly (previously safe to omit, since every write shared the same `period`).
     const keyOf = (w: { period: string; goalTier: string; location: string; department: string; goalName: string }) =>
       [w.period, w.goalTier, w.location, w.department, w.goalName].join("|");
-    const uniqueWrites = Array.from(new Map(writes.map((w) => [keyOf(w), w])).values());
+    // Per-department hours/orders for the cross-department ratio split are derived data, not
+    // anything a person types in — always overwritten with Ops Dashboard's latest numbers and
+    // kept out of the review/mismatch/audit lists below.
+    const allUniqueWrites = Array.from(new Map(writes.map((w) => [keyOf(w), w])).values());
+    const splitWrites = allUniqueWrites.filter((w) => w.goalTier === DEPT_SPLIT_TIER);
+    const uniqueWrites = allUniqueWrites.filter((w) => w.goalTier !== DEPT_SPLIT_TIER);
 
     const thisMonthPeriod = formatMonthLabel(currentMonthValue());
     const nextMonthPeriod = formatMonthLabel(nextMonthValue(currentMonthValue()));
@@ -287,7 +293,7 @@ export async function GET(request: NextRequest) {
       Array.from(existingByKey.entries()).filter(([, v]) => v !== null).map(([k]) => k)
     );
 
-    const toWrite = uniqueWrites.filter((w) => !filled.has(keyOf(w)));
+    const toWrite = [...uniqueWrites.filter((w) => !filled.has(keyOf(w))), ...splitWrites];
 
     // Cells that already had a value we're leaving alone (fill-only-if-empty),
     // but where pf-dashboard now computes something meaningfully different —
@@ -333,8 +339,8 @@ export async function GET(request: NextRequest) {
       period,
       considered,
       synced: toWrite,
-      skippedExisting: uniqueWrites.length - toWrite.length,
-      unmapped: considered - writes.length,
+      skippedExisting: uniqueWrites.length + splitWrites.length - toWrite.length,
+      unmapped: considered - (writes.length - splitWrites.length),
       reviewRecommended,
       submittedMismatches,
     });

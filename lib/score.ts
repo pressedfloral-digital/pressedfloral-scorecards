@@ -1,10 +1,11 @@
-import type { Employee, Goal, PayType, Scorecard, ScorecardGoal } from "./types";
+import type { Employee, Goal, PayType, Scorecard, ScorecardGoal, ScorecardGoalSplit } from "./types";
 
 export type EditableGoal = Goal & {
   scTarget: number;
   scMin: number;
   scActual: number | null;
   scWeight: number;
+  split?: ScorecardGoalSplit;
 };
 
 export function baseEarnings(input: {
@@ -239,8 +240,8 @@ export function buildScorecard(input: {
     periodType: input.periodType
   });
 
-  const goals = input.goals.map((goal) =>
-    calculateGoal({
+  const goals = input.goals.map((goal) => {
+    const scored = calculateGoal({
       goal,
       target: goal.scTarget,
       min: goal.scMin,
@@ -248,8 +249,9 @@ export function buildScorecard(input: {
       weight: goal.scWeight,
       baseEarnings: earnings,
       bonusPotentialPct
-    })
-  );
+    });
+    return goal.split ? { ...scored, split: goal.split } : scored;
+  });
   const weightedAchievement = goals.reduce((sum, goal) => sum + goal.weighted, 0);
   const scorecardCapped = weightedAchievement > 200;
   const finalAchievement = scorecardCapped ? 200 : weightedAchievement;

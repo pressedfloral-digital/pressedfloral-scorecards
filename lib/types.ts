@@ -62,6 +62,15 @@ export type Employee = {
   employmentType?: string;
 };
 
+// Set on Individual Ratio rows that were split by time spent in each production department
+// (lib/crossDeptRatio.ts). Saved with submitted scorecards so the split stays explained.
+export type ScorecardGoalSplit = {
+  of: string;       // id of the home goal this row was split from
+  share: number;    // share of production hours this row covers (0–1)
+  hours: number;
+  isHome: boolean;
+};
+
 export type ScorecardGoal = {
   name: string;
   goalTier: GoalTier;
@@ -79,6 +88,7 @@ export type ScorecardGoal = {
   weighted: number;
   bonusContribution: number;
   metMin: boolean;
+  split?: ScorecardGoalSplit;
 };
 
 export type Scorecard = {
