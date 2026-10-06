@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fixtureEmployees, fixtureGoals, fixturePeriod } from "../../lib/fixtures";
-import { baseEarnings, buildScorecard, calculateGoal, sumQuarterlyEmployee } from "../../lib/score";
+import { baseEarnings, buildScorecard, calculateGoal, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee } from "../../lib/score";
+import type { Employee, Scorecard } from "../../lib/types";
 
 describe("score calculations", () => {
   it("calculates higher-is-better goals", () => {
@@ -179,6 +180,61 @@ describe("score calculations", () => {
       expect(result.estimatedMonths).toEqual([]);
       expect(result.missingMonths).toEqual(qMonths);
       expect(result.hoursWorked).toBeUndefined();
+    });
+  });
+
+  describe("refreshScorecardEarnings", () => {
+    const hourly = (name: string, hoursWorked: number, hourlyRate = 18.5): Employee => ({
+      id: name, name, role: "Designer", department: "Design", location: "Georgia", manager: "",
+      payType: "hourly", hourlyRate, hoursWorked
+    });
+    const submitted = (overrides: Partial<Scorecard> = {}): Scorecard => ({
+      id: "sc-1", employeeName: "Erin Webb", role: "Designer", department: "Design", location: "Georgia",
+      payType: "hourly", hourlyRate: 18.5, baseEarnings: 0, bonusPotentialPct: 10,
+      scorecardMonth: "September 2026", periodType: "monthly", weightedAchievement: 110,
+      bonusAmount: 0, scorecardCapped: false, flag120: false, reviewStatus: "pending_review",
+      goals: [{ ...calculateGoal({ goal: fixtureGoals[0], target: 100, min: 80, actual: 110, weight: 100, baseEarnings: 0 }) }],
+      ...overrides
+    });
+
+    it("maps scorecard periods to payroll months", () => {
+      expect(scorecardPayrollMonths("September 2026")).toEqual(["2026-09"]);
+      expect(scorecardPayrollMonths("Q3 2026")).toEqual(["2026-07", "2026-08", "2026-09"]);
+      expect(scorecardPayrollMonths("garbage")).toEqual([]);
+    });
+
+    it("re-prices a scorecard submitted before payroll was uploaded", () => {
+      const next = refreshScorecardEarnings({ scorecard: submitted(), ripplingByMonth: { "2026-09": [hourly("Erin Webb", 100)] } });
+      expect(next?.baseEarnings).toBeCloseTo(1850);
+      expect(next?.hours).toBe(100);
+      expect(next?.bonusAmount).toBeCloseTo(1850 * 1.1 * 0.1);
+      expect(next?.goals[0].bonusContribution).toBeCloseTo(1850 * 1.1 * 0.1);
+      expect(next?.weightedAchievement).toBe(110);
+      expect(next?.reviewStatus).toBe("pending_review");
+    });
+
+    it("leaves approved, unmatched and unchanged scorecards alone", () => {
+      const rippling = { "2026-09": [hourly("Erin Webb", 100)] };
+      expect(refreshScorecardEarnings({ scorecard: submitted({ reviewStatus: "approved" }), ripplingByMonth: rippling })).toBeNull();
+      expect(refreshScorecardEarnings({ scorecard: submitted({ employeeName: "Someone Else" }), ripplingByMonth: rippling })).toBeNull();
+      expect(refreshScorecardEarnings({ scorecard: submitted({ baseEarnings: 1850, hours: 100 }), ripplingByMonth: rippling })).toBeNull();
+    });
+
+    it("keeps a prorated bonus prorated", () => {
+      const explicit = refreshScorecardEarnings({ scorecard: submitted(), ripplingByMonth: { "2026-09": [hourly("Erin Webb", 100)] }, prorationFactor: 0.5 });
+      expect(explicit?.bonusAmount).toBeCloseTo(101.75);
+      // Recovered from the stored ratio: $1000 earnings, 50%-prorated $55 bonus.
+      const recovered = refreshScorecardEarnings({ scorecard: submitted({ baseEarnings: 1000, bonusAmount: 55 }), ripplingByMonth: { "2026-09": [hourly("Erin Webb", 100)] } });
+      expect(recovered?.bonusAmount).toBeCloseTo(101.75);
+    });
+
+    it("sums the quarter for quarterly scorecards", () => {
+      const next = refreshScorecardEarnings({
+        scorecard: submitted({ scorecardMonth: "Q3 2026", periodType: "quarterly" }),
+        ripplingByMonth: { "2026-07": [hourly("Erin Webb", 100)], "2026-09": [hourly("Erin Webb", 50)] }
+      });
+      expect(next?.baseEarnings).toBeCloseTo(150 * 18.5);
+      expect(next?.hours).toBe(150);
     });
   });
 });

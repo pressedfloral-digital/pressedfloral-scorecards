@@ -74,6 +74,98 @@ export function sumQuarterlyEmployee(input: {
   };
 }
 
+const MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+
+/** ISO months ("2026-09") a scorecard's earnings come from: one for "September 2026", three for "Q3 2026". */
+export function scorecardPayrollMonths(scorecardMonth: string): string[] {
+  const quarter = scorecardMonth.match(/^Q([1-4]) (\d{4})$/);
+  if (quarter) {
+    const start = (Number(quarter[1]) - 1) * 3 + 1;
+    return [0, 1, 2].map((i) => `${quarter[2]}-${String(start + i).padStart(2, "0")}`);
+  }
+  const monthly = scorecardMonth.match(/^([A-Za-z]+) (\d{4})$/);
+  const monthIndex = monthly ? MONTH_NAMES.indexOf(monthly[1].toLowerCase()) : -1;
+  return monthIndex === -1 ? [] : [`${monthly![2]}-${String(monthIndex + 1).padStart(2, "0")}`];
+}
+
+/**
+ * Re-prices an already-submitted scorecard against the current Rippling uploads, keeping its
+ * frozen goals/achievement and only swapping in the new pay basis, hours and earnings (and the
+ * bonus that follows from them). Lets a late or corrected payroll upload reach scorecards that
+ * were submitted before it landed.
+ *
+ * Returns null when nothing should change: approved scorecards (final — they must be reopened),
+ * employees missing from the uploads, or earnings/hours that already match.
+ *
+ * prorationFactor: pass the employee's last-day proration when known; otherwise it is recovered
+ * from the stored bonus/earnings ratio (1 when the old earnings were 0).
+ */
+export function refreshScorecardEarnings(input: {
+  scorecard: Scorecard;
+  ripplingByMonth: Record<string, Employee[]>;
+  prorationFactor?: number;
+}): Scorecard | null {
+  const { scorecard } = input;
+  if (scorecard.reviewStatus === "approved") return null;
+  const months = scorecardPayrollMonths(scorecard.scorecardMonth);
+  if (months.length === 0) return null;
+
+  const rows = months
+    .map((month) => (input.ripplingByMonth[month] || []).find((e) => e.name === scorecard.employeeName))
+    .filter((row): row is Employee => Boolean(row));
+  if (rows.length === 0) return null;
+  const latest = rows[rows.length - 1];
+
+  let earnings: number;
+  let hours: number | undefined;
+  if (scorecard.periodType === "quarterly") {
+    const summed = sumQuarterlyEmployee({ employeeName: scorecard.employeeName, qMonths: months, ripplingByMonth: input.ripplingByMonth });
+    hours = summed.hoursWorked;
+    earnings = baseEarnings({
+      payType: latest.payType,
+      hourlyRate: latest.hourlyRate,
+      hours,
+      annualPay: latest.annualPay,
+      grossEarnings: summed.quarterlyEarnings,
+      periodType: "quarterly"
+    });
+  } else {
+    hours = latest.hoursWorked;
+    earnings = baseEarnings({
+      payType: latest.payType,
+      hourlyRate: latest.hourlyRate,
+      hours,
+      annualPay: latest.annualPay,
+      grossEarnings: latest.grossEarnings,
+      periodType: "monthly"
+    });
+  }
+
+  const sameEarnings = Math.abs(earnings - (scorecard.baseEarnings || 0)) < 0.005;
+  const sameHours = Math.abs((hours || 0) - (scorecard.hours || 0)) < 0.00005;
+  if (sameEarnings && sameHours) return null;
+
+  const pct = scorecard.bonusPotentialPct ?? 10;
+  const finalAchievement = Math.min(scorecard.weightedAchievement || 0, 200);
+  const bonusFor = (base: number) => base * (finalAchievement / 100) * (pct / 100);
+  const oldUnprorated = bonusFor(scorecard.baseEarnings || 0);
+  const prorationFactor = input.prorationFactor
+    ?? (oldUnprorated > 0 ? Math.min(scorecard.bonusAmount / oldUnprorated, 1) : 1);
+  const bonus = bonusFor(earnings);
+
+  return {
+    ...scorecard,
+    payType: latest.payType,
+    hourlyRate: latest.hourlyRate,
+    annualPay: latest.annualPay,
+    hours,
+    baseEarnings: earnings,
+    // Match submit: a prorated bonus is stored rounded to cents.
+    bonusAmount: prorationFactor < 1 ? Math.round(bonus * prorationFactor * 100) / 100 : bonus,
+    goals: scorecard.goals.map((goal) => ({ ...goal, bonusContribution: earnings * (goal.weighted / 100) * (pct / 100) }))
+  };
+}
+
 export function calculateGoal(input: {
   goal: Pick<Goal, "name" | "goalTier" | "location" | "department" | "role" | "lowerBetter" | "capped" | "capPct">;
   target: number;

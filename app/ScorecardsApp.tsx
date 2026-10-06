@@ -16,7 +16,7 @@ import { currentMonthValue, formatMonthLabel } from "../lib/periods";
 import { getReportingTree, profileNode } from "../lib/reportingTree";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
-import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
+import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   hydrateFromLocalStorage,
   persistActuals,
@@ -1777,7 +1777,53 @@ export default function ScorecardsApp() {
     }
     setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: employees } }));
     persistRippling(month, employees);
-    showToast("Rippling data saved");
+    const refreshed = await refreshSubmittedEarnings(month, { ...appData.rippling, [month]: employees });
+    showToast(refreshed > 0
+      ? `Rippling data saved — updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}`
+      : "Rippling data saved");
+  }
+
+  // Submitted scorecards freeze their earnings at submit time, so a payroll upload that lands
+  // afterwards (or corrects an earlier one) would never reach them. Re-price every non-approved
+  // scorecard whose month/quarter covers the uploaded month. Returns how many changed.
+  async function refreshSubmittedEarnings(month: string, ripplingByMonth: Record<string, Employee[]>) {
+    const monthLabel = formatMonthLabel(month);
+    const updates: Scorecard[] = [];
+    for (const scorecard of appData.scorecards) {
+      if (!scorecardPayrollMonths(scorecard.scorecardMonth).includes(month)) continue;
+      const prorateDay = scorecard.periodType === "monthly"
+        ? appData.actuals[monthLabel]?.[`__prorate_day__|${scorecard.employeeName}`]
+        : null;
+      const [y, m] = month.split("-").map(Number);
+      const prorationFactor = prorateDay != null ? Math.round(prorateDay) / new Date(y, m, 0).getDate() : undefined;
+      const next = refreshScorecardEarnings({ scorecard, ripplingByMonth, prorationFactor });
+      if (next) updates.push(next);
+    }
+    if (updates.length === 0) return 0;
+
+    const saved: Scorecard[] = [];
+    for (const scorecard of updates) {
+      if (!isFixture && sb) {
+        const result = await sb.from("scorecards").update({
+          pay_type: scorecard.payType,
+          hourly_rate: scorecard.hourlyRate || null,
+          annual_pay: scorecard.annualPay || null,
+          hours_worked: scorecard.hours || null,
+          base_earnings: scorecard.baseEarnings,
+          bonus_amount: scorecard.bonusAmount,
+          goals: scorecard.goals
+        }).eq("id", scorecard.id);
+        if (result.error) {
+          showSupabaseError(result.error, `Earnings could not be updated on ${scorecard.employeeName}'s ${scorecard.scorecardMonth} scorecard.`);
+          continue;
+        }
+      }
+      saved.push(scorecard);
+      persistScorecard(scorecard);
+    }
+    const byId = new Map(saved.map((scorecard) => [scorecard.id, scorecard]));
+    setAppData((current) => ({ ...current, scorecards: current.scorecards.map((sc) => byId.get(sc.id) ?? sc) }));
+    return saved.length;
   }
 
   async function clearRipplingForMonth(month: string) {
