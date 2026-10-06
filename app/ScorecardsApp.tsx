@@ -13,9 +13,10 @@ import {
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
 import { currentMonthValue, formatMonthLabel } from "../lib/periods";
-import { getReportingTree } from "../lib/reportingTree";
+import { getReportingTree, profileNode } from "../lib/reportingTree";
+import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
-import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
+import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
   MIN_SPLIT_SHARE,
@@ -34,6 +35,7 @@ import {
   persistActuals,
   persistGoals,
   persistRippling,
+  removePersistedRippling,
   persistScorecard,
   PROFILE_EMAIL_KEY,
   PROFILE_ROLE_KEY
@@ -65,7 +67,7 @@ import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMe
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetClose, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
@@ -87,6 +89,7 @@ import {
   LayoutDashboard,
   LayoutGrid,
   ListChecks,
+  Lock,
   MoreHorizontal,
   RefreshCw,
   RotateCcw,
@@ -232,8 +235,12 @@ function metaKey(type: "target" | "min", goal: Pick<Goal, "goalTier" | "location
 
 // Employees who worked fewer than this many hours in the period don't need a scorecard —
 // they're excluded from "not submitted" counts/todos and shown as "Not Eligible" rather than
-// flagged as outstanding work. A manager can still submit one manually if there's an exception.
+// flagged as outstanding work. Their scorecard card is locked (can't be opened or edited).
 const MIN_HOURS_FOR_SCORECARD = 40;
+
+function isBelowMinHours(employee: Pick<Employee, "hoursWorked">): boolean {
+  return employee.hoursWorked != null && employee.hoursWorked < MIN_HOURS_FOR_SCORECARD;
+}
 
 // Company-wide ratio targets by department × seniority (admin-editable in Users & Settings),
 // used for the cross-department Individual Ratio split — see lib/crossDeptRatio.ts.
@@ -293,17 +300,30 @@ function scopedForProfile<T extends { department?: string; location?: string }>(
   });
 }
 
+// Everyone the profile manages: their Rippling name tree, plus team members the uploader
+// assigned to them (or to anyone below them in the supervisor chain). Mirrors
+// private.scorecards_manages_employee in the database.
+function managedEmployeeNames(profile: ManagerProfile, allEmployees: Employee[]): Set<string> {
+  const roots = [
+    profile.linkedEmployeeName || "",
+    profileNode(profile.id),
+    ...(profile.descendantProfileIds || []).map(profileNode),
+  ];
+  return getReportingTree(roots, allEmployees, profile.knownProfiles || []);
+}
+
 function scopedScorecardsForProfile(scorecards: import("../lib/types").Scorecard[], profile: ManagerProfile | null, allEmployees: Employee[] = []) {
   if (!profile || profile.role === "admin") return scorecards;
   if (profile.role === "user") {
     if (!profile.linkedEmployeeName) return [];
     return scorecards.filter((sc) => sc.employeeName === profile.linkedEmployeeName);
   }
+  const managed = managedEmployeeNames(profile, allEmployees);
   if (profile.linkedEmployeeName) {
-    const tree = getReportingTree(profile.linkedEmployeeName, allEmployees);
-    return scorecards.filter((sc) => tree.has(sc.employeeName));
+    return scorecards.filter((sc) => managed.has(sc.employeeName));
   }
   return scorecards.filter((sc) => {
+    if (managed.has(sc.employeeName)) return true;
     const deptOk = !profile.departments.length || profile.departments.includes(sc.department || "");
     const locOk = !profile.locations.length || profile.locations.includes(sc.location || "");
     return deptOk && locOk;
@@ -313,16 +333,21 @@ function scopedScorecardsForProfile(scorecards: import("../lib/types").Scorecard
 function scopedEmployeesForProfile(employees: Employee[], profile: ManagerProfile | null, allEmployees: Employee[] = []) {
   if (!profile || profile.role === "admin") return employees;
   if (profile.role === "user") return [];
+  const managed = managedEmployeeNames(profile, allEmployees);
+  // Team members the uploader explicitly assigned to this manager (or someone under them)
+  // are always theirs, even outside the manager's department/location scope.
+  const assignedRoots = new Set([profile.id, ...(profile.descendantProfileIds || [])]);
+  const isAssigned = (e: Employee) => !!e.assignedManagerId && assignedRoots.has(e.assignedManagerId);
   if (profile.linkedEmployeeName) {
-    const tree = getReportingTree(profile.linkedEmployeeName, allEmployees);
-    const treeFiltered = employees.filter((e) => tree.has(e.name));
+    const treeFiltered = employees.filter((e) => managed.has(e.name));
     // If the manager also has explicit department restrictions, intersect them
     if (profile.departments.length > 0) {
-      return treeFiltered.filter((e) => profile.departments.includes(e.department || ""));
+      return treeFiltered.filter((e) => isAssigned(e) || profile.departments.includes(e.department || ""));
     }
     return treeFiltered;
   }
-  return scopedForProfile(employees, profile);
+  const scoped = new Set(scopedForProfile(employees, profile));
+  return employees.filter((e) => scoped.has(e) || managed.has(e.name));
 }
 
 export default function ScorecardsApp() {
@@ -359,6 +384,10 @@ export default function ScorecardsApp() {
   // Every profile id anywhere below the current user in the supervisor chain — lets a manager
   // approve/return a scorecard assigned to a subordinate (at any depth) who's unavailable.
   const [reviewChainIds, setReviewChainIds] = useState<Set<string>>(new Set());
+  // Display name of the current user's own supervisor — the person any scorecard the current
+  // user submits (their own, or a direct report's) routes to for review/approval. Shown on
+  // "Pending Review" cards in Team Scorecards so it's clear who a submission is waiting on.
+  const [reviewerName, setReviewerName] = useState<string | null>(null);
   const [employeePeriodTypes, setEmployeePeriodTypes] = useState<Record<string, "monthly" | "quarterly">>({});
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceLoading, setMaintenanceLoading] = useState(false);
@@ -369,7 +398,16 @@ export default function ScorecardsApp() {
 
   // When viewing as another user, all display/scoping uses this instead of the real profile.
   // Write operations always use the real `profile` so data is never saved under the wrong user.
-  const effectiveProfile = viewAsProfile ?? profile;
+  const baseEffectiveProfile = viewAsProfile ?? profile;
+  // Attach the supervisor chain below this user so upload-assigned team members of their
+  // sub-managers resolve into their reporting tree.
+  const effectiveProfile = useMemo<ManagerProfile | null>(() => {
+    if (!baseEffectiveProfile) return null;
+    const known = adminUsers.length > 0
+      ? adminUsers.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }))
+      : subordinateProfiles.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }));
+    return { ...baseEffectiveProfile, descendantProfileIds: [...reviewChainIds], knownProfiles: known };
+  }, [baseEffectiveProfile, reviewChainIds, adminUsers, subordinateProfiles]);
 
   // Names of managers an admin has granted company-goal access to (cascades to their Rippling downline).
   const companyGoalGrantedNames = useMemo(
@@ -541,7 +579,7 @@ export default function ScorecardsApp() {
 
   useEffect(() => {
     if (!authenticated || profile?.role !== "admin") return;
-    if (mode !== "users" && !(mode === "todos" && viewAsProfile)) return;
+    if (mode !== "users" && mode !== "rippling" && !(mode === "todos" && viewAsProfile)) return;
     void loadAdminUsers();
   }, [authenticated, profile?.role, mode, viewAsProfile, isFixture, sb]);
 
@@ -572,6 +610,9 @@ export default function ScorecardsApp() {
         frontier = children;
       }
       setReviewChainIds(chain);
+      // The person any scorecard viewAsProfile submits routes to — their own supervisor.
+      const viewAsReviewer = viewAsProfile.supervisorId ? adminUsers.find((u) => u.id === viewAsProfile.supervisorId) : undefined;
+      setReviewerName(viewAsReviewer ? (viewAsReviewer.linkedEmployeeName || viewAsReviewer.email) : null);
       return;
     }
     // Normal mode: fetch on login so badge count is accurate from the start.
@@ -596,6 +637,12 @@ export default function ScorecardsApp() {
           }
           if (Array.isArray(body.descendantIds)) {
             setReviewChainIds(new Set(body.descendantIds.map((id: unknown) => String(id))));
+          }
+          if (body.reviewer && typeof body.reviewer === "object") {
+            const name = typeof body.reviewer.name === "string" && body.reviewer.name.trim() ? body.reviewer.name.trim() : body.reviewer.email;
+            setReviewerName(typeof name === "string" && name ? name : null);
+          } else {
+            setReviewerName(null);
           }
         })
         .catch(() => {});
@@ -794,11 +841,23 @@ export default function ScorecardsApp() {
     const rawGoals = (goalsResult.data || []).map(goalFromRow);
     // Company goals are org-wide and aren't scoped by the viewer's own department/location —
     // access to them is governed separately by resolveCompanyGoalAccess downstream.
+    // Team members assigned to a manager can sit outside the manager's department/location
+    // scope — keep their department/individual goals so their scorecards are complete.
+    const managedEmps = loadedProfile.role === "manager"
+      ? (() => { const names = managedEmployeeNames(loadedProfile, allEmployees); return allEmployees.filter((e) => names.has(e.name)); })()
+      : [];
+    const inScope = new Set(scopedForProfile(rawGoals.filter((g) => g.goalTier !== "company"), loadedProfile));
     const goals = [
       ...rawGoals.filter((g) => g.goalTier === "company"),
-      ...scopedForProfile(rawGoals.filter((g) => g.goalTier !== "company"), loadedProfile)
+      ...rawGoals.filter((g) => g.goalTier !== "company" && (inScope.has(g) || managedEmps.some((e) =>
+        g.goalTier === "individual" && g.employeeName
+          ? g.employeeName === e.name
+          : g.department === e.department && (!g.location || g.location === e.location) && (g.goalTier === "department" || !g.role || g.role === e.role)
+      )))
     ];
-    const scorecards = scopedScorecardsForProfile((scorecardsResult.data || []).map(scorecardFromRow), loadedProfile, allEmployees);
+    // Row-level security already limits which scorecards come back; the screens re-scope by
+    // the viewer (including View As) downstream.
+    const scorecards = (scorecardsResult.data || []).map(scorecardFromRow);
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
     setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
@@ -1750,7 +1809,70 @@ export default function ScorecardsApp() {
     }
     setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: employees } }));
     persistRippling(month, employees);
-    showToast("Rippling data saved");
+    const refreshed = await refreshSubmittedEarnings(month, { ...appData.rippling, [month]: employees });
+    showToast(refreshed > 0
+      ? `Rippling data saved — updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}`
+      : "Rippling data saved");
+  }
+
+  // Submitted scorecards freeze their earnings at submit time, so a payroll upload that lands
+  // afterwards (or corrects an earlier one) would never reach them. Re-price every non-approved
+  // scorecard whose month/quarter covers the uploaded month. Returns how many changed.
+  async function refreshSubmittedEarnings(month: string, ripplingByMonth: Record<string, Employee[]>) {
+    const monthLabel = formatMonthLabel(month);
+    const updates: Scorecard[] = [];
+    for (const scorecard of appData.scorecards) {
+      if (!scorecardPayrollMonths(scorecard.scorecardMonth).includes(month)) continue;
+      const prorateDay = scorecard.periodType === "monthly"
+        ? appData.actuals[monthLabel]?.[`__prorate_day__|${scorecard.employeeName}`]
+        : null;
+      const [y, m] = month.split("-").map(Number);
+      const prorationFactor = prorateDay != null ? Math.round(prorateDay) / new Date(y, m, 0).getDate() : undefined;
+      const next = refreshScorecardEarnings({ scorecard, ripplingByMonth, prorationFactor });
+      if (next) updates.push(next);
+    }
+    if (updates.length === 0) return 0;
+
+    const saved: Scorecard[] = [];
+    for (const scorecard of updates) {
+      if (!isFixture && sb) {
+        const result = await sb.from("scorecards").update({
+          pay_type: scorecard.payType,
+          hourly_rate: scorecard.hourlyRate || null,
+          annual_pay: scorecard.annualPay || null,
+          hours_worked: scorecard.hours || null,
+          base_earnings: scorecard.baseEarnings,
+          bonus_amount: scorecard.bonusAmount,
+          goals: scorecard.goals
+        }).eq("id", scorecard.id);
+        if (result.error) {
+          showSupabaseError(result.error, `Earnings could not be updated on ${scorecard.employeeName}'s ${scorecard.scorecardMonth} scorecard.`);
+          continue;
+        }
+      }
+      saved.push(scorecard);
+      persistScorecard(scorecard);
+    }
+    const byId = new Map(saved.map((scorecard) => [scorecard.id, scorecard]));
+    setAppData((current) => ({ ...current, scorecards: current.scorecards.map((sc) => byId.get(sc.id) ?? sc) }));
+    return saved.length;
+  }
+
+  async function clearRipplingForMonth(month: string) {
+    if (!isFixture && sb) {
+      const result = await sb.from("rippling_employees").delete().eq("period", month);
+      if (result.error) {
+        showSupabaseError(result.error, "Rippling data could not be removed.");
+        return;
+      }
+    }
+    setAppData((current) => {
+      const next = { ...current.rippling };
+      delete next[month];
+      return { ...current, rippling: next };
+    });
+    removePersistedRippling(month);
+    showToast("Rippling data cleared for " + formatMonthLabel(month));
   }
 
   async function submitScorecardDirect(scorecard: Scorecard) {
@@ -2008,6 +2130,7 @@ export default function ScorecardsApp() {
                 currentUserEmail={currentUserEmail}
                 currentUserProfileId={effectiveProfile?.id}
                 reviewChainIds={reviewChainIds}
+                reviewerName={reviewerName ?? undefined}
                 employeePeriodTypes={employeePeriodTypes}
                 onDeactivateEmployee={roleAtLeast(effectiveProfile, "manager") ? deactivateEmployee : undefined}
                 focusEmployeeKey={scorecardFocus?.employeeKey ?? null}
@@ -2030,16 +2153,11 @@ export default function ScorecardsApp() {
           {mode === "rippling" && (
             <RipplingScreen
               defaultMonth={workMonth}
+              users={adminUsers.filter((u) => u.status !== "deactivated")}
+              usersLoading={adminUsersLoading}
               saved={appData.rippling}
               onSaveForMonth={saveRipplingForMonth}
-              onClearMonth={(month) => {
-                setAppData((current) => {
-                  const next = { ...current.rippling };
-                  delete next[month];
-                  return { ...current, rippling: next };
-                });
-                showToast("Rippling data cleared for " + formatMonthLabel(month));
-              }}
+              onClearMonth={clearRipplingForMonth}
             />
           )}
           {mode === "guide" && <GuideScreen profile={effectiveProfile} />}
@@ -2863,7 +2981,7 @@ function UsersScreen(props: {
   const [resendingId, setResendingId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<AdminManagedUser | null>(null);
   const sortedUsers = [...props.users].sort((a, b) => a.email.localeCompare(b.email));
-  const editingUser = editingId ? sortedUsers.find((u) => u.id === editingId) : undefined;
+  const [showDeactivated, setShowDeactivated] = useState(true);   const deactivatedCount = sortedUsers.filter((u) => u.status === "deactivated").length;   const visibleUsers = showDeactivated ? sortedUsers : sortedUsers.filter((u) => u.status !== "deactivated");   const editingUser = editingId ? sortedUsers.find((u) => u.id === editingId) : undefined;
 
   return (
     <div className="screen active">
@@ -2906,7 +3024,7 @@ function UsersScreen(props: {
       </section>
 
       <section style={{ padding: 0 }} className="overflow-hidden">
-        <div className="px-4 pb-2.5 pt-4 text-[11px] font-semibold uppercase tracking-wider text-primary">Current users</div>
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-2.5 pt-4">           <div className="text-[11px] font-semibold uppercase tracking-wider text-primary">Current users</div>           {deactivatedCount > 0 && (             <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground">               <Checkbox checked={showDeactivated} onCheckedChange={(v) => setShowDeactivated(v === true)} />               Show deactivated users ({deactivatedCount})             </label>           )}         </div>
         <Table className="text-[12.5px]">
           <TableHeader className="bg-muted/40 [&_th]:h-9 [&_th]:px-4 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
             <TableRow className="hover:bg-transparent">
@@ -2919,10 +3037,12 @@ function UsersScreen(props: {
             </TableRow>
           </TableHeader>
           <TableBody className="[&_td]:px-4 [&_td]:py-3">
-            {!sortedUsers.length && (
-              <TableRow><TableCell colSpan={6} className="py-6 text-center text-muted-foreground">{props.loading ? "Loading users…" : "No users found."}</TableCell></TableRow>
+                      {!visibleUsers.length && (
+              <TableRow><TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+                {props.loading ? "Loading users…" : !sortedUsers.length ? "No users found." : "All users are deactivated — check \u201cShow deactivated users\u201d above to see them."}
+              </TableCell></TableRow>
             )}
-            {sortedUsers.map((user) => (
+            {visibleUsers.map((user) => (
               <React.Fragment key={user.id}>
                 <TableRow>
                   <TableCell>
@@ -3123,7 +3243,13 @@ function UserPermissionForm(props: {
     setDraft(userDraftFromUser(props.user));
   }, [props.user?.id]);
 
-  const employeeNames = useMemo(() => Array.from(new Set(props.employees.map((employee) => employee.name))).sort(), [props.employees]);
+  // Includes names that only appear in the Rippling Manager column (e.g. owners who aren't on
+  // the payroll export) so those managers can still be linked and matched on upload. Emails
+  // are skipped — the upload writes one there when a picked manager has no linked name.
+  const employeeNames = useMemo(() => Array.from(new Set([
+    ...props.employees.map((employee) => employee.name),
+    ...props.employees.map((employee) => (employee.manager || "").trim()).filter((name) => name && !name.includes("@")),
+  ])).sort(), [props.employees]);
   const departmentOptions = departments.map((department) => ({ value: department, label: department }));
   const locationOptions = locations.map((location) => ({ value: location, label: location }));
 
@@ -4616,6 +4742,8 @@ function ScorecardsScreen(props: {
   currentUserEmail: string;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
+  // Display name of the current user's own supervisor — who a scorecard routes to for review.
+  reviewerName?: string;
   employeePeriodTypes?: Record<string, "monthly" | "quarterly">;
   onDeactivateEmployee?: (employeeName: string, isoMonth: string, mode: "month" | "from" | "reactivate") => void;
   // Set by a "Go to scorecard" to-do link — scrolls to and auto-expands this employee's card.
@@ -4628,6 +4756,7 @@ function ScorecardsScreen(props: {
   const [filterLocations, setFilterLocations] = useState<string[]>([]);
   const [globalPeriodType, setGlobalPeriodType] = useState<"monthly" | "quarterly">("monthly");
   const [hideCompleted, setHideCompleted] = useState(false);
+  const [hideIneligible, setHideIneligible] = useState(false);
   const [viewMode, setViewMode] = useState<"cards" | "progress">("cards");
   const [progressStatusFilter, setProgressStatusFilter] = useState<ScorecardCompletionStatus[]>([]);
 
@@ -4740,6 +4869,7 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
+    if (hideIneligible && isBelowMinHours(withActualEarnings(e))) return false;
     if (hideCompleted) {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
       if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -4939,6 +5069,10 @@ function ScorecardsScreen(props: {
             <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
             Hide completed
           </label>
+          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title={`Hides scorecards for team members who worked under ${MIN_HOURS_FOR_SCORECARD} hours in the period`}>
+            <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
+            Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
+          </label>
         </div>
       </section>
 
@@ -5031,6 +5165,7 @@ function ScorecardsScreen(props: {
                     currentUserEmail={props.currentUserEmail}
                     currentUserProfileId={props.currentUserProfileId}
                     reviewChainIds={props.reviewChainIds}
+                    reviewerName={props.reviewerName}
                     autoOpen={!!props.focusEmployeeKey && props.focusEmployeeKey === (emp.id || emp.name)}
                     autoOpenNonce={props.focusNonce}
                   />
@@ -5084,6 +5219,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
+                  if (hideIneligible && isBelowMinHours({ hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked })) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
                     if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -5142,6 +5278,7 @@ function ScorecardsScreen(props: {
                         currentUserEmail={props.currentUserEmail}
                         currentUserProfileId={props.currentUserProfileId}
                         reviewChainIds={props.reviewChainIds}
+                        reviewerName={props.reviewerName}
                       />
                     );
                   })}
@@ -5331,7 +5468,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5362,6 +5499,7 @@ function LiveScorecardCard({
   currentUserEmail: string;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
+  reviewerName?: string;
   autoOpen?: boolean;
   autoOpenNonce?: number;
 }) {
@@ -5559,9 +5697,12 @@ function LiveScorecardCard({
   // read-only review card takes over again.
   const displayedSubmitted = (submittedScorecard && submittedScorecard.reviewStatus !== "returned") ? submittedScorecard : lastSubmitted;
   if (displayedSubmitted) {
-    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} />;
+    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} reviewerName={reviewerName} />;
   }
   const returnedScorecard = !lastSubmitted && submittedScorecard?.reviewStatus === "returned" ? submittedScorecard : null;
+  // Under the minimum-hours threshold: the card stays visible with a "Not Eligible" badge but
+  // is locked — it can't be expanded, so goals/actuals/weights can't be edited or submitted.
+  const ineligible = isBelowMinHours(employee);
 
   const activeEmployee = cardPeriodType === "quarterly" ? quarterlyEmployee : employee;
   const activeMonth = cardPeriodType === "quarterly" ? quarterKey : month;
@@ -5644,8 +5785,16 @@ function LiveScorecardCard({
 
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card">
-      <button type="button" onClick={() => setOpen(!open)} className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/40">
-        <ChevronRight className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
+      <button
+        type="button"
+        onClick={() => { if (!ineligible) setOpen(!open); }}
+        disabled={ineligible}
+        aria-disabled={ineligible}
+        className={`flex w-full items-center gap-3 px-4 py-3 text-left transition-colors ${ineligible ? "cursor-not-allowed opacity-60" : "hover:bg-muted/40"}`}
+      >
+        {ineligible
+          ? <Lock className="size-4 shrink-0 text-muted-foreground" />
+          : <ChevronRight className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />}
         <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-secondary text-[11px] font-semibold text-foreground">{dashInitials(employee.name)}</span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13.5px] font-medium text-foreground">{employee.name}</span>
@@ -5653,7 +5802,7 @@ function LiveScorecardCard({
             {employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
           </span>
         </span>
-        {currentGoals.length > 0 ? (
+        {currentGoals.length > 0 && !ineligible ? (
           <>
             <span className="hidden text-right sm:block">
               <span className="block text-[10px] uppercase tracking-wide text-muted-foreground">Achievement</span>
@@ -5671,18 +5820,18 @@ function LiveScorecardCard({
             </span>
           </>
         ) : null}
-        {returnedScorecard ? (
-          <Badge variant="secondary" className="shrink-0 font-medium" style={{ background: "#FEE2E2", color: "#991B1B", borderColor: "#FECACA" }}>Returned</Badge>
-        ) : employee.hoursWorked != null && employee.hoursWorked < MIN_HOURS_FOR_SCORECARD ? (
-          <Badge variant="secondary" title={`Worked ${employee.hoursWorked.toFixed(2)} hrs this period — below the ${MIN_HOURS_FOR_SCORECARD}-hour minimum, so no scorecard is required`} className="shrink-0 font-medium text-muted-foreground">
-            Not Eligible ({employee.hoursWorked.toFixed(1)} hrs)
+        {ineligible ? (
+          <Badge variant="secondary" title={`Worked ${employee.hoursWorked!.toFixed(2)} hrs this period — below the ${MIN_HOURS_FOR_SCORECARD}-hour minimum, so this scorecard is locked`} className="shrink-0 font-medium text-muted-foreground">
+            Ineligible due to hours ({employee.hoursWorked!.toFixed(1)} hrs)
           </Badge>
+        ) : returnedScorecard ? (
+          <Badge variant="secondary" className="shrink-0 font-medium" style={{ background: "#FEE2E2", color: "#991B1B", borderColor: "#FECACA" }}>Returned</Badge>
         ) : (
           <Badge variant="secondary" title="This scorecard hasn't been submitted yet" className="shrink-0 font-medium">Not Submitted</Badge>
         )}
       </button>
 
-      {returnedScorecard?.reviewNote && (
+      {returnedScorecard?.reviewNote && !ineligible && (
         <div style={{ borderTop: "1px solid #FECACA", background: "#FEF2F2", padding: "8px 16px" }}>
           <span style={{ fontSize: "11.5px", fontWeight: 600, color: "#991B1B" }}>Returned</span>
           {returnedScorecard.reviewedBy && <span style={{ fontSize: "11.5px", color: "#991B1B" }}> by {returnedScorecard.reviewedBy}</span>}
@@ -5690,7 +5839,7 @@ function LiveScorecardCard({
         </div>
       )}
 
-      {open && (
+      {open && !ineligible && (
         <>
           <div className="flex flex-wrap items-end gap-6 border-t border-border bg-muted/30 px-4 py-2.5">
             <div>
@@ -5989,7 +6138,7 @@ function Metric({ label, value, highlight }: { label: string; value: string; hig
   return <div className="metric-card"><div className="mlabel">{label}</div><div className={`mval ${highlight ? "highlight" : ""}`}>{value}</div></div>;
 }
 
-function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds }: {
+function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName }: {
   scorecard: Scorecard;
   onDeleteGoal: (value: { scorecardId: string; goalName: string }) => void;
   onApprove: (scorecardId: string) => void;
@@ -6002,6 +6151,10 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
   canReopen?: boolean;
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
+  // Name of the manager this scorecard was submitted to for review/approval — the current
+  // viewer's own supervisor, since that's who any scorecard they (or their reports) submit
+  // routes to. Shown on the "Pending Review" state in Team Scorecards.
+  reviewerName?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [returning, setReturning] = useState(false);
@@ -6035,6 +6188,11 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
           <span className="block truncate text-[11.5px] text-muted-foreground">
             {scorecard.role}{scorecard.department ? ` · ${scorecard.department}` : ""}{scorecard.location ? ` · ${scorecard.location}` : ""}
           </span>
+          {scorecard.reviewStatus === "pending_review" && reviewerName && (
+            <span className="block truncate text-[11px] text-muted-foreground">
+              Submitted to {reviewerName} for review and approval
+            </span>
+          )}
         </span>
         <span className="hidden text-right sm:block">
           <span className="block text-[10px] uppercase tracking-wide text-muted-foreground">Achievement</span>
@@ -6778,26 +6936,49 @@ function ReportLineChart({
 
 function RipplingScreen(props: {
   defaultMonth: string;
+  users: AssignableUser[];
+  usersLoading: boolean;
   saved: Record<string, Employee[]>;
   onSaveForMonth: (month: string, employees: Employee[]) => void;
   onClearMonth: (month: string) => void;
 }) {
   const [uploadMonth, setUploadMonth] = useState(props.defaultMonth);
-  const [preview, setPreview] = useState<Employee[]>([]);
+  const [parsed, setParsed] = useState<Employee[]>([]);
   const [previewFileName, setPreviewFileName] = useState("");
   const [expandedMonth, setExpandedMonth] = useState<string | null>(null);
+  // Uploader's manager picks for flagged rows, keyed by employee name.
+  const [managerChoices, setManagerChoices] = useState<Record<string, string>>({});
+  const [showManagerIssues, setShowManagerIssues] = useState(false);
+
+  // Re-resolved whenever the user list arrives/changes, so a file dropped before users load
+  // still gets checked.
+  const { employees: preview, issues: managerIssues } = useMemo(
+    () => resolveUploadManagers(parsed, props.users),
+    [parsed, props.users]
+  );
+  const unresolvedCount = managerIssues.filter((i) => !managerChoices[i.employeeName]).length;
 
   async function handleFile(file: File | undefined) {
     if (!file) return;
-    setPreview(parseRipplingEmployees(await file.text()));
+    const rows = parseRipplingEmployees(await file.text());
+    setParsed(rows);
     setPreviewFileName(file.name);
+    setManagerChoices({});
+    setShowManagerIssues(resolveUploadManagers(rows, props.users).issues.length > 0);
+  }
+
+  function discardPreview() {
+    setParsed([]);
+    setPreviewFileName("");
+    setManagerChoices({});
+    setShowManagerIssues(false);
   }
 
   function handleSave() {
-    if (!preview.length) return;
-    props.onSaveForMonth(uploadMonth, preview);
-    setPreview([]);
-    setPreviewFileName("");
+    if (!preview.length || props.usersLoading) return;
+    if (unresolvedCount > 0) { setShowManagerIssues(true); return; }
+    props.onSaveForMonth(uploadMonth, applyManagerChoices(preview, managerChoices, props.users));
+    discardPreview();
   }
 
   function handleDownload(month: string, employees: Employee[]) {
@@ -6850,13 +7031,38 @@ function RipplingScreen(props: {
           <input type="file" accept=".csv" hidden onChange={(e) => handleFile(e.target.files?.[0])} />
         </label>
         {preview.length > 0 && (
-          <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-3 py-2">
-            <span className="text-[12.5px] text-foreground">{preview.length} employees parsed from <span className="font-medium">{previewFileName}</span></span>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-3 py-2">
+            <span className="text-[12.5px] text-foreground">
+              {preview.length} employees parsed from <span className="font-medium">{previewFileName}</span>
+              {props.usersLoading ? (
+                <span className="ml-2 text-muted-foreground">· Checking managers…</span>
+              ) : managerIssues.length > 0 && (
+                <button type="button" onClick={() => setShowManagerIssues(true)} className={`ml-2 font-medium underline-offset-2 hover:underline ${unresolvedCount > 0 ? "text-destructive" : "text-primary"}`}>
+                  {unresolvedCount > 0
+                    ? `⚠ ${unresolvedCount} manager mismatch${unresolvedCount !== 1 ? "es" : ""} to resolve`
+                    : `✓ ${managerIssues.length} manager mismatch${managerIssues.length !== 1 ? "es" : ""} resolved — review`}
+                </button>
+              )}
+            </span>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" className="text-[12px]" onClick={() => { setPreview([]); setPreviewFileName(""); }}>Discard</Button>
-              <Button size="sm" onClick={handleSave}>Save for {formatMonthLabel(uploadMonth)}</Button>
+              <Button variant="outline" size="sm" className="text-[12px]" onClick={discardPreview}>Discard</Button>
+              <Button size="sm" onClick={handleSave} disabled={props.usersLoading}>Save for {formatMonthLabel(uploadMonth)}</Button>
             </div>
           </div>
+        )}
+        {showManagerIssues && managerIssues.length > 0 && (
+          <ManagerIssuesModal
+            issues={managerIssues}
+            users={props.users}
+            choices={managerChoices}
+            onChoose={(employeeName, userId) => setManagerChoices((c) => ({ ...c, [employeeName]: userId }))}
+            onAcceptSuggestions={() => setManagerChoices((c) => {
+              const next = { ...c };
+              for (const issue of managerIssues) if (!next[issue.employeeName] && issue.suggestedIds[0]) next[issue.employeeName] = issue.suggestedIds[0];
+              return next;
+            })}
+            onClose={() => setShowManagerIssues(false)}
+          />
         )}
       </section>
 
@@ -6889,7 +7095,9 @@ function RipplingScreen(props: {
                       <Button variant="ghost" size="sm" className="h-7 px-2 text-[11.5px] text-muted-foreground" onClick={() => handleDownload(month, employees)}>
                         <Download className="mr-1 size-3.5" />Download CSV
                       </Button>
-                      <Button variant="ghost" size="sm" className="h-7 px-2 text-[11.5px] text-destructive hover:text-destructive" onClick={() => props.onClearMonth(month)}>
+                      <Button variant="ghost" size="sm" className="h-7 px-2 text-[11.5px] text-destructive hover:text-destructive" onClick={() => {
+                        if (window.confirm(`Remove the ${formatMonthLabel(month)} Rippling data (${employees.length} employee${employees.length !== 1 ? "s" : ""})? You can re-upload the CSV afterwards.`)) props.onClearMonth(month);
+                      }}>
                         Remove
                       </Button>
                     </div>
@@ -8601,6 +8809,108 @@ function WhatIfScreen(props: {
 function MigrateScreen() {
   return (
     <div className="screen active"><section><div className="section-title">Migrate Local Data to Supabase</div><p>This React version preserves the same legacy localStorage keys. Use this only from a browser that contains the original local data.</p><button className="submit-btn" onClick={() => alert("Migration uses the preserved Supabase table contracts and should be run only after a real Supabase smoke test.")}>Start Migration</button></section></div>
+  );
+}
+
+// Pop-up on the Rippling Data page: every row whose CSV Manager doesn't line up with the app
+// (unknown name, ambiguous name, or a different supervisor on the Users page) must have its
+// manager picked by the uploader before the upload can be saved.
+function ManagerIssuesModal(props: {
+  issues: ManagerIssue[];
+  users: AssignableUser[];
+  choices: Record<string, string>;
+  onChoose: (employeeName: string, userId: string) => void;
+  onAcceptSuggestions: () => void;
+  onClose: () => void;
+}) {
+  const userById = new Map(props.users.map((u) => [u.id, u]));
+  const userLabel = (u: AssignableUser) => u.linkedEmployeeName || u.email;
+  const managers = props.users
+    .filter((u) => u.role === "manager" || u.role === "admin")
+    .sort((a, b) => userLabel(a).localeCompare(userLabel(b)));
+  const resolved = props.issues.filter((i) => props.choices[i.employeeName]).length;
+  const anySuggestionsLeft = props.issues.some((i) => !props.choices[i.employeeName] && i.suggestedIds.length > 0);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-labelledby="manager-issues-title">
+      <div className="flex max-h-[85vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl">
+        <div className="border-b border-border px-5 py-4">
+          <div id="manager-issues-title" className="text-[15px] font-semibold text-foreground">Resolve manager mismatches</div>
+          <p className="mt-1 text-[12.5px] text-muted-foreground">
+            These team members&apos; Manager in the CSV doesn&apos;t line up with the app. Pick who should own each scorecard. That manager (and anyone above them) can then see and edit it.
+          </p>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          <Table className="text-[12.5px]">
+            <TableHeader className="sticky top-0 bg-muted/60 [&_th]:h-9 [&_th]:px-4 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
+              <TableRow className="hover:bg-transparent">
+                <TableHead>Team member</TableHead>
+                <TableHead className="hidden sm:table-cell">CSV manager</TableHead>
+                <TableHead className="hidden sm:table-cell">App supervisor</TableHead>
+                <TableHead className="hidden lg:table-cell">Issue</TableHead>
+                <TableHead className="w-[45%] sm:w-[15rem]">Assign to</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody className="[&_td]:px-4 [&_td]:py-2.5">
+              {props.issues.map((issue) => {
+                const sup = issue.appSupervisorId ? userById.get(issue.appSupervisorId) : undefined;
+                const suggested = issue.suggestedIds.map((id) => userById.get(id)).filter((u): u is AssignableUser => !!u);
+                const others = managers.filter((u) => !issue.suggestedIds.includes(u.id));
+                const choice = props.choices[issue.employeeName];
+                return (
+                  <TableRow key={issue.employeeName} className={choice ? "" : "bg-destructive/5"}>
+                    <TableCell className="whitespace-normal">
+                      <div className="font-medium text-foreground">{issue.employeeName}</div>
+                      <div className="text-[11.5px] text-muted-foreground">{[issue.department, issue.location].filter(Boolean).join(" · ")}</div>
+                      {/* Narrow screens: the hidden columns' details fold in under the name. */}
+                      <div className="mt-1 text-[11.5px] text-muted-foreground sm:hidden">
+                        CSV: {issue.csvManager || "—"}{sup ? ` · App: ${userLabel(sup)}` : ""}
+                      </div>
+                      <div className="mt-0.5 text-[11.5px] text-destructive lg:hidden">{describeIssue(issue)}</div>
+                    </TableCell>
+                    <TableCell className="hidden sm:table-cell">{issue.csvManager || <span className="text-muted-foreground">—</span>}</TableCell>
+                    <TableCell className="hidden sm:table-cell">{sup ? userLabel(sup) : <span className="text-muted-foreground">—</span>}</TableCell>
+                    <TableCell className="hidden whitespace-normal text-[11.5px] text-muted-foreground lg:table-cell">{describeIssue(issue)}</TableCell>
+                    <TableCell>
+                      <Select value={choice || ""} onValueChange={(v) => props.onChoose(issue.employeeName, v)}>
+                        <SelectTrigger className="h-8 w-full min-w-0 text-[12px] [&>span]:truncate" aria-label={`Manager for ${issue.employeeName}`}>
+                          <SelectValue placeholder="Choose manager…" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {suggested.map((u, idx) => (
+                            <SelectItem key={u.id} value={u.id} className="text-[12.5px]">
+                              {userLabel(u)}
+                              <span className="ml-1.5 text-[11px] text-muted-foreground">
+                                {u.id === issue.appSupervisorId ? "app supervisor" : issue.csvMatchIds.includes(u.id) ? "CSV manager" : idx === 0 ? "suggested · dept/location" : "dept/location"}
+                              </span>
+                            </SelectItem>
+                          ))}
+                          {suggested.length > 0 && others.length > 0 && <SelectSeparator />}
+                          {others.map((u) => (
+                            <SelectItem key={u.id} value={u.id} className="text-[12.5px]">{userLabel(u)}</SelectItem>
+                          ))}
+                          <SelectSeparator />
+                          <SelectItem value={LEAVE_UNASSIGNED} className="text-[12.5px] text-muted-foreground">Leave as in CSV (no app manager)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-3">
+          <span className="text-[12.5px] text-muted-foreground">{resolved} of {props.issues.length} resolved</span>
+          <div className="flex gap-2">
+            {anySuggestionsLeft && (
+              <Button variant="outline" size="sm" className="text-[12px]" onClick={props.onAcceptSuggestions}>Use first suggestion for the rest</Button>
+            )}
+            <Button size="sm" onClick={props.onClose}>{resolved === props.issues.length ? "Done" : "Finish later"}</Button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -44,6 +44,13 @@ export function persistRippling(month: string, employees: Employee[]) {
   if (!months.includes(month)) writeJson(RIPPLING_MONTHS_INDEX, [...months, month].sort());
 }
 
+export function removePersistedRippling(month: string) {
+  if (!canUseStorage()) return;
+  try { window.localStorage.removeItem(`${RIPPLING_PREFIX}${month}`); } catch { /* storage unavailable */ }
+  const months = readJson<string[]>(RIPPLING_MONTHS_INDEX, []);
+  writeJson(RIPPLING_MONTHS_INDEX, months.filter((m) => m !== month));
+}
+
 export function persistScorecard(scorecard: Scorecard) {
   const key = `${SCORECARDS_PREFIX}${scorecard.scorecardMonth}`;
   const existing = readJson<Scorecard[]>(key, []);

@@ -90,6 +90,7 @@ export function employeeFromRow(row: Record<string, any>): Employee {
     department: row.department || "",
     location: row.location || "",
     manager: row.manager || "",
+    assignedManagerId: row.assigned_manager_id || undefined,
     payType: row.pay_type || "hourly",
     hourlyRate: row.hourly_rate,
     annualPay: row.annual_pay,
@@ -108,6 +109,9 @@ export function employeeToRow(period: string, employee: Employee) {
     department: employee.department,
     location: employee.location,
     manager: employee.manager || null,
+    // Only sent when set, so uploads without assignments still work against a database
+    // that hasn't run the assigned_manager_id migration yet.
+    ...(employee.assignedManagerId ? { assigned_manager_id: employee.assignedManagerId } : {}),
     pay_type: employee.payType,
     hourly_rate: employee.hourlyRate || null,
     annual_pay: employee.annualPay || null,
