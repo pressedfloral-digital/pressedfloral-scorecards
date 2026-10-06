@@ -19,7 +19,7 @@
 // and aren't part of this request.
 
 import { actualKey, personalActualKey } from "./scorecardCompletion";
-import { formatMonthLabel, currentMonthValue, nextMonthValue } from "./periods";
+import { formatMonthLabel, currentBusinessMonth, nextMonthValue } from "./periods";
 import { DEPT_SPLIT_TIER, PRODUCTION_DEPTS, deptSplitGoalName } from "./crossDeptRatio";
 import type { Goal } from "./types";
 
@@ -429,7 +429,7 @@ export async function computePfDashboardSync(params: {
   // `targetMonth` the Actuals half above is backfilling.
   const RATIO_GOAL_MIN_NAME = "Combined Ratio Attainment";
   const estimated: { current?: PfEstimatedMonthResult; next?: PfEstimatedMonthResult } = kpisData.estimated ?? {};
-  const thisMonth = currentMonthValue();
+  const thisMonth = currentBusinessMonth();
   const monthBuckets: { period: string; goalVariant?: PfRatioVariant; expectedVariant?: PfRatioVariant }[] = [
     { period: thisMonth, goalVariant: estimated.current?.goal, expectedVariant: estimated.current?.expected },
     { period: nextMonthValue(thisMonth), goalVariant: estimated.next?.goal, expectedVariant: estimated.next?.expected },

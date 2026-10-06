@@ -6,7 +6,7 @@
     },
     {
       "path": "/api/cron/sync-pf-kpis",
-      "schedule": "0 14 3 * *"
+      "schedule": "0 14 * * *"
     }
   ]
 }
