@@ -63,6 +63,9 @@ export type Employee = {
   employmentType?: string;
   // Set when an EmployeeOverride changed this row: the values Rippling actually uploaded.
   uploaded?: { department: string; manager?: string; assignedManagerId?: string };
+  // Set by lockMonthStartProfiles when Rippling's upload for this month changed these fields
+  // mid-month: the uploaded values, held back until the following month.
+  monthStartHeld?: Partial<Pick<Employee, "role" | "department" | "location">>;
 };
 
 // Manual department/manager correction that survives Rippling uploads. Applies to every
