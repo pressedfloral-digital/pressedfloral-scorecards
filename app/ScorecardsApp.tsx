@@ -17,7 +17,7 @@ import { currentMonthValue, formatMonthLabel } from "../lib/periods";
 import { getReportingTree, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
-import { computeScorecardCompletion, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { computeScorecardCompletion, isFinalizedForHistory, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
@@ -458,7 +458,8 @@ export default function ScorecardsApp() {
     search: "",
     location: "",
     department: "",
-    goal: ""
+    goal: "",
+    employees: []
   });
   const [historyView, setHistoryView] = useState<HistoryView>("table");
 
@@ -1272,19 +1273,26 @@ export default function ScorecardsApp() {
       });
   }, [effectiveProfile, appData.scorecards]);
 
+  // Pending and returned scorecards stay out of Historical Data until approved.
+  const historyScorecards = useMemo(
+    () => scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees).filter(isFinalizedForHistory),
+    [appData.scorecards, effectiveProfile, allRipplingEmployees]
+  );
+
   const filteredHistory = useMemo(() => {
-    return scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees).filter((scorecard) => {
+    return historyScorecards.filter((scorecard) => {
       if (historyFilters.period && scorecard.scorecardMonth !== historyFilters.period) return false;
       if (historyFilters.location && scorecard.location !== historyFilters.location) return false;
       if (historyFilters.department && scorecard.department !== historyFilters.department) return false;
       if (historyFilters.goal && !scorecard.goals.some((goal) => goal.name === historyFilters.goal)) return false;
+      if (historyFilters.employees.length && !historyFilters.employees.includes(scorecard.employeeName)) return false;
       if (historyFilters.search) {
         const haystack = [scorecard.employeeName, scorecard.role, scorecard.department, scorecard.location, scorecard.manager].join(" ").toLowerCase();
         if (!haystack.includes(historyFilters.search.toLowerCase())) return false;
       }
       return true;
     });
-  }, [appData.scorecards, historyFilters, effectiveProfile, allRipplingEmployees]);
+  }, [historyScorecards, historyFilters]);
 
   // workMonth = the most recently completed month (always previous calendar month)
   const workMonth = useMemo(() => {
@@ -2203,7 +2211,7 @@ export default function ScorecardsApp() {
               filters={historyFilters}
               view={historyView}
               scorecards={filteredHistory}
-              allScorecards={scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)}
+              allScorecards={historyScorecards}
               readonly={effectiveProfile?.role === "user"}
               onFilters={setHistoryFilters}
               onView={setHistoryView}
@@ -4468,7 +4476,7 @@ function MultiSelectDropdown({ label, options, selected, onChange, emptyLabel, t
         <span className="truncate">{displayLabel}</span>
         <ChevronDown className="size-4 shrink-0 text-muted-foreground opacity-50" />
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-[var(--radix-dropdown-menu-trigger-width)]">
+      <DropdownMenuContent align="start" className="max-h-80 min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto">
         <DropdownMenuCheckboxItem checked={allChecked} onCheckedChange={toggleAll} onSelect={(e) => e.preventDefault()} className="text-[13px] font-medium">
           Select all
         </DropdownMenuCheckboxItem>
@@ -6580,7 +6588,6 @@ function HistoryScreen(props: {
   const [toMonth, setToMonth] = useState("");
   const [selLocation, setSelLocation] = useState("");
   const [selDept, setSelDept] = useState("");
-  const [selEmployee, setSelEmployee] = useState("");
   const [metric, setMetric] = useState<"achievement" | "bonus" | "goal">("achievement");
   const [metricGoal, setMetricGoal] = useState("");
   const [groupBy, setGroupBy] = useState<"employee" | "department" | "location">("employee");
@@ -6607,6 +6614,20 @@ function HistoryScreen(props: {
     [props.allScorecards]
   );
 
+  // Employee selection is shared by every view; empty means all employees.
+  const selEmployees = props.filters.employees;
+  const employeeOptions = useMemo(() => allEmployeeNames.map((n) => ({ value: n, label: n })), [allEmployeeNames]);
+  const employeePicker = (triggerClassName: string) => (
+    <MultiSelectDropdown
+      label="All employees"
+      emptyLabel="All employees"
+      triggerClassName={triggerClassName}
+      options={employeeOptions}
+      selected={selEmployees}
+      onChange={(values) => props.onFilters({ ...props.filters, employees: values.length === employeeOptions.length ? [] : values })}
+    />
+  );
+
   // Filtered scorecards for report views
   const reportScorecards = useMemo(() =>
     props.allScorecards.filter((sc) => {
@@ -6615,10 +6636,10 @@ function HistoryScreen(props: {
       if (toMonth && iso > toMonth) return false;
       if (selLocation && sc.location !== selLocation) return false;
       if (selDept && sc.department !== selDept) return false;
-      if (selEmployee && sc.employeeName !== selEmployee) return false;
+      if (selEmployees.length && !selEmployees.includes(sc.employeeName)) return false;
       return true;
     }),
-    [props.allScorecards, fromMonth, toMonth, selLocation, selDept, selEmployee]
+    [props.allScorecards, fromMonth, toMonth, selLocation, selDept, selEmployees]
   );
 
   const reportMonths = useMemo(() =>
@@ -6721,6 +6742,7 @@ function HistoryScreen(props: {
                   <Input value={props.filters.search} onChange={(e) => props.onFilters({ ...props.filters, search: e.target.value })} placeholder="Search employee, location…" className="h-8 w-[220px] pl-8 text-[12px]" />
                 </div>
                 <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
+                {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -6797,6 +6819,7 @@ function HistoryScreen(props: {
           {!props.readonly && (
             <section style={{ padding: 0 }} className="overflow-hidden">
               <div className="flex flex-wrap items-center gap-2 p-2.5">
+                {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -6873,13 +6896,7 @@ function HistoryScreen(props: {
                 </Select>
               </ReportControl>
               <ReportControl label="Employee">
-                <Select value={selEmployee || ALL_LOCATIONS} onValueChange={(v) => setSelEmployee(v === ALL_LOCATIONS ? "" : v)}>
-                  <SelectTrigger size="sm" className="min-w-[9rem] text-[12px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_LOCATIONS}>All employees</SelectItem>
-                    {allEmployeeNames.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                {employeePicker("min-w-[9rem]")}
               </ReportControl>
               <ReportControl label="Group by">
                 <Select value={groupBy} onValueChange={(v) => setGroupBy(v as "employee" | "department" | "location")}>

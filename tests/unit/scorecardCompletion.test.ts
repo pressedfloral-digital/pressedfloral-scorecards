@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeScorecardCompletion } from "../../lib/scorecardCompletion";
+import { computeScorecardCompletion, isFinalizedForHistory } from "../../lib/scorecardCompletion";
 import type { Employee, EmployeeScorecardSettings, Goal, Scorecard } from "../../lib/types";
 
 const employee: Employee = {
@@ -141,5 +141,14 @@ describe("computeScorecardCompletion", () => {
     });
     expect(quarterlyResult.goalCount).toBe(1);
     expect(quarterlyResult.totalWeight).toBe(60);
+  });
+});
+
+describe("isFinalizedForHistory", () => {
+  it("includes approved and no-review scorecards, excludes pending and returned", () => {
+    expect(isFinalizedForHistory({ reviewStatus: "approved" })).toBe(true);
+    expect(isFinalizedForHistory({ reviewStatus: undefined })).toBe(true);
+    expect(isFinalizedForHistory({ reviewStatus: "pending_review" })).toBe(false);
+    expect(isFinalizedForHistory({ reviewStatus: "returned" })).toBe(false);
   });
 });

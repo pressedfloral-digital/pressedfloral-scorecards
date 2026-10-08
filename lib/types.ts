@@ -176,5 +176,6 @@ export type HistoryFilters = {
   location: string;
   department: string;
   goal: string;
+  employees: string[]; // empty = all employees
 };
 

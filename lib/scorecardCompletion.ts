@@ -142,3 +142,10 @@ export function computeScorecardCompletion(input: {
   if (hasUnsetWeights || totalWeight !== 100) return { status: "in_progress", goalCount, totalWeight, hasUnsetWeights };
   return { status: "ready", goalCount, totalWeight, hasUnsetWeights };
 }
+
+// Historical Data only shows finalized scorecards: approved by the reviewer, or submitted with
+// no review step (no reviewStatus — legacy rows and submitters without a supervisor).
+// Scorecards awaiting review or returned for changes stay out of history until approved.
+export function isFinalizedForHistory(scorecard: Pick<Scorecard, "reviewStatus">) {
+  return !scorecard.reviewStatus || scorecard.reviewStatus === "approved";
+}
