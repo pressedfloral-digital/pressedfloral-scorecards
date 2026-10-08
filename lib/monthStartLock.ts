@@ -4,7 +4,7 @@ type ProfileFields = Pick<Employee, "role" | "department" | "location">;
 
 // First month the lock applies to. Earlier months keep their uploaded values, so scorecards
 // already scored or set up before the guardrail existed are left as they were.
-export const MONTH_START_LOCK_FROM = "2026-10";
+export const MONTH_START_LOCK_FROM = "2026-09";
 
 // A team member's title, department and location — what decides which goals land on their
 // scorecard — are locked to their values on day 1 of the month. A month's Rippling upload
