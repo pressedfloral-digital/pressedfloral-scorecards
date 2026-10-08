@@ -9,9 +9,14 @@ const promoted: Employee = { ...ava, role: "Senior Designer", department: "Produ
 
 describe("lockMonthStartProfiles", () => {
   it("leaves months before the guardrail started as uploaded", () => {
-    const locked = lockMonthStartProfiles({ "2026-08": [ava], "2026-09": [promoted], "2026-10": [promoted] });
+    const locked = lockMonthStartProfiles({ "2026-07": [ava], "2026-08": [promoted], "2026-09": [promoted] });
+    expect(locked["2026-08"][0]).toEqual(promoted);
     expect(locked["2026-09"][0]).toEqual(promoted);
-    expect(locked["2026-10"][0]).toEqual(promoted);
+  });
+
+  it("holds a September 2026 promotion until October", () => {
+    const locked = lockMonthStartProfiles({ "2026-08": [ava], "2026-09": [promoted] });
+    expect(locked["2026-09"][0].role).toBe("Design Specialist");
   });
 
   it("keeps a month's title, department and location from the previous upload", () => {
