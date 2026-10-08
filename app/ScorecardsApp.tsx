@@ -13,9 +13,10 @@ import {
 } from "../lib/adminUsers";
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
-import { currentMonthValue, formatMonthLabel } from "../lib/periods";
+import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
 import { getReportingTree, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
+import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { computeScorecardCompletion, isFinalizedForHistory, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
@@ -1222,6 +1223,10 @@ export default function ScorecardsApp() {
     return result;
   }, [appData.rippling]);
 
+  // Rippling rows with title/department/location locked to day 1 of each month — what every
+  // scorecard is built from, so a mid-month change only takes effect the following month.
+  const scorecardRippling = useMemo(() => lockMonthStartProfiles(appData.rippling), [appData.rippling]);
+
   // Employee record for the logged-in user (for the Personal Scorecard panel).
   // Falls back to the most recent submitted scorecard if the employee isn't in Rippling,
   // so the personal scorecard always shows applicable goals even before payroll data is uploaded.
@@ -1832,9 +1837,13 @@ export default function ScorecardsApp() {
     setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: applyEmployeeOverrides(month, employees, current.employeeOverrides) } }));
     persistRippling(month, employees);
     const refreshed = await refreshSubmittedEarnings(month, { ...appData.rippling, [month]: employees });
-    showToast(refreshed > 0
-      ? `Rippling data saved — updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}`
-      : "Rippling data saved");
+    const held = lockMonthStartProfiles({ ...appData.rippling, [month]: applyEmployeeOverrides(month, employees, appData.employeeOverrides) })[month]
+      .filter((e) => e.monthStartHeld).length;
+    const notes = [
+      refreshed > 0 ? `updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}` : "",
+      held > 0 ? `${held} mid-month title/department change${held === 1 ? "" : "s"} will apply from ${formatMonthLabel(nextIsoMonth(month))}` : ""
+    ].filter(Boolean);
+    showToast(notes.length > 0 ? `Rippling data saved — ${notes.join("; ")}` : "Rippling data saved");
   }
 
   // Submitted scorecards freeze their earnings at submit time, so a payroll upload that lands
@@ -2115,10 +2124,11 @@ export default function ScorecardsApp() {
                   scorecards={myOwnScorecards}
                   employeeName={effectiveProfile?.linkedEmployeeName || ""}
                   myEmployee={myEmployee}
+                  titleOverride={effectiveProfile?.titleOverride}
                   periodType={effectiveProfile?.scorecardPeriodType}
                   allGoals={myGoals.filter((g) => g.active)}
                   allActuals={appData.actuals}
-                  rippling={appData.rippling}
+                  rippling={scorecardRippling}
                   goalAssignments={appData.goalAssignments}
                   empSettings={appData.employeeScorecardSettings.filter((s) => s.employeeName === (effectiveProfile?.linkedEmployeeName || ""))}
                 />
@@ -2166,7 +2176,7 @@ export default function ScorecardsApp() {
                 selectedMonths={scorecardMonths}
                 months={months}
                 profile={effectiveProfile}
-                rippling={appData.rippling}
+                rippling={scorecardRippling}
                 allEmployees={allRipplingEmployees}
                 scorecards={scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)}
                 allGoals={appData.goals.filter((g) => g.active)}
@@ -2276,7 +2286,7 @@ export default function ScorecardsApp() {
               allGoals={appData.goals.filter((g) => g.active)}
               companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
               subordinateProfiles={subordinateProfiles}
-              rippling={appData.rippling}
+              rippling={scorecardRippling}
               scorecards={appData.scorecards}
               allEmployees={allRipplingEmployees}
               goalAssignments={appData.goalAssignments}
@@ -2409,11 +2419,12 @@ function AuthScreen(props: {
 }
 
 function PersonalScorecardPanel({
-  scorecards, employeeName, myEmployee, periodType, allGoals, allActuals, rippling, goalAssignments, empSettings
+  scorecards, employeeName, myEmployee: latestEmployee, titleOverride, periodType, allGoals, allActuals, rippling, goalAssignments, empSettings
 }: {
   scorecards: Scorecard[];
   employeeName: string;
   myEmployee: Employee | null;
+  titleOverride?: string;
   periodType?: "monthly" | "quarterly";
   allGoals: Goal[];
   allActuals: Record<string, ActualsByKey>;
@@ -2491,6 +2502,15 @@ function PersonalScorecardPanel({
   const periodISO = periodToISO(currentPeriod);
   const isQuarterly = /^Q\d /.test(currentPeriod);
   const quarterKey = periodISO ? quarterKeyForMonth(periodISO) : "";
+
+  // Title/department/location as locked for this period (see lockMonthStartProfiles); periods
+  // without an upload use the latest Rippling data.
+  const myEmployee = useMemo((): Employee | null => {
+    if (!latestEmployee || !periodISO) return latestEmployee;
+    const row = (rippling[periodISO] || []).find((e) => e.name === latestEmployee.name);
+    if (!row) return latestEmployee;
+    return { ...latestEmployee, role: titleOverride ?? row.role, department: row.department, location: row.location };
+  }, [latestEmployee, periodISO, rippling, titleOverride]);
 
   const periodActuals = useMemo(() => ({
     ...(allActuals[currentPeriod] || {}),
@@ -4883,7 +4903,8 @@ function ScorecardsScreen(props: {
     const result: Employee[] = [];
     for (const period of periods) {
       for (const emp of props.rippling[period] || []) {
-        if (!seen.has(emp.name)) { seen.add(emp.name); result.push(emp); }
+        // Standing in for a later month, so any held-back mid-month change now applies.
+        if (!seen.has(emp.name)) { seen.add(emp.name); result.push(unlockMonthStartProfile(emp)); }
       }
     }
     return result;
@@ -5907,8 +5928,15 @@ function LiveScorecardCard({
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13.5px] font-medium text-foreground">{employee.name}</span>
           <span className="block truncate text-[11.5px] text-muted-foreground">
-            {employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
+            {/* A submitted scorecard shows the title/department it was scored under. */}
+            {(displayedSubmitted ?? employee).role}{(displayedSubmitted ?? employee).department ? ` · ${(displayedSubmitted ?? employee).department}` : ""}{(displayedSubmitted ?? employee).location ? ` · ${(displayedSubmitted ?? employee).location}` : ""}
             {employee.uploaded ? <span title="Department or manager was changed manually and overrides Rippling" className="font-medium text-foreground"> · Edited</span> : null}
+            {employee.monthStartHeld && !displayedSubmitted ? (
+              <span
+                title={`Locked to their ${formatMonthLabel(isoMonth)} start. Rippling shows ${[employee.monthStartHeld.role, employee.monthStartHeld.department, employee.monthStartHeld.location].filter(Boolean).join(" · ")}, which applies from ${formatMonthLabel(nextIsoMonth(isoMonth))}.`}
+                className="font-medium text-foreground"
+              > · Changed mid-month</span>
+            ) : null}
           </span>
         </span>
         {currentGoals.length > 0 && !ineligible ? (

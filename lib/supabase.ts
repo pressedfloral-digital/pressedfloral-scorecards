@@ -105,10 +105,10 @@ export function employeeToRow(period: string, employee: Employee) {
   return {
     period,
     full_name: employee.name,
-    role: employee.role,
-    // Rows are stored as Rippling uploaded them; overrides are applied on load.
-    department: employee.uploaded?.department ?? employee.department,
-    location: employee.location,
+    // Rows are stored as Rippling uploaded them; overrides and month-start locks are applied on load.
+    role: employee.monthStartHeld?.role ?? employee.role,
+    department: employee.monthStartHeld?.department ?? employee.uploaded?.department ?? employee.department,
+    location: employee.monthStartHeld?.location ?? employee.location,
     manager: (employee.uploaded ? employee.uploaded.manager : employee.manager) || null,
     // Only sent when set, so uploads without assignments still work against a database
     // that hasn't run the assigned_manager_id migration yet.
