@@ -226,6 +226,20 @@ function scorecardGoalsMissingActuals(scorecard: Pick<Scorecard, "goals">): stri
   return Array.from(new Set(scorecard.goals.filter((g) => g.actual == null || Number.isNaN(g.actual)).map((g) => g.name)));
 }
 
+// Duplicate Goals Bank entries (same tier/location/department/name/role or employee) share one
+// target/min/actual slot, so a scorecard keeps only the first of them.
+function dedupeGoalIds(ids: string[], goals: Goal[]): string[] {
+  const seen = new Set<string>();
+  return ids.filter((id) => {
+    const goal = goals.find((g) => g.id === id);
+    if (!goal) return true;
+    const key = actualKey(goal);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function actualKey(goal: Pick<Goal, "goalTier" | "location" | "department" | "name" | "role" | "employeeName">) {
   // Individual-tier goals of the same name/department/location can be assigned per role or
   // per employee (e.g. "Individual Ratio" for Senior/Design/Master Design Specialist) — fold
@@ -2597,6 +2611,8 @@ function PersonalScorecardPanel({
         .filter((g): g is Goal => !!g);
       goalList = [...kept, ...extras];
     }
+    const keptIds = new Set(dedupeGoalIds(goalList.map((g) => g.id), goalList));
+    goalList = goalList.filter((g) => keptIds.has(g.id));
 
     // 4. Map to EditableGoal — manager weight overrides take precedence over stored weights
     const weightOverrides: Record<string, number> = settings?.weightOverrides ?? {};
@@ -5651,12 +5667,12 @@ function LiveScorecardCard({
 
   function computeGoalIds(pt: "monthly" | "quarterly", s?: EmployeeScorecardSettings): string[] {
     const base = baseIdsForPeriod(pt);
-    if (!s) return base;
+    if (!s) return dedupeGoalIds(base, [...baseGoals, ...allGoals]);
     const excluded = new Set(s.excludedGoalIds);
     const kept = base.filter((id) => !excluded.has(id));
     // Extra goals the manager manually added that aren't in base (and still exist in allGoals)
     const extras = s.addedGoalIds.filter((id) => !base.includes(id) && allGoals.some((g) => g.id === id));
-    return [...kept, ...extras];
+    return dedupeGoalIds([...kept, ...extras], [...baseGoals, ...allGoals]);
   }
 
   function settingsForPeriod(pt: "monthly" | "quarterly"): EmployeeScorecardSettings | undefined {
