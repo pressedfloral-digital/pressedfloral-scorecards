@@ -221,6 +221,11 @@ const fixtureManagedUsers: AdminManagedUser[] = [
   }
 ];
 
+// Names of goals on a scorecard that have no actual yet; submission is blocked until empty.
+function scorecardGoalsMissingActuals(scorecard: Pick<Scorecard, "goals">): string[] {
+  return Array.from(new Set(scorecard.goals.filter((g) => g.actual == null || Number.isNaN(g.actual)).map((g) => g.name)));
+}
+
 function actualKey(goal: Pick<Goal, "goalTier" | "location" | "department" | "name" | "role" | "employeeName">) {
   // Individual-tier goals of the same name/department/location can be assigned per role or
   // per employee (e.g. "Individual Ratio" for Senior/Design/Master Design Specialist) — fold
@@ -1945,6 +1950,11 @@ export default function ScorecardsApp() {
   }
 
   async function submitScorecardDirect(scorecard: Scorecard) {
+    const missingActuals = scorecardGoalsMissingActuals(scorecard);
+    if (missingActuals.length > 0) {
+      showToast(`Scorecard not submitted — missing actual${missingActuals.length === 1 ? "" : "s"} for ${missingActuals.join(", ")}`);
+      return;
+    }
     // Look up the submitting manager's supervisor to determine review routing
     const submittingProfile = profile; // the currently logged-in manager
     const supervisorId = submittingProfile?.supervisorId;
@@ -5900,6 +5910,9 @@ function LiveScorecardCard({
   const totalWeight = Number(currentGoals.reduce((sum, g) => sum + g.scWeight, 0).toFixed(1));
   const weightsValid = currentGoals.length === 0 || (!hasUnsetWeights && totalWeight === 100);
   const hasQuarterlyMismatch = cardPeriodType === "monthly" && currentGoals.some((g) => g.periodType === "quarterly");
+  // A scorecard saves its actuals at submission, so every goal needs one first —
+  // otherwise an actual entered later never reaches the submitted scorecard.
+  const missingActualGoals = scorecardGoalsMissingActuals(liveScorecard);
   const availableToAdd = allGoals.filter((g) => {
     if (goalIds.includes(g.id)) return false;
     // Company-tier goals are normally excluded from this list (they're assigned via Goals &
@@ -6268,11 +6281,16 @@ function LiveScorecardCard({
                 Remove quarterly goals before submitting a monthly scorecard
               </span>
             )}
+            {!isCurrentMonth && !isFutureMonth && missingActualGoals.length > 0 && (
+              <span className="text-[11.5px] font-semibold text-destructive">
+                Missing actual{missingActualGoals.length === 1 ? "" : "s"}: {missingActualGoals.join(", ")}
+              </span>
+            )}
             <Button
               size="sm"
               className="ml-auto"
-              disabled={isCurrentMonth || isFutureMonth || hasNoTarget || currentGoals.length === 0 || !weightsValid || hasQuarterlyMismatch}
-              title={isCurrentMonth || isFutureMonth ? "Scorecards can only be submitted for past months" : hasNoTarget ? "Set goal values and minimums first" : hasUnsetWeights ? "Assign goal weights in Goals & Actuals first" : !weightsValid ? "Weights must add up to 100%" : hasQuarterlyMismatch ? "Remove quarterly goals before submitting a monthly scorecard" : undefined}
+              disabled={isCurrentMonth || isFutureMonth || hasNoTarget || currentGoals.length === 0 || !weightsValid || hasQuarterlyMismatch || missingActualGoals.length > 0}
+              title={isCurrentMonth || isFutureMonth ? "Scorecards can only be submitted for past months" : hasNoTarget ? "Set goal values and minimums first" : hasUnsetWeights ? "Assign goal weights in Goals & Actuals first" : !weightsValid ? "Weights must add up to 100%" : hasQuarterlyMismatch ? "Remove quarterly goals before submitting a monthly scorecard" : missingActualGoals.length > 0 ? "Enter every goal's actual before submitting" : undefined}
               onClick={() => {
                 const submitScorecard = prorationFactor < 1
                   ? { ...liveScorecard, bonusAmount: Math.round(proratedBonus * 100) / 100 }
