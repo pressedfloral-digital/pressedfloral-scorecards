@@ -3437,13 +3437,7 @@ function UserPermissionForm(props: {
       {draft.role === "admin" && (
         <div className="flex flex-wrap items-end gap-3">
           <DrawerField label="Linked employee (optional)" className="min-w-[12rem] flex-1">
-            <Select value={draft.linkedEmployeeName || "__none__"} onValueChange={(v) => setDraft({ ...draft, linkedEmployeeName: v === "__none__" ? "" : v })}>
-              <SelectTrigger className="w-full" aria-label="Linked employee"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__none__">No linked employee</SelectItem>
-                {employeeNames.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <LinkedNameInput ariaLabel="Linked employee" placeholder="No linked employee" names={employeeNames} value={draft.linkedEmployeeName} onChange={(v) => setDraft({ ...draft, linkedEmployeeName: v })} />
           </DrawerField>
         </div>
       )}
@@ -3457,13 +3451,7 @@ function UserPermissionForm(props: {
             <MultiSelectDropdown label="All locations" emptyLabel="No locations" triggerClassName="w-full" options={locationOptions} selected={draft.locations} onChange={(values) => setDraft({ ...draft, locations: values })} />
           </DrawerField>
           <DrawerField label="Reporting tree root" className="min-w-[12rem] flex-1">
-            <Select value={draft.linkedEmployeeName || ALL_LOCATIONS} onValueChange={(v) => v === ALL_LOCATIONS ? setDraft({ ...draft, linkedEmployeeName: "" }) : setLinkedEmployee(v)}>
-              <SelectTrigger className="w-full" aria-label="Reporting tree root"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL_LOCATIONS}>No linked employee</SelectItem>
-                {employeeNames.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <LinkedNameInput ariaLabel="Reporting tree root" placeholder="No linked employee" names={employeeNames} value={draft.linkedEmployeeName} onChange={setLinkedEmployee} />
           </DrawerField>
         </div>
       )}
@@ -3490,12 +3478,7 @@ function UserPermissionForm(props: {
       {draft.role === "user" && (
         <div className="flex flex-wrap items-end gap-3">
           <DrawerField label="Linked employee" className="min-w-[12rem] flex-1">
-            <Select value={draft.linkedEmployeeName || undefined} onValueChange={(v) => setDraft({ ...draft, linkedEmployeeName: v })}>
-              <SelectTrigger className="w-full" aria-label="Linked employee"><SelectValue placeholder="Choose employee" /></SelectTrigger>
-              <SelectContent>
-                {employeeNames.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <LinkedNameInput ariaLabel="Linked employee" placeholder="Choose or type a name" names={employeeNames} value={draft.linkedEmployeeName} onChange={(v) => setDraft({ ...draft, linkedEmployeeName: v })} />
           </DrawerField>
         </div>
       )}
@@ -3552,6 +3535,22 @@ function UserPermissionForm(props: {
         {props.onCancel && <Button variant="outline" size="sm" onClick={props.onCancel}>Cancel</Button>}
         <Button size="sm" onClick={handleSubmit}>{props.submitLabel}</Button>
       </div>
+    </div>
+  );
+}
+
+// Linked employee name: suggests names from Rippling but accepts any typed name, for people
+// (e.g. owners) who don't appear in a Rippling export. Clearing the box unlinks the user.
+function LinkedNameInput({ value, names, onChange, ariaLabel, placeholder }: { value: string; names: string[]; onChange: (value: string) => void; ariaLabel: string; placeholder: string }) {
+  const listId = React.useId();
+  const notInRippling = !!value.trim() && !names.some((name) => normalizePersonName(name) === normalizePersonName(value));
+  return (
+    <div className="flex flex-col gap-1">
+      <Input list={listId} aria-label={ariaLabel} placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} onBlur={(e) => { const trimmed = e.target.value.replace(/\s+/g, " ").trim(); if (trimmed !== e.target.value) onChange(trimmed); }} />
+      <datalist id={listId}>
+        {names.map((name) => <option key={name} value={name} />)}
+      </datalist>
+      {notInRippling && <span className="text-[11px] text-muted-foreground">Not in Rippling data — entered manually</span>}
     </div>
   );
 }
