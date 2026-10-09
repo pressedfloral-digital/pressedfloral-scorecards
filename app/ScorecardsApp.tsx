@@ -5257,7 +5257,7 @@ function ScorecardsScreen(props: {
             Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
           </label>
           {hasMultipleLevels && (
-            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Shows only team members who report directly to you">
+            <label className="ml-auto flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Shows only team members who report directly to you">
               <Checkbox checked={directReportsOnly} onCheckedChange={(v) => setDirectReportsOnly(v === true)} />
               Direct reports only
             </label>
