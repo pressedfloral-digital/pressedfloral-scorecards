@@ -221,6 +221,13 @@ const fixtureManagedUsers: AdminManagedUser[] = [
   }
 ];
 
+// Whether the viewer is this team member's direct manager: the manager matched at upload (or set
+// by an admin override) when there is one, otherwise the Rippling Manager name.
+function isDirectReportOf(employee: Pick<Employee, "manager" | "assignedManagerId">, profileId: string | undefined, profileNames: string[]): boolean {
+  if (employee.assignedManagerId) return employee.assignedManagerId === profileId;
+  return profileNames.some((n) => normalizePersonName(n) === normalizePersonName(employee.manager));
+}
+
 // Names of goals on a scorecard that have no actual yet; submission is blocked until empty.
 function scorecardGoalsMissingActuals(scorecard: Pick<Scorecard, "goals">): string[] {
   return Array.from(new Set(scorecard.goals.filter((g) => g.actual == null || Number.isNaN(g.actual)).map((g) => g.name)));
@@ -4899,6 +4906,7 @@ function ScorecardsScreen(props: {
   const [globalPeriodType, setGlobalPeriodType] = useState<"monthly" | "quarterly">("monthly");
   const [hideCompleted, setHideCompleted] = useState(false);
   const [hideIneligible, setHideIneligible] = useState(false);
+  const [directReportsOnly, setDirectReportsOnly] = useState(false);
   const [viewMode, setViewMode] = useState<"cards" | "progress">("cards");
   const [progressStatusFilter, setProgressStatusFilter] = useState<ScorecardCompletionStatus[]>([]);
 
@@ -4979,6 +4987,12 @@ function ScorecardsScreen(props: {
   // Latest employees scoped to profile — used for multi-month mode filters
   const multiMonthTeam = scopedEmployeesForProfile(latestEmployees, props.profile, props.allEmployees);
 
+  // "Direct reports only" is offered to anyone whose team spans more than one level.
+  const isDirectReport = (e: Employee) => isDirectReportOf(e, props.profile?.id, currentUserNames);
+  const visibleTeam = singleMonthMode ? teamEmployees : multiMonthTeam;
+  const hasMultipleLevels = visibleTeam.some(isDirectReport) && visibleTeam.some((e) => !isDirectReport(e) && e.name !== props.profile?.linkedEmployeeName);
+  const directOnly = directReportsOnly && hasMultipleLevels;
+
   // Filter options from team employees (single) or latest scoped team (multi/all)
   const teamDepts = singleMonthMode
     ? Array.from(new Set(teamEmployees.map((e) => e.department).filter(Boolean))).sort()
@@ -5026,6 +5040,7 @@ function ScorecardsScreen(props: {
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
     if (hideIneligible && isBelowMinHours(withActualEarnings(e))) return false;
+    if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
       if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -5048,11 +5063,13 @@ function ScorecardsScreen(props: {
 
   const employeeOptions = singleMonthMode
     ? sortedTeam.filter((e) =>
+        (!directOnly || isDirectReport(e)) &&
         (filterLocations.length === 0 || filterLocations.includes(e.location)) &&
         (filterDepts.length === 0 || filterDepts.includes(e.department))
       ).map((e) => e.name)
     : [...multiMonthTeam]
         .filter((e) =>
+          (!directOnly || isDirectReport(e)) &&
           (filterDepts.length === 0 || filterDepts.includes(e.department)) &&
           (filterLocations.length === 0 || filterLocations.includes(e.location))
         )
@@ -5230,6 +5247,12 @@ function ScorecardsScreen(props: {
             <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
             Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
           </label>
+          {hasMultipleLevels && (
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Shows only team members who report directly to you">
+              <Checkbox checked={directReportsOnly} onCheckedChange={(v) => setDirectReportsOnly(v === true)} />
+              Direct reports only
+            </label>
+          )}
         </div>
       </section>
 
@@ -5379,6 +5402,7 @@ function ScorecardsScreen(props: {
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
                   if (hideIneligible && isBelowMinHours({ hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked })) return false;
+                  if (directOnly && !isDirectReport(e)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
                     if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -6323,10 +6347,7 @@ function LiveScorecardCard({
               onClick={() => {
                 // An indirect manager can submit on the direct manager's behalf, but confirms first —
                 // the scorecard routes to the submitter's own manager, not the direct manager's.
-                const isDirectManager = employee.assignedManagerId
-                  ? employee.assignedManagerId === currentUserProfileId
-                  : (currentUserNames || []).some((n) => normalizePersonName(n) === normalizePersonName(employee.manager));
-                if (employee.manager && !isDirectManager) {
+                if (employee.manager && !isDirectReportOf(employee, currentUserProfileId, currentUserNames || [])) {
                   const routing = reviewerName ? `It will be sent to ${reviewerName} for approval.` : "It will be sent to your manager for approval.";
                   if (!window.confirm(`You are submitting the scorecard on behalf of ${employee.manager}. ${routing} Do you wish to proceed?`)) return;
                 }
