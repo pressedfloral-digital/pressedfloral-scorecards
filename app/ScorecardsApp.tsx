@@ -5248,20 +5248,23 @@ function ScorecardsScreen(props: {
             />
           )}
           <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
-          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Hides scorecards that are Approved or Submitted with no reviewer — i.e. already finalized">
-            <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
-            Hide completed
-          </label>
-          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title={`Hides scorecards for team members who worked under ${MIN_HOURS_FOR_SCORECARD} hours in the period`}>
-            <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
-            Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
-          </label>
-          {hasMultipleLevels && (
-            <label className="ml-auto flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Shows only team members who report directly to you">
-              <Checkbox checked={directReportsOnly} onCheckedChange={(v) => setDirectReportsOnly(v === true)} />
-              Direct reports only
+          {/* The checkboxes wrap as one group, so none ends up alone on its own line. */}
+          <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-3 gap-y-2">
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Hides scorecards that are Approved or Submitted with no reviewer — i.e. already finalized">
+              <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
+              Hide completed
             </label>
-          )}
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title={`Hides scorecards for team members who worked under ${MIN_HOURS_FOR_SCORECARD} hours in the period`}>
+              <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
+              Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
+            </label>
+            {hasMultipleLevels && (
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Shows only team members who report directly to you">
+                <Checkbox checked={directReportsOnly} onCheckedChange={(v) => setDirectReportsOnly(v === true)} />
+                Direct reports only
+              </label>
+            )}
+          </div>
         </div>
       </section>
 
