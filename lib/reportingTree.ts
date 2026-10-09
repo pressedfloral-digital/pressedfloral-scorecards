@@ -47,3 +47,18 @@ export function getReportingTree(roots: string | string[], employees: Employee[]
   for (const r of rootList) result.delete(r);
   return result;
 }
+
+// The row that decides who someone reports to for a quarter: their latest upload within the
+// quarter (quarterStart is the quarter's first ISO month), so a manager change partway through
+// the quarter counts for that quarter. Undefined when they're in none of the quarter's uploads.
+export function latestRowInQuarter(rippling: Record<string, Employee[]>, name: string, quarterStart: string): Employee | undefined {
+  const [y, m] = quarterStart.split("-").map(Number);
+  if (!y || !m) return undefined;
+  for (let i = 2; i >= 0; i--) {
+    const d = new Date(y, m - 1 + i, 1);
+    const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const row = (rippling[month] || []).find((r) => r.name === name);
+    if (row) return row;
+  }
+  return undefined;
+}
