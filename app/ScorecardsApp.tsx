@@ -486,7 +486,8 @@ export default function ScorecardsApp() {
     location: "",
     department: "",
     goal: "",
-    employees: []
+    employees: [],
+    teamStatus: "current"
   });
   const [historyView, setHistoryView] = useState<HistoryView>("table");
 
@@ -1304,10 +1305,22 @@ export default function ScorecardsApp() {
       });
   }, [effectiveProfile, appData.scorecards]);
 
+  // Current team members are the people in the latest Rippling upload; everyone else with
+  // history (e.g. former team members backfilled from Drive) is "former". No uploads → all current.
+  const currentTeamNames = useMemo(() => {
+    const latest = Object.keys(appData.rippling).filter((p) => appData.rippling[p]?.length).sort().pop();
+    return latest ? new Set(appData.rippling[latest].map((e) => e.name)) : null;
+  }, [appData.rippling]);
+
   // Pending and returned scorecards stay out of Historical Data until approved.
   const historyScorecards = useMemo(
-    () => scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees).filter(isFinalizedForHistory),
-    [appData.scorecards, effectiveProfile, allRipplingEmployees]
+    () => scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)
+      .filter(isFinalizedForHistory)
+      .filter((sc) => {
+        if (historyFilters.teamStatus === "all" || !currentTeamNames) return true;
+        return currentTeamNames.has(sc.employeeName) === (historyFilters.teamStatus === "current");
+      }),
+    [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, currentTeamNames]
   );
 
   const filteredHistory = useMemo(() => {
@@ -6733,6 +6746,16 @@ function HistoryScreen(props: {
   // Employee selection is shared by every view; empty means all employees.
   const selEmployees = props.filters.employees;
   const employeeOptions = useMemo(() => allEmployeeNames.map((n) => ({ value: n, label: n })), [allEmployeeNames]);
+  const teamStatusPicker = (
+    <Select value={props.filters.teamStatus} onValueChange={(v) => props.onFilters({ ...props.filters, teamStatus: v as HistoryFilters["teamStatus"], employees: [] })}>
+      <SelectTrigger size="sm" className="min-w-[8.5rem] text-[12px]" aria-label="Team members"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="current">Current team</SelectItem>
+        <SelectItem value="former">Former team</SelectItem>
+        <SelectItem value="all">All team members</SelectItem>
+      </SelectContent>
+    </Select>
+  );
   const employeePicker = (triggerClassName: string) => (
     <MultiSelectDropdown
       label="All employees"
@@ -6858,6 +6881,7 @@ function HistoryScreen(props: {
                   <Input value={props.filters.search} onChange={(e) => props.onFilters({ ...props.filters, search: e.target.value })} placeholder="Search employee, location…" className="h-8 w-[220px] pl-8 text-[12px]" />
                 </div>
                 <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
+                {teamStatusPicker}
                 {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
@@ -6935,6 +6959,7 @@ function HistoryScreen(props: {
           {!props.readonly && (
             <section style={{ padding: 0 }} className="overflow-hidden">
               <div className="flex flex-wrap items-center gap-2 p-2.5">
+                {teamStatusPicker}
                 {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
@@ -7010,6 +7035,9 @@ function HistoryScreen(props: {
                     {allDepts.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
                   </SelectContent>
                 </Select>
+              </ReportControl>
+              <ReportControl label="Team members">
+                {teamStatusPicker}
               </ReportControl>
               <ReportControl label="Employee">
                 {employeePicker("min-w-[9rem]")}
