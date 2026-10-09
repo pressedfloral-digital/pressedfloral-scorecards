@@ -79,7 +79,7 @@ export function Sidebar({
       <Sheet open={openMobile} onOpenChange={setOpenMobile}>
         <SheetContent
           side="left"
-          className="w-[--sidebar-width-mobile] bg-sidebar p-0 text-sidebar-foreground"
+          className="w-(--sidebar-width-mobile) bg-sidebar p-0 text-sidebar-foreground"
         >
           <div className="flex h-full w-full flex-col">{children}</div>
         </SheetContent>
@@ -90,7 +90,7 @@ export function Sidebar({
   return (
     <div
       className={cn(
-        "sticky top-0 hidden h-svh w-[--sidebar-width] shrink-0 md:flex",
+        "sticky top-0 hidden h-svh w-(--sidebar-width) shrink-0 md:flex",
         className
       )}
     >
