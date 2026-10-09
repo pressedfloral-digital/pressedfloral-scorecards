@@ -487,7 +487,8 @@ export default function ScorecardsApp() {
     department: "",
     goal: "",
     employees: [],
-    teamStatus: "current"
+    teamStatus: "current",
+    periodType: "all"
   });
   const [historyView, setHistoryView] = useState<HistoryView>("table");
 
@@ -1319,8 +1320,9 @@ export default function ScorecardsApp() {
       .filter((sc) => {
         if (historyFilters.teamStatus === "all" || !currentTeamNames) return true;
         return currentTeamNames.has(sc.employeeName) === (historyFilters.teamStatus === "current");
-      }),
-    [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, currentTeamNames]
+      })
+      .filter((sc) => historyFilters.periodType === "all" || isQuarterLabel(sc.scorecardMonth) === (historyFilters.periodType === "quarterly")),
+    [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, historyFilters.periodType, currentTeamNames]
   );
 
   const filteredHistory = useMemo(() => {
@@ -6674,7 +6676,34 @@ function parseMonthLabel(label: string): string {
   return `${y}-${String(m + 1).padStart(2, "0")}`;
 }
 
+function isQuarterLabel(label: string): boolean {
+  return /^Q[1-4] \d{4}$/.test(label.trim());
+}
+
+// Historical Data report periods: "YYYY-MM" for months, "YYYY-Qn" for quarters.
+function historyPeriodKey(label: string): string {
+  const qm = label.trim().match(/^Q([1-4]) (\d{4})$/);
+  return qm ? `${qm[2]}-Q${qm[1]}` : parseMonthLabel(label);
+}
+
+// Chronological order: a quarter sorts right after its last month.
+function historyPeriodOrder(key: string): string {
+  const qm = key.match(/^(\d{4})-Q([1-4])$/);
+  return qm ? `${qm[1]}-${String(Number(qm[2]) * 3).padStart(2, "0")}-1` : `${key}-0`;
+}
+
+function sortHistoryPeriods(keys: string[]): string[] {
+  return keys.sort((a, b) => historyPeriodOrder(a).localeCompare(historyPeriodOrder(b)));
+}
+
+function historyPeriodLabel(key: string): string {
+  const qm = key.match(/^(\d{4})-Q([1-4])$/);
+  return qm ? `Q${qm[2]} ${qm[1]}` : formatMonthLabel(key);
+}
+
 function shortMonthLabel(iso: string): string {
+  const qm = iso.match(/^(\d{4})-Q([1-4])$/);
+  if (qm) return `Q${qm[2]} '${qm[1].slice(2)}`;
   const names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   const [y, m] = iso.split("-").map(Number);
   if (!y || !m) return iso;
@@ -6720,10 +6749,12 @@ function HistoryScreen(props: {
   const [metric, setMetric] = useState<"achievement" | "bonus" | "goal">("achievement");
   const [metricGoal, setMetricGoal] = useState("");
   const [groupBy, setGroupBy] = useState<"employee" | "department" | "location">("employee");
+  // The range options change with the scorecard type (months vs quarters), so start over.
+  useEffect(() => { setFromMonth(""); setToMonth(""); }, [props.filters.periodType]);
 
   // Options derived from all scorecards
   const allMonthIsos = useMemo(() =>
-    Array.from(new Set(props.allScorecards.map((sc) => parseMonthLabel(sc.scorecardMonth)))).filter(Boolean).sort(),
+    sortHistoryPeriods(Array.from(new Set(props.allScorecards.map((sc) => historyPeriodKey(sc.scorecardMonth)))).filter(Boolean)),
     [props.allScorecards]
   );
   const allLocations = useMemo(() =>
@@ -6756,6 +6787,16 @@ function HistoryScreen(props: {
       </SelectContent>
     </Select>
   );
+  const periodTypePicker = (
+    <Select value={props.filters.periodType} onValueChange={(v) => props.onFilters({ ...props.filters, periodType: v as HistoryFilters["periodType"], period: "" })}>
+      <SelectTrigger size="sm" className="min-w-[8.5rem] text-[12px]" aria-label="Scorecard type"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all">Monthly &amp; quarterly</SelectItem>
+        <SelectItem value="monthly">Monthly</SelectItem>
+        <SelectItem value="quarterly">Quarterly</SelectItem>
+      </SelectContent>
+    </Select>
+  );
   const employeePicker = (triggerClassName: string) => (
     <MultiSelectDropdown
       label="All employees"
@@ -6770,9 +6811,9 @@ function HistoryScreen(props: {
   // Filtered scorecards for report views
   const reportScorecards = useMemo(() =>
     props.allScorecards.filter((sc) => {
-      const iso = parseMonthLabel(sc.scorecardMonth);
-      if (fromMonth && iso < fromMonth) return false;
-      if (toMonth && iso > toMonth) return false;
+      const order = historyPeriodOrder(historyPeriodKey(sc.scorecardMonth));
+      if (fromMonth && order < historyPeriodOrder(fromMonth)) return false;
+      if (toMonth && order > historyPeriodOrder(toMonth)) return false;
       if (selLocation && sc.location !== selLocation) return false;
       if (selDept && sc.department !== selDept) return false;
       if (selEmployees.length && !selEmployees.includes(sc.employeeName)) return false;
@@ -6782,7 +6823,7 @@ function HistoryScreen(props: {
   );
 
   const reportMonths = useMemo(() =>
-    Array.from(new Set(reportScorecards.map((sc) => parseMonthLabel(sc.scorecardMonth)))).filter(Boolean).sort(),
+    sortHistoryPeriods(Array.from(new Set(reportScorecards.map((sc) => historyPeriodKey(sc.scorecardMonth)))).filter(Boolean)),
     [reportScorecards]
   );
 
@@ -6804,7 +6845,7 @@ function HistoryScreen(props: {
 
   function getGroupMonthValue(groupKey: string, isoMonth: string): number | null {
     const scs = reportScorecards.filter((sc) => {
-      if (parseMonthLabel(sc.scorecardMonth) !== isoMonth) return false;
+      if (historyPeriodKey(sc.scorecardMonth) !== isoMonth) return false;
       if (groupBy === "employee") return sc.employeeName === groupKey;
       if (groupBy === "department") return sc.department === groupKey;
       return sc.location === groupKey;
@@ -6882,6 +6923,7 @@ function HistoryScreen(props: {
                 </div>
                 <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
                 {teamStatusPicker}
+                {periodTypePicker}
                 {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
@@ -6960,6 +7002,7 @@ function HistoryScreen(props: {
             <section style={{ padding: 0 }} className="overflow-hidden">
               <div className="flex flex-wrap items-center gap-2 p-2.5">
                 {teamStatusPicker}
+                {periodTypePicker}
                 {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
@@ -7005,7 +7048,7 @@ function HistoryScreen(props: {
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={ALL_LOCATIONS}>Earliest</SelectItem>
-                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{formatMonthLabel(m)}</SelectItem>)}
+                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{historyPeriodLabel(m)}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </ReportControl>
@@ -7014,7 +7057,7 @@ function HistoryScreen(props: {
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={ALL_LOCATIONS}>Latest</SelectItem>
-                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{formatMonthLabel(m)}</SelectItem>)}
+                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{historyPeriodLabel(m)}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </ReportControl>
@@ -7038,6 +7081,9 @@ function HistoryScreen(props: {
               </ReportControl>
               <ReportControl label="Team members">
                 {teamStatusPicker}
+              </ReportControl>
+              <ReportControl label="Scorecard type">
+                {periodTypePicker}
               </ReportControl>
               <ReportControl label="Employee">
                 {employeePicker("min-w-[9rem]")}

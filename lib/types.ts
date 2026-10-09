@@ -182,5 +182,6 @@ export type HistoryFilters = {
   goal: string;
   employees: string[]; // empty = all employees
   teamStatus: "current" | "former" | "all"; // current = in the latest Rippling upload
+  periodType: "all" | "monthly" | "quarterly";
 };
 
