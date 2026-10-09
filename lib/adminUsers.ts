@@ -21,6 +21,7 @@ export const SCORECARD_LOCATIONS = ["Utah", "Georgia", "Remote"];
 export type AdminManagedUser = {
   id: string;
   email: string;
+  fullName?: string;
   role: ProfileRole;
   departments: string[];
   locations: string[];
@@ -42,6 +43,7 @@ export type AdminManagedUser = {
 export type AdminUserPayload = {
   id?: string;
   email?: string;
+  fullName?: string;
   role: ProfileRole;
   departments: string[];
   locations: string[];
@@ -100,6 +102,7 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
   const departments = uniqueAllowedStrings(source.departments, allowedDepartments);
   const locations = uniqueAllowedStrings(source.locations, allowedLocations);
   const linkedEmployeeName = normalizeOptionalString(source.linkedEmployeeName);
+  const fullName = normalizeOptionalString(typeof source.fullName === "string" ? source.fullName.replace(/\s+/g, " ") : source.fullName);
   // Other names the person appears under in Rippling, so upload Manager names still match.
   const linkedNameAliases = parseNameAliases(source.linkedNameAliases)
     .filter((alias) => alias.toLowerCase() !== (linkedEmployeeName || "").toLowerCase());
@@ -110,7 +113,7 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
   if (role === "admin") {
     return {
       ok: true,
-      value: { id, email, role, departments: [], locations: [], allDepartments: true, allLocations: true, linkedEmployeeName, linkedNameAliases, scorecardPeriodType }
+      value: { id, email, fullName, role, departments: [], locations: [], allDepartments: true, allLocations: true, linkedEmployeeName, linkedNameAliases, scorecardPeriodType }
     };
   }
 
@@ -118,7 +121,7 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
     if (!linkedEmployeeName) return { ok: false, error: "Choose the employee this viewer can access." };
     return {
       ok: true,
-      value: { id, email, role, departments: [], locations: [], linkedEmployeeName, linkedNameAliases, allDepartments: true, allLocations: true, scorecardPeriodType, companyGoalsGrant }
+      value: { id, email, fullName, role, departments: [], locations: [], linkedEmployeeName, linkedNameAliases, allDepartments: true, allLocations: true, scorecardPeriodType, companyGoalsGrant }
     };
   }
 
@@ -134,6 +137,7 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
     value: {
       id,
       email,
+      fullName,
       role,
       departments: allDepartments ? [] : departments,
       locations: allLocations ? [] : locations,
@@ -154,6 +158,7 @@ export function adminProfileToRow(userId: string, payload: AdminUserPayload, opt
   const aliases = payload.linkedNameAliases || [];
   return {
     id: userId,
+    full_name: payload.fullName || null,
     role: payload.role,
     departments: payload.departments,
     locations: payload.locations,

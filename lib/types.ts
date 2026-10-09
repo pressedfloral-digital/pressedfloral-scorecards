@@ -5,6 +5,7 @@ export type ProfileRole = "admin" | "manager" | "user";
 export type ManagerProfile = {
   id: string;
   email: string;
+  fullName?: string;     // display name entered by an admin (manager_profiles.full_name)
   role: ProfileRole;
   departments: string[];
   locations: string[];
