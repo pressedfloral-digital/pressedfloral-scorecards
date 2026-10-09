@@ -17,7 +17,7 @@ import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } f
 import { getReportingTree, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
-import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
+import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { computeScorecardCompletion, isFinalizedForHistory, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
@@ -4919,6 +4919,9 @@ function ScorecardsScreen(props: {
   // Single-month mode = exactly one month selected → live draft cards
   // Multi/all mode = 0 or 2+ months → live draft cards per month, grouped by month
   const singleMonthMode = props.selectedMonths.length === 1;
+  // The viewer's own names as they appear in Rippling's Manager column — to tell whether they're
+  // a team member's direct manager when submitting.
+  const currentUserNames = [props.profile?.linkedEmployeeName, ...(props.profile?.linkedNameAliases || [])].filter((n): n is string => !!n);
   const selectedMonth = singleMonthMode ? props.selectedMonths[0] : "";
   const periodLabel = globalPeriodType === "quarterly" ? quarterKeyForMonth(selectedMonth) : formatMonthLabel(selectedMonth);
 
@@ -5314,6 +5317,7 @@ function ScorecardsScreen(props: {
                     currentUserProfileId={props.currentUserProfileId}
                     reviewChainIds={props.reviewChainIds}
                     reviewerName={props.reviewerName}
+                    currentUserNames={currentUserNames}
                     autoOpen={!!props.focusEmployeeKey && props.focusEmployeeKey === (emp.id || emp.name)}
                     autoOpenNonce={props.focusNonce}
                   />
@@ -5428,6 +5432,7 @@ function ScorecardsScreen(props: {
                         currentUserProfileId={props.currentUserProfileId}
                         reviewChainIds={props.reviewChainIds}
                         reviewerName={props.reviewerName}
+                    currentUserNames={currentUserNames}
                       />
                     );
                   })}
@@ -5617,7 +5622,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, currentUserNames, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5655,6 +5660,7 @@ function LiveScorecardCard({
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
   reviewerName?: string;
+  currentUserNames?: string[];
   autoOpen?: boolean;
   autoOpenNonce?: number;
 }) {
@@ -6308,6 +6314,15 @@ function LiveScorecardCard({
               disabled={isCurrentMonth || isFutureMonth || hasNoTarget || currentGoals.length === 0 || !weightsValid || hasQuarterlyMismatch || missingActualGoals.length > 0}
               title={isCurrentMonth || isFutureMonth ? "Scorecards can only be submitted for past months" : hasNoTarget ? "Set goal values and minimums first" : hasUnsetWeights ? "Assign goal weights in Goals & Actuals first" : !weightsValid ? "Weights must add up to 100%" : hasQuarterlyMismatch ? "Remove quarterly goals before submitting a monthly scorecard" : missingActualGoals.length > 0 ? "Enter every goal's actual before submitting" : undefined}
               onClick={() => {
+                // An indirect manager can submit on the direct manager's behalf, but confirms first —
+                // the scorecard routes to the submitter's own manager, not the direct manager's.
+                const isDirectManager = employee.assignedManagerId
+                  ? employee.assignedManagerId === currentUserProfileId
+                  : (currentUserNames || []).some((n) => normalizePersonName(n) === normalizePersonName(employee.manager));
+                if (employee.manager && !isDirectManager) {
+                  const routing = reviewerName ? `It will be sent to ${reviewerName} for approval.` : "It will be sent to your manager for approval.";
+                  if (!window.confirm(`You are submitting the scorecard on behalf of ${employee.manager}. ${routing} Do you wish to proceed?`)) return;
+                }
                 const submitScorecard = prorationFactor < 1
                   ? { ...liveScorecard, bonusAmount: Math.round(proratedBonus * 100) / 100 }
                   : liveScorecard;
