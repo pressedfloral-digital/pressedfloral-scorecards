@@ -1,9 +1,15 @@
 /**
  * Monthly KPI auto-sync from pf-dashboard into this app's `actuals` table.
  *
- * Triggered by Vercel Cron (see vercel.json → 0 14 3 * * = 8 AM MDT on the 3rd
- * of each month, a few days after month-close so payroll/production data has
- * time to land in pf-dashboard). Vercel automatically adds
+ * Months here are pf-dashboard's *business* months — each Mon–Sun week belongs
+ * to the month its Monday falls in — so a month isn't finished until the Monday
+ * after its last week, once pf-dashboard has loaded that week (see
+ * businessMonthReadyAt in lib/periods.ts). Triggered daily by Vercel Cron
+ * (vercel.json → 0 14 * * * = 8 AM MDT); with no `month` param it syncs the
+ * most recently completed business month, and only during the
+ * AUTO_SYNC_WINDOW_DAYS after it completes — re-running daily in that window
+ * picks up late payroll/Rippling uploads, and fill-only-if-empty (below) keeps
+ * the repeats harmless. Vercel automatically adds
  * `Authorization: Bearer $CRON_SECRET` to the request.
  *
  * Can also be triggered manually — by an admin or manager from the Scorecards
@@ -29,7 +35,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { goalFromRow } from "@/lib/supabase";
 import { computePfDashboardSync } from "@/lib/pfDashboardSync";
 import { DEPT_SPLIT_TIER } from "@/lib/crossDeptRatio";
-import { currentMonthValue, formatMonthLabel, nextMonthValue } from "@/lib/periods";
+import { businessMonthReadyAt, currentBusinessMonth, formatMonthLabel, isBusinessMonthComplete, lastCompletedBusinessMonth, nextMonthValue } from "@/lib/periods";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -73,12 +79,9 @@ async function authorizeCaller(request: NextRequest, sb: SupabaseClient): Promis
   return null;
 }
 
-// Last fully-completed calendar month, as "YYYY-MM", relative to now.
-function lastCompletedMonth(): string {
-  const now = new Date();
-  const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-}
+// How many days after a business month completes the daily cron keeps re-syncing it.
+const AUTO_SYNC_WINDOW_DAYS = 7;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export async function GET(request: NextRequest) {
   let sb: SupabaseClient;
@@ -97,10 +100,23 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "PF_DASHBOARD_API_URL or SCORECARDS_SYNC_SECRET not set" }, { status: 500 });
   }
 
-  const targetMonth = request.nextUrl.searchParams.get("month") ?? lastCompletedMonth();
+  const monthParam = request.nextUrl.searchParams.get("month");
+  const targetMonth = monthParam ?? lastCompletedBusinessMonth();
   if (!/^\d{4}-\d{2}$/.test(targetMonth)) {
     return NextResponse.json({ error: 'Invalid "month" — expected "YYYY-MM"' }, { status: 400 });
   }
+
+  // Scheduled run outside the window after the latest month completed — nothing to do.
+  const readyAt = businessMonthReadyAt(targetMonth);
+  if (!monthParam && Date.now() - readyAt.getTime() > AUTO_SYNC_WINDOW_DAYS * DAY_MS) {
+    return NextResponse.json({ skipped: true, reason: `${formatMonthLabel(targetMonth)} sync window has passed`, synced: [] });
+  }
+
+  // A month whose last week hasn't finished would only have partial actuals, and fill-only-if-
+  // empty means a partial value would then stick — so actuals wait for the month to complete.
+  // Goal/Min (current/next month targets) still sync.
+  const actualsReady = isBusinessMonthComplete(targetMonth);
+  const actualsDeferredUntil = actualsReady ? null : readyAt.toISOString();
 
   const audit = request.nextUrl.searchParams.get("audit") === "1";
 
@@ -124,13 +140,14 @@ export async function GET(request: NextRequest) {
       location: r.location ?? "",
     }));
 
-    const { period, considered, writes } = await computePfDashboardSync({
+    const { period, considered, writes: computedWrites } = await computePfDashboardSync({
       targetMonth,
       baseUrl,
       syncSecret,
       goals,
       roster,
     });
+    const writes = actualsReady ? computedWrites : computedWrites.filter((w) => w.goalTier === "__meta__");
 
     // Multiple goals_bank rows can share the same (tier, location, department,
     // name) — e.g. duplicate goals entered twice by mistake. They'd all write
@@ -150,8 +167,8 @@ export async function GET(request: NextRequest) {
     const splitWrites = allUniqueWrites.filter((w) => w.goalTier === DEPT_SPLIT_TIER);
     const uniqueWrites = allUniqueWrites.filter((w) => w.goalTier !== DEPT_SPLIT_TIER);
 
-    const thisMonthPeriod = formatMonthLabel(currentMonthValue());
-    const nextMonthPeriod = formatMonthLabel(nextMonthValue(currentMonthValue()));
+    const thisMonthPeriod = formatMonthLabel(currentBusinessMonth());
+    const nextMonthPeriod = formatMonthLabel(nextMonthValue(currentBusinessMonth()));
     const periodsToCheck = Array.from(new Set([period, thisMonthPeriod, nextMonthPeriod]));
 
     // Existing actuals for the relevant periods, regardless of value — used both for
@@ -343,6 +360,7 @@ export async function GET(request: NextRequest) {
       unmapped: considered - (writes.length - splitWrites.length),
       reviewRecommended,
       submittedMismatches,
+      actualsDeferredUntil,
     });
   } catch (e) {
     console.error("sync-pf-kpis error:", e);

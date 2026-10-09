@@ -1755,6 +1755,10 @@ export default function ScorecardsApp() {
     if (submittedMismatches.length > 0) {
       parts.push(`${submittedMismatches.length} submitted scorecard value${submittedMismatches.length === 1 ? "" : "s"} no longer match${submittedMismatches.length === 1 ? "es" : ""}.`);
     }
+    if (typeof body.actualsDeferredUntil === "string") {
+      const readyOn = new Date(body.actualsDeferredUntil).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      parts.push(`${period} actuals aren't synced yet — its last week isn't finished. They'll sync automatically from ${readyOn}.`);
+    }
     showToast(parts.join(" "));
 
     return { synced: synced.length, reviewRecommended, submittedMismatches, period };
