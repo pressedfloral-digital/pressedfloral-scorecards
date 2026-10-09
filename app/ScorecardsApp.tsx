@@ -638,7 +638,7 @@ export default function ScorecardsApp() {
       setReviewChainIds(chain);
       // The person any scorecard viewAsProfile submits routes to — their own supervisor.
       const viewAsReviewer = viewAsProfile.supervisorId ? adminUsers.find((u) => u.id === viewAsProfile.supervisorId) : undefined;
-      setReviewerName(viewAsReviewer ? (viewAsReviewer.linkedEmployeeName || viewAsReviewer.email) : null);
+      setReviewerName(viewAsReviewer ? (viewAsReviewer.fullName || viewAsReviewer.linkedEmployeeName || viewAsReviewer.email) : null);
       return;
     }
     // Normal mode: fetch on login so badge count is accurate from the start.
@@ -2219,7 +2219,7 @@ export default function ScorecardsApp() {
                 employeeOverrides={appData.employeeOverrides}
                 managerOptions={adminUsers
                   .filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin"))
-                  .map((u) => ({ id: u.id, label: u.linkedEmployeeName || u.email }))
+                  .map((u) => ({ id: u.id, label: u.fullName || u.linkedEmployeeName || u.email }))
                   .sort((a, b) => a.label.localeCompare(b.label))}
                 onSaveEmployeeOverride={profile?.role === "admin" ? saveEmployeeOverride : undefined}
                 onClearEmployeeOverride={profile?.role === "admin" ? clearEmployeeOverride : undefined}
@@ -3142,7 +3142,7 @@ function UsersScreen(props: {
         <Table className="text-[12.5px]">
           <TableHeader className="bg-muted/40 [&_th]:h-9 [&_th]:px-4 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
             <TableRow className="hover:bg-transparent">
-              <TableHead>Email</TableHead>
+              <TableHead>User</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Role</TableHead>
               <TableHead>Scope</TableHead>
@@ -3161,7 +3161,9 @@ function UsersScreen(props: {
                 <TableRow>
                   <TableCell>
                     <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-medium text-foreground">{user.email}</span>
+                      {user.fullName
+                        ? <span className="flex flex-col"><span className="font-medium text-foreground">{user.fullName}</span><span className="text-[11.5px] text-muted-foreground">{user.email}</span></span>
+                        : <span className="font-medium text-foreground">{user.email}</span>}
                       {user.id === props.currentUserId && <Badge variant="secondary" className="font-medium">You</Badge>}
                       {!user.hasProfile && <Badge variant="outline" className="font-medium text-[#9B2C2C]">No profile</Badge>}
                     </span>
@@ -3401,6 +3403,7 @@ function UserPermissionForm(props: {
     const saved = await props.onSubmit({
       id: draft.id,
       email: draft.email,
+      fullName: draft.fullName?.trim() || undefined,
       role: draft.role,
       departments: isManager ? (allDepts ? [] : draft.departments) : [],
       locations: isManager ? (allLocs ? [] : draft.locations) : [],
@@ -3419,6 +3422,9 @@ function UserPermissionForm(props: {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-end gap-3">
+        <DrawerField label="Name" htmlFor="user-full-name" className="min-w-[12rem] flex-1">
+          <Input id="user-full-name" aria-label="Name" value={draft.fullName ?? ""} onChange={(e) => setDraft({ ...draft, fullName: e.target.value })} placeholder="First and last name" />
+        </DrawerField>
         <DrawerField label="Email" htmlFor="user-email" className="min-w-[14rem] flex-1">
           <Input id="user-email" aria-label="Email" type="email" value={draft.email} onChange={(e) => setDraft({ ...draft, email: e.target.value })} placeholder="name@pressedfloral.com" />
         </DrawerField>
@@ -3467,7 +3473,7 @@ function UserPermissionForm(props: {
               <SelectContent>
                 <SelectItem value="__none__">No supervisor</SelectItem>
                 {(props.allUsers || []).filter((u) => u.id !== draft.id && (u.role === "manager" || u.role === "admin")).map((u) => (
-                  <SelectItem key={u.id} value={u.id}>{u.linkedEmployeeName || u.email}</SelectItem>
+                  <SelectItem key={u.id} value={u.id}>{u.fullName || u.linkedEmployeeName || u.email}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -3559,6 +3565,7 @@ function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email:
   if (!user) {
     return {
       email: "",
+      fullName: "",
       role: "" as ProfileRole,
       departments: [],
       locations: [],
@@ -3576,6 +3583,7 @@ function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email:
   return {
     id: user.id,
     email: user.email,
+    fullName: user.fullName || "",
     role: user.role,
     // Expand "all access" (empty array) to every option selected so the multi-select shows it.
     departments: isManager ? (allDepts ? [...departments] : user.departments) : [],

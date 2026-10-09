@@ -130,6 +130,7 @@ export function profileFromRow(email: string, row: Record<string, any>): Manager
   return {
     id: String(row.id),
     email,
+    fullName: typeof row.full_name === "string" && row.full_name.trim() ? row.full_name.trim() : undefined,
     role,
     departments: Array.isArray(row.departments) ? row.departments : [],
     locations: Array.isArray(row.locations) ? row.locations : [],

@@ -41,15 +41,14 @@ export async function GET(request: NextRequest) {
   if (ownSupervisorId) {
     const { data: supervisorProfile } = await client
       .from("manager_profiles")
-      .select("id, email, linked_employee_name")
+      .select("id, email, full_name, linked_employee_name")
       .eq("id", ownSupervisorId)
       .maybeSingle();
     if (supervisorProfile) {
       reviewer = {
         id: String(supervisorProfile.id),
-        name: typeof supervisorProfile.linked_employee_name === "string" && supervisorProfile.linked_employee_name.trim()
-          ? supervisorProfile.linked_employee_name.trim()
-          : null,
+        name: [supervisorProfile.full_name, supervisorProfile.linked_employee_name]
+          .find((n): n is string => typeof n === "string" && !!n.trim())?.trim() ?? null,
         email: supervisorProfile.email,
       };
     }
