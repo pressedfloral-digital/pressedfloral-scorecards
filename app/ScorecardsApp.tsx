@@ -5247,9 +5247,8 @@ function ScorecardsScreen(props: {
               onChange={(v) => setProgressStatusFilter(v as ScorecardCompletionStatus[])}
             />
           )}
-          <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
-          {/* The checkboxes wrap as one group, so none ends up alone on its own line. */}
-          <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-3 gap-y-2">
+          {/* The checkboxes sit together on their own line, left-aligned under the filters. */}
+          <div className="flex min-w-0 basis-full flex-wrap items-center gap-x-3 gap-y-2 px-0.5">
             <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Hides scorecards that are Approved or Submitted with no reviewer — i.e. already finalized">
               <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
               Hide completed
