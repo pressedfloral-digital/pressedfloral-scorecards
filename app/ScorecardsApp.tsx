@@ -14,7 +14,7 @@ import {
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
 import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
-import { getReportingTree, profileNode } from "../lib/reportingTree";
+import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
@@ -4987,10 +4987,19 @@ function ScorecardsScreen(props: {
   // Latest employees scoped to profile — used for multi-month mode filters
   const multiMonthTeam = scopedEmployeesForProfile(latestEmployees, props.profile, props.allEmployees);
 
+  // Who someone reports to for a period. Quarterly views list the team from the quarter's first
+  // month, but use the latest upload in the quarter for reporting lines, so a manager change
+  // during the quarter (e.g. Lauren Cox moving to Braden in September) counts for that quarter.
+  function reportingRowFor(name: string, isoMonth: string): Employee | undefined {
+    if (globalPeriodType !== "quarterly" || !/^\d{4}-\d{2}$/.test(isoMonth)) return undefined;
+    return latestRowInQuarter(props.rippling, name, quarterToIsoMonth(quarterKeyForMonth(isoMonth)));
+  }
+
   // "Direct reports only" is offered to anyone whose team spans more than one level.
-  const isDirectReport = (e: Employee) => isDirectReportOf(e, props.profile?.id, currentUserNames);
+  const isDirectReport = (e: Employee, isoMonth: string = selectedMonth) =>
+    isDirectReportOf(reportingRowFor(e.name, isoMonth) ?? e, props.profile?.id, currentUserNames);
   const visibleTeam = singleMonthMode ? teamEmployees : multiMonthTeam;
-  const hasMultipleLevels = visibleTeam.some(isDirectReport) && visibleTeam.some((e) => !isDirectReport(e) && e.name !== props.profile?.linkedEmployeeName);
+  const hasMultipleLevels = visibleTeam.some((e) => isDirectReport(e)) && visibleTeam.some((e) => !isDirectReport(e) && e.name !== props.profile?.linkedEmployeeName);
   const directOnly = directReportsOnly && hasMultipleLevels;
 
   // Filter options from team employees (single) or latest scoped team (multi/all)
@@ -5347,7 +5356,7 @@ function ScorecardsScreen(props: {
                     currentUserProfileId={props.currentUserProfileId}
                     reviewChainIds={props.reviewChainIds}
                     reviewerName={props.reviewerName}
-                    currentUserNames={currentUserNames}
+                    isDirectReport={isDirectReport(emp)}
                     autoOpen={!!props.focusEmployeeKey && props.focusEmployeeKey === (emp.id || emp.name)}
                     autoOpenNonce={props.focusNonce}
                   />
@@ -5402,7 +5411,7 @@ function ScorecardsScreen(props: {
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
                   if (hideIneligible && isBelowMinHours({ hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked })) return false;
-                  if (directOnly && !isDirectReport(e)) return false;
+                  if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
                     if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -5463,7 +5472,7 @@ function ScorecardsScreen(props: {
                         currentUserProfileId={props.currentUserProfileId}
                         reviewChainIds={props.reviewChainIds}
                         reviewerName={props.reviewerName}
-                    currentUserNames={currentUserNames}
+                    isDirectReport={isDirectReport(emp, m)}
                       />
                     );
                   })}
@@ -5653,7 +5662,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, currentUserNames, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, isDirectReport, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5691,7 +5700,7 @@ function LiveScorecardCard({
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
   reviewerName?: string;
-  currentUserNames?: string[];
+  isDirectReport?: boolean; // whether the viewer is this team member's direct manager for the period
   autoOpen?: boolean;
   autoOpenNonce?: number;
 }) {
@@ -6347,7 +6356,7 @@ function LiveScorecardCard({
               onClick={() => {
                 // An indirect manager can submit on the direct manager's behalf, but confirms first —
                 // the scorecard routes to the submitter's own manager, not the direct manager's.
-                if (employee.manager && !isDirectReportOf(employee, currentUserProfileId, currentUserNames || [])) {
+                if (employee.manager && isDirectReport === false) {
                   const routing = reviewerName ? `It will be sent to ${reviewerName} for approval.` : "It will be sent to your manager for approval.";
                   if (!window.confirm(`You are submitting the scorecard on behalf of ${employee.manager}. ${routing} Do you wish to proceed?`)) return;
                 }
