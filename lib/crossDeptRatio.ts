@@ -86,6 +86,21 @@ export function deptSplitKey(metric: "hours" | "orders", dept: string, employeeN
   return [DEPT_SPLIT_TIER, "", dept, deptSplitGoalName(metric, employeeName)].join("|");
 }
 
+// A production team member's total Ops Dashboard hours for a business month — every department
+// they clocked into, G&A included — stored as a pseudo-department next to the per-department rows.
+// Ops Dashboard counts a Mon–Sun week in the month its Monday falls in, so this differs from
+// Rippling's calendar-month payroll hours; see scorecardHours in lib/scorecardCompletion.ts.
+export const OPS_TOTAL_DEPT = "All";
+
+export function opsHoursKey(employeeName: string) {
+  return deptSplitKey("hours", OPS_TOTAL_DEPT, employeeName);
+}
+
+export function readOpsHours(actuals: ActualsByKey | undefined, employeeName: string): number | undefined {
+  const hours = actuals?.[opsHoursKey(employeeName)];
+  return hours == null ? undefined : hours;
+}
+
 const RATIO_RE = /ratio/i;
 const DEPT_MENTION_RE = /\b(Design|Preservation|Fulfillment|Resin)\b/i;
 

@@ -19,7 +19,7 @@ import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/report
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
-import { computeScorecardCompletion, isFinalizedForHistory, personalActualKey, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
@@ -30,6 +30,7 @@ import {
   applyCrossDeptSplit,
   parseRatioTierTargets,
   readDeptHours,
+  readOpsHours,
   SPLIT_NOTE,
   splitSummary,
   type RatioTierTargets
@@ -263,14 +264,10 @@ function metaKey(type: "target" | "min", goal: Pick<Goal, "goalTier" | "location
   return `__${type}__${actualKey(goal)}`;
 }
 
-// Employees who worked fewer than this many hours in the period don't need a scorecard —
-// they're excluded from "not submitted" counts/todos and shown as "Not Eligible" rather than
-// flagged as outstanding work. Their scorecard card is locked (can't be opened or edited).
-const MIN_HOURS_FOR_SCORECARD = 40;
-
-function isBelowMinHours(employee: Pick<Employee, "hoursWorked">): boolean {
-  return employee.hoursWorked != null && employee.hoursWorked < MIN_HOURS_FOR_SCORECARD;
-}
+// Employees who worked fewer than MIN_HOURS_FOR_SCORECARD hours in the period don't need a
+// scorecard — they're excluded from "not submitted" counts/todos and shown as "Not Eligible"
+// rather than flagged as outstanding work. Their scorecard card is locked (can't be opened or
+// edited). Production team members' hours come from Ops Dashboard (see scorecardHours).
 
 // Company-wide ratio targets by department × seniority (admin-editable in Users & Settings),
 // used for the cross-department Individual Ratio split — see lib/crossDeptRatio.ts.
@@ -1377,17 +1374,19 @@ export default function ScorecardsApp() {
 
   const missingScorecards = useMemo(() => {
     const employees = appData.rippling[workMonth] || [];
+    const monthActuals = appData.actuals[formatMonthLabel(workMonth)];
     return employees.filter((employee) =>
-      (employee.hoursWorked ?? MIN_HOURS_FOR_SCORECARD) >= MIN_HOURS_FOR_SCORECARD &&
+      !isBelowMinHours(scorecardHours(employee, monthActuals)) &&
       !appData.scorecards.some((sc) => sc.employeeName === employee.name && sc.scorecardMonth === formatMonthLabel(workMonth))
     );
-  }, [appData.rippling, appData.scorecards, workMonth]);
+  }, [appData.rippling, appData.scorecards, appData.actuals, workMonth]);
 
   const missingCurrentTargets = useMemo(() => {
     const today = new Date();
     const currentMonthVal = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
     const currentLabel = formatMonthLabel(currentMonthVal);
-    const currentActuals = { ...(appData.actuals[currentLabel] || {}), ...(appData.actuals[quarterKeyForMonth(currentMonthVal)] || {}) };
+    const monthActuals = appData.actuals[currentLabel] || {};
+    const quarterActuals = appData.actuals[quarterKeyForMonth(currentMonthVal)] || {};
     const isAdmin = roleAtLeast(effectiveProfile, "admin");
     const canSeeCompany = isAdmin || resolveCompanyGoalAccess(effectiveProfile);
     return appData.goals.filter((g) =>
@@ -1395,7 +1394,7 @@ export default function ScorecardsApp() {
       (canSeeCompany ? true : g.goalTier !== "company") &&
       (g.goalTier === "company" || g.goalTier === "department") &&
       scopedForProfile([g], effectiveProfile).length > 0 &&
-      currentActuals[metaKey("target", g)] == null
+      (g.periodType === "quarterly" ? quarterActuals : monthActuals)[metaKey("target", g)] == null
     );
   }, [appData.goals, appData.actuals, appData.rippling, effectiveProfile, adminUsers, companyGoalGrantedNames, hasCompanyGoalAccess]);
 
@@ -1404,7 +1403,8 @@ export default function ScorecardsApp() {
     const next = new Date(today.getFullYear(), today.getMonth() + 1, 1);
     const nextVal = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
     const nextLabel = formatMonthLabel(nextVal);
-    const nextActuals = { ...(appData.actuals[nextLabel] || {}), ...(appData.actuals[quarterKeyForMonth(nextVal)] || {}) };
+    const monthActuals = appData.actuals[nextLabel] || {};
+    const quarterActuals = appData.actuals[quarterKeyForMonth(nextVal)] || {};
     const isAdmin = roleAtLeast(effectiveProfile, "admin");
     const canSeeCompany = isAdmin || resolveCompanyGoalAccess(effectiveProfile);
     return appData.goals.filter((g) =>
@@ -1412,7 +1412,7 @@ export default function ScorecardsApp() {
       (canSeeCompany ? true : g.goalTier !== "company") &&
       (g.goalTier === "company" || g.goalTier === "department") &&
       scopedForProfile([g], effectiveProfile).length > 0 &&
-      nextActuals[metaKey("target", g)] == null
+      (g.periodType === "quarterly" ? quarterActuals : monthActuals)[metaKey("target", g)] == null
     );
   }, [appData.goals, appData.actuals, appData.rippling, effectiveProfile, adminUsers, companyGoalGrantedNames, hasCompanyGoalAccess]);
 
@@ -1448,7 +1448,8 @@ export default function ScorecardsApp() {
     const scopedEmployees = scopedEmployeesForProfile(appData.rippling[workMonth] || [], effectiveProfile, allRipplingEmployees);
     // Employees who worked under the minimum hours don't need a scorecard — exclude them from
     // the expected/missing counts so a part-time month doesn't look like an outstanding task.
-    const eligibleScopedEmployees = scopedEmployees.filter((emp) => (emp.hoursWorked ?? MIN_HOURS_FOR_SCORECARD) >= MIN_HOURS_FOR_SCORECARD);
+    const workMonthActuals = appData.actuals[workMonthLabel];
+    const eligibleScopedEmployees = scopedEmployees.filter((emp) => !isBelowMinHours(scorecardHours(emp, workMonthActuals)));
     const expected = eligibleScopedEmployees.length;
     const submittedCount = submittedThisMonth.length;
     const totalBonus = submittedThisMonth.reduce((sum, sc) => sum + (sc.bonusAmount || 0), 0);
@@ -1495,7 +1496,7 @@ export default function ScorecardsApp() {
       actions,
       myLatest, myPrev, myRecent,
     };
-  }, [appData.scorecards, appData.rippling, workMonth, effectiveProfile, allRipplingEmployees, missingActuals, missingCurrentTargets, myOwnScorecards]);
+  }, [appData.scorecards, appData.rippling, appData.actuals, workMonth, effectiveProfile, allRipplingEmployees, missingActuals, missingCurrentTargets, myOwnScorecards]);
 
   async function saveGoal(goal: Goal): Promise<Goal | null> {
     let savedGoal = goal;
@@ -1765,6 +1766,10 @@ export default function ScorecardsApp() {
     }
     if (submittedMismatches.length > 0) {
       parts.push(`${submittedMismatches.length} submitted scorecard value${submittedMismatches.length === 1 ? "" : "s"} no longer match${submittedMismatches.length === 1 ? "es" : ""}.`);
+    }
+    if (typeof body.actualsDeferredUntil === "string") {
+      const readyOn = new Date(body.actualsDeferredUntil).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      parts.push(`${period} actuals aren't synced yet — its last week isn't finished. They'll sync automatically from ${readyOn}.`);
     }
     showToast(parts.join(" "));
 
@@ -2355,18 +2360,22 @@ export default function ScorecardsApp() {
                 mountScreen("scorecard");
               }}
               onSaveTarget={saveMonthTarget}
+              // Quarterly goals live under the quarter ("Q4 2026"), not the month — the Goals
+              // table and scorecards only read quarterly values from there.
               onSaveCurrentTargetPair={(goal, target, min) => {
                 const today = new Date();
-                const period = formatMonthLabel(`${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`);
+                const iso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+                const period = goal.periodType === "quarterly" ? quarterKeyForMonth(iso) : formatMonthLabel(iso);
                 return saveMonthTargetPair(goal, period, target, min);
               }}
               onSaveTargetPair={(goal, target, min) => {
                 const today = new Date();
                 const next = new Date(today.getFullYear(), today.getMonth() + 1, 1);
-                const period = formatMonthLabel(`${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`);
+                const iso = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
+                const period = goal.periodType === "quarterly" ? quarterKeyForMonth(iso) : formatMonthLabel(iso);
                 return saveMonthTargetPair(goal, period, target, min);
               }}
-              onSaveActual={(goal, value) => saveActual(goal, value, formatMonthLabel(workMonth))}
+              onSaveActual={(goal, value) => saveActual(goal, value, goal.periodType === "quarterly" ? quarterKeyForMonth(workMonth) : formatMonthLabel(workMonth))}
               onRipplingUpload={(employees) => saveRipplingForMonth(workMonth, employees)}
             />
           )}
@@ -3921,7 +3930,6 @@ function GoalsScreen(props: {
     props.onSaveTargetPair(goal, target, min, period);
   };
 
-  const mergedActuals = { ...props.actuals, ...quarterActuals };
 
   function locLabel(loc?: string) {
     if (!loc) return "—";
@@ -4384,7 +4392,8 @@ function GoalsScreen(props: {
             <GoalEditor
               key={props.editingGoal.id}
               goal={props.editingGoal}
-              actuals={mergedActuals}
+              actuals={props.editingGoal.periodType === "quarterly" ? quarterActuals : props.actuals}
+              periodLabel={props.editingGoal.periodType === "quarterly" ? quarterKey : formatMonthLabel(props.month)}
               isAdmin={props.isAdmin}
               companyGoalAccess={props.companyGoalAccess}
               allowedDepartments={props.allowedDepartments}
@@ -4626,12 +4635,16 @@ function DrawerField({ label, required, htmlFor, className, children }: {
   );
 }
 
-function GoalEditor({ goal, actuals, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, teamEmployees, onSave, onSaveTargetPair, onCancel }: { goal: Goal; actuals: ActualsByKey; isAdmin?: boolean; companyGoalAccess?: boolean; allowedDepartments?: string[]; allowedLocations?: string[]; teamEmployees?: Employee[]; onSave: (goal: Goal) => Goal | null | void | Promise<Goal | null | void>; onSaveTargetPair: (goal: Goal, target: string, min: string) => void | Promise<void>; onCancel: () => void }) {
+function GoalEditor({ goal, actuals, periodLabel, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, teamEmployees, onSave, onSaveTargetPair, onCancel }: { goal: Goal; actuals: ActualsByKey; periodLabel?: string; isAdmin?: boolean; companyGoalAccess?: boolean; allowedDepartments?: string[]; allowedLocations?: string[]; teamEmployees?: Employee[]; onSave: (goal: Goal) => Goal | null | void | Promise<Goal | null | void>; onSaveTargetPair: (goal: Goal, target: string, min: string) => void | Promise<void>; onCancel: () => void }) {
   const canManageCompany = isAdmin || companyGoalAccess;
   const isNew = goal.name === "";
   const [draft, setDraft] = useState(goal);
-  const [target, setTarget] = useState(actuals[metaKey("target", goal)] != null ? String(actuals[metaKey("target", goal)]) : String(goal.goalValue || ""));
-  const [min, setMin] = useState(actuals[metaKey("min", goal)] != null ? String(actuals[metaKey("min", goal)]) : String(goal.minValue || ""));
+  // Only prefill with this period's own values. Prefilling with the bank default (goalValue/minValue,
+  // often last quarter's numbers) made an unset period look set, and saving the drawer for any other
+  // edit silently wrote those stale numbers into the period.
+  const periodHasTargets = actuals[metaKey("target", goal)] != null || actuals[metaKey("min", goal)] != null;
+  const [target, setTarget] = useState(actuals[metaKey("target", goal)] != null ? String(actuals[metaKey("target", goal)]) : "");
+  const [min, setMin] = useState(actuals[metaKey("min", goal)] != null ? String(actuals[metaKey("min", goal)]) : "");
   const [weightVal, setWeightVal] = useState(goal.weight != null ? String(goal.weight) : "");
 
   // Required fields that must be explicitly chosen — blank ("" or "__unset__") on new goals
@@ -4809,12 +4822,17 @@ function GoalEditor({ goal, actuals, isAdmin, companyGoalAccess, allowedDepartme
 
           <div className="grid grid-cols-2 gap-3">
             <DrawerField label="Goal" htmlFor="goal-target">
-              <Input id="goal-target" type="number" value={target} onChange={(e) => setTarget(e.target.value)} />
+              <Input id="goal-target" type="number" value={target} placeholder={goal.goalValue ? String(goal.goalValue) : undefined} onChange={(e) => setTarget(e.target.value)} />
             </DrawerField>
             <DrawerField label="Minimum" htmlFor="goal-min">
-              <Input id="goal-min" type="number" value={min} onChange={(e) => setMin(e.target.value)} />
+              <Input id="goal-min" type="number" value={min} placeholder={goal.minValue ? String(goal.minValue) : undefined} onChange={(e) => setMin(e.target.value)} />
             </DrawerField>
           </div>
+          {!isNew && !periodHasTargets && periodLabel && (
+            <p className="-mt-2 text-[12px] text-muted-foreground">
+              No goal set for {periodLabel} yet.{goal.goalValue ? " Grey numbers are the bank defaults, shown for reference only." : ""}
+            </p>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <DrawerField label="Lower is better" required>
@@ -5074,7 +5092,7 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
-    if (hideIneligible && isBelowMinHours(withActualEarnings(e))) return false;
+    if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
     if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
@@ -5438,7 +5456,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
-                  if (hideIneligible && isBelowMinHours({ hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked })) return false;
+                  if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[mLabel]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
@@ -5931,9 +5949,12 @@ function LiveScorecardCard({
   const returnedScorecard = !lastSubmitted && submittedScorecard?.reviewStatus === "returned" ? submittedScorecard : null;
   // Under the minimum-hours threshold: the card stays visible with a "Not Eligible" badge but
   // is locked — it can't be expanded, so goals/actuals/weights can't be edited or submitted.
-  const ineligible = isBelowMinHours(employee);
+  const monthHours = scorecardHours(employee, periodActuals);
+  const ineligible = isBelowMinHours(monthHours);
 
   const activeEmployee = cardPeriodType === "quarterly" ? quarterlyEmployee : employee;
+  const cardHoursFromOps = cardPeriodType === "monthly" && readOpsHours(periodActuals, employee.name) != null;
+  const cardHours = cardPeriodType === "quarterly" ? quarterlyEmployee.hoursWorked : monthHours;
   const activeMonth = cardPeriodType === "quarterly" ? quarterKey : month;
 
   const currentGoals: EditableGoal[] = (() => {
@@ -6061,8 +6082,8 @@ function LiveScorecardCard({
           </>
         ) : null}
         {ineligible ? (
-          <Badge variant="secondary" title={`Worked ${employee.hoursWorked!.toFixed(2)} hrs this period — below the ${MIN_HOURS_FOR_SCORECARD}-hour minimum, so this scorecard is locked`} className="shrink-0 font-medium text-muted-foreground">
-            Ineligible due to hours ({employee.hoursWorked!.toFixed(1)} hrs)
+          <Badge variant="secondary" title={`Worked ${monthHours!.toFixed(2)} hrs this period — below the ${MIN_HOURS_FOR_SCORECARD}-hour minimum, so this scorecard is locked`} className="shrink-0 font-medium text-muted-foreground">
+            Ineligible due to hours ({monthHours!.toFixed(1)} hrs)
           </Badge>
         ) : returnedScorecard ? (
           <Badge variant="secondary" className="shrink-0 font-medium" style={{ background: "#FEE2E2", color: "#991B1B", borderColor: "#FECACA" }}>Returned</Badge>
@@ -6086,10 +6107,10 @@ function LiveScorecardCard({
               <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{cardPeriodType === "quarterly" ? `Quarterly earnings · ${quarterKey}` : "Base earnings"}</div>
               <div className="text-[13px] font-semibold tabular-nums">{formatCurrency(liveScorecard.baseEarnings)}</div>
             </div>
-            {activeEmployee.hoursWorked ? (
-              <div>
-                <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Hours worked{cardPeriodType === "quarterly" ? " (qtr)" : ""}</div>
-                <div className="text-[13px] font-semibold tabular-nums">{activeEmployee.hoursWorked.toFixed(2)}</div>
+            {cardHours ? (
+              <div title={cardHoursFromOps ? "Ops Dashboard hours for weeks starting this month — used for the minimum-hours check. Earnings still come from Rippling payroll." : undefined}>
+                <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Hours worked{cardPeriodType === "quarterly" ? " (qtr)" : cardHoursFromOps ? " (Ops Dashboard)" : ""}</div>
+                <div className="text-[13px] font-semibold tabular-nums">{cardHours.toFixed(2)}</div>
               </div>
             ) : null}
             <div onClick={(e) => e.stopPropagation()}>
@@ -7716,16 +7737,30 @@ function TodosScreen({
   const [draftCurrentTargets, setDraftCurrentTargets] = useState<Record<string, { target: string; min: string }>>({});
   const [draftActuals, setDraftActuals] = useState<Record<string, string>>({});
 
+  // Merge quarterly-period actuals so quarterly goals stored under "Q2 2025" are found when checking "June 2025".
+  // Quarterly goals' keys are dropped from the month bucket first, so a stray value saved under the
+  // month can't make a quarterly goal look "set" here while the Goals table (which reads only the
+  // quarter) shows it blank.
+  const quarterOnlyKeys = useMemo(() => {
+    const keysFor = (g: Goal) => [actualKey(g), metaKey("target", g), metaKey("min", g)];
+    const monthlyKeys = new Set(allGoals.filter((g) => g.periodType !== "quarterly").flatMap(keysFor));
+    return allGoals.filter((g) => g.periodType === "quarterly").flatMap(keysFor).filter((k) => !monthlyKeys.has(k));
+  }, [allGoals]);
+  function periodActualsFor(isoMonth: string): ActualsByKey {
+    const month = { ...(allActuals[formatMonthLabel(isoMonth)] || {}) };
+    for (const k of quarterOnlyKeys) delete month[k];
+    return { ...month, ...(allActuals[quarterKeyForMonth(isoMonth)] || {}) };
+  }
+
   const workMonthLabel = formatMonthLabel(workMonth);
-  // Merge quarterly-period actuals so quarterly goals stored under "Q2 2025" are found when checking "June 2025"
-  const workActuals = { ...(allActuals[workMonthLabel] || {}), ...(allActuals[quarterKeyForMonth(workMonth)] || {}) };
+  const workActuals = periodActualsFor(workMonth);
 
   const currentMonthValue = useMemo(() => {
     const today = new Date();
     return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
   }, []);
   const currentMonthLabel = useMemo(() => formatMonthLabel(currentMonthValue), [currentMonthValue]);
-  const currentActuals = { ...(allActuals[currentMonthLabel] || {}), ...(allActuals[quarterKeyForMonth(currentMonthValue)] || {}) };
+  const currentActuals = periodActualsFor(currentMonthValue);
 
   const nextMonthValue = useMemo(() => {
     const today = new Date();
@@ -7733,7 +7768,7 @@ function TodosScreen({
     return `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
   }, []);
   const nextMonthLabel = useMemo(() => formatMonthLabel(nextMonthValue), [nextMonthValue]);
-  const nextActuals = { ...(allActuals[nextMonthLabel] || {}), ...(allActuals[quarterKeyForMonth(nextMonthValue)] || {}) };
+  const nextActuals = periodActualsFor(nextMonthValue);
 
   const isAdmin = roleAtLeast(profile, "admin");
   const canSeeCompany = isAdmin || companyGoalAccess;

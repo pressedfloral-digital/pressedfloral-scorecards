@@ -19,8 +19,8 @@
 // and aren't part of this request.
 
 import { actualKey, personalActualKey } from "./scorecardCompletion";
-import { formatMonthLabel, currentMonthValue, nextMonthValue } from "./periods";
-import { DEPT_SPLIT_TIER, PRODUCTION_DEPTS, deptSplitGoalName } from "./crossDeptRatio";
+import { formatMonthLabel, currentBusinessMonth, nextMonthValue } from "./periods";
+import { DEPT_SPLIT_TIER, OPS_TOTAL_DEPT, PRODUCTION_DEPTS, deptSplitGoalName } from "./crossDeptRatio";
 import type { Goal } from "./types";
 
 // ── Minimal shapes of pf-dashboard's API responses (can't import cross-repo) ───
@@ -393,13 +393,18 @@ export async function computePfDashboardSync(params: {
   // locations, so a home Individual Ratio can be split by where the person actually worked
   // (see lib/crossDeptRatio.ts). All four departments are written — including zeros — for
   // anyone with any production time, so a corrected-away department doesn't leave a stale row.
+  // The same people also get an OPS_TOTAL_DEPT row: their hours across every department.
   const norm = (s: string) => s.trim().toLowerCase();
   const rosterByNorm = new Map(roster.map((e) => [norm(e.name), e.name]));
   const splitTotals = new Map<string, Record<string, { hours: number; orders: number }>>();
+  // Total hours in every department (G&A included), which scorecard eligibility uses for
+  // production team members in place of Rippling's calendar-month payroll hours.
+  const totalHours = new Map<string, number>();
   for (const m of [...memberRatiosByLoc.Utah, ...memberRatiosByLoc.Georgia]) {
-    if (!(PRODUCTION_DEPTS as readonly string[]).includes(m.department)) continue;
     const employeeName = rosterByNorm.get(norm(m.name));
     if (!employeeName) continue;
+    totalHours.set(employeeName, (totalHours.get(employeeName) ?? 0) + (m.hours || 0));
+    if (!(PRODUCTION_DEPTS as readonly string[]).includes(m.department)) continue;
     const byDept = splitTotals.get(employeeName) ?? {};
     const cur = byDept[m.department] ?? { hours: 0, orders: 0 };
     byDept[m.department] = { hours: cur.hours + (m.hours || 0), orders: cur.orders + (m.orders || 0) };
@@ -415,6 +420,10 @@ export async function computePfDashboardSync(params: {
         });
       }
     }
+    writes.push({
+      goalId: "", period, goalTier: DEPT_SPLIT_TIER, location: "", department: OPS_TOTAL_DEPT,
+      goalName: deptSplitGoalName("hours", employeeName), value: totalHours.get(employeeName) ?? 0,
+    });
   }
 
   // ── Goal/Min sync — this month and next month's forward-looking targets ──
@@ -429,7 +438,7 @@ export async function computePfDashboardSync(params: {
   // `targetMonth` the Actuals half above is backfilling.
   const RATIO_GOAL_MIN_NAME = "Combined Ratio Attainment";
   const estimated: { current?: PfEstimatedMonthResult; next?: PfEstimatedMonthResult } = kpisData.estimated ?? {};
-  const thisMonth = currentMonthValue();
+  const thisMonth = currentBusinessMonth();
   const monthBuckets: { period: string; goalVariant?: PfRatioVariant; expectedVariant?: PfRatioVariant }[] = [
     { period: thisMonth, goalVariant: estimated.current?.goal, expectedVariant: estimated.current?.expected },
     { period: nextMonthValue(thisMonth), goalVariant: estimated.next?.goal, expectedVariant: estimated.next?.expected },
