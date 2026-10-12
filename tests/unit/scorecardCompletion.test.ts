@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { computeScorecardCompletion, isFinalizedForHistory } from "../../lib/scorecardCompletion";
+import { computeScorecardCompletion, isFinalizedForHistory, scorecardHours } from "../../lib/scorecardCompletion";
+import { opsHoursKey } from "../../lib/crossDeptRatio";
 import type { Employee, EmployeeScorecardSettings, Goal, Scorecard } from "../../lib/types";
 
 const employee: Employee = {
@@ -100,6 +101,15 @@ describe("computeScorecardCompletion", () => {
     expect(result.status).toBe("no_scorecard_required");
   });
 
+  it("uses Ops Dashboard hours over Rippling's for production team members", () => {
+    const opsUnder = computeScorecardCompletion({ ...baseInput, actuals: { [opsHoursKey(employee.name)]: 32 } });
+    expect(opsUnder.status).toBe("no_scorecard_required");
+
+    const partTime = { ...employee, hoursWorked: 30 };
+    const opsOver = computeScorecardCompletion({ ...baseInput, employee: partTime, actuals: { [opsHoursKey(employee.name)]: 48 } });
+    expect(opsOver.status).not.toBe("no_scorecard_required");
+  });
+
   it("excludes a goal via employee settings even though it's in the base set", () => {
     const settings: EmployeeScorecardSettings = {
       id: "settings-1",
@@ -141,6 +151,14 @@ describe("computeScorecardCompletion", () => {
     });
     expect(quarterlyResult.goalCount).toBe(1);
     expect(quarterlyResult.totalWeight).toBe(60);
+  });
+});
+
+describe("scorecardHours", () => {
+  it("falls back to Rippling hours when Ops Dashboard has none", () => {
+    expect(scorecardHours(employee, {})).toBe(160);
+    expect(scorecardHours(employee, undefined)).toBe(160);
+    expect(scorecardHours(employee, { [opsHoursKey(employee.name)]: 0 })).toBe(0);
   });
 });
 
