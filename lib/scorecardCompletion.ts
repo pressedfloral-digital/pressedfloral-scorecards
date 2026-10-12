@@ -1,3 +1,4 @@
+import { readOpsHours } from "./crossDeptRatio";
 import type { ActualsByKey, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, Scorecard } from "./types";
 
 export type ScorecardCompletionStatus =
@@ -17,8 +18,20 @@ export interface ScorecardCompletion {
 }
 
 // Employees who worked fewer than this many hours in the period don't need a scorecard.
-// Mirrors MIN_HOURS_FOR_SCORECARD in app/ScorecardsApp.tsx.
-const MIN_HOURS_FOR_SCORECARD = 40;
+export const MIN_HOURS_FOR_SCORECARD = 40;
+
+// Hours a month's scorecard counts for an employee. Production team members (anyone Ops Dashboard
+// tracks) use Ops Dashboard's hours for the business month — weeks bucketed by their Monday — so
+// eligibility matches their KPIs; everyone else uses the Rippling upload's hours. Pay is unaffected:
+// earnings always come from Rippling. `monthActuals` is that month's actuals map.
+export function scorecardHours(employee: Pick<Employee, "name" | "hoursWorked">, monthActuals: ActualsByKey | undefined): number | undefined {
+  return readOpsHours(monthActuals, employee.name) ?? employee.hoursWorked;
+}
+
+// Unknown hours (no upload, no Ops Dashboard row) never lock a scorecard.
+export function isBelowMinHours(hours: number | undefined): boolean {
+  return hours != null && hours < MIN_HOURS_FOR_SCORECARD;
+}
 
 function goalActiveForMonth(goal: Pick<Goal, "startMonth" | "endMonth">, month: string): boolean {
   if (goal.startMonth && goal.startMonth > month) return false;
@@ -114,7 +127,7 @@ export function computeScorecardCompletion(input: {
 }): ScorecardCompletion {
   const { employee, isoMonth, periodType, allGoals, goalAssignments, actuals, employeeScorecardSettings, submittedScorecard } = input;
 
-  if ((employee.hoursWorked ?? MIN_HOURS_FOR_SCORECARD) < MIN_HOURS_FOR_SCORECARD) {
+  if (isBelowMinHours(scorecardHours(employee, actuals))) {
     return { status: "no_scorecard_required", goalCount: 0, totalWeight: 0, hasUnsetWeights: false };
   }
 
