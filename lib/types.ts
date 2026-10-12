@@ -67,6 +67,9 @@ export type Employee = {
   // Set by lockMonthStartProfiles when Rippling's upload for this month changed these fields
   // mid-month: the uploaded values, held back until the following month.
   monthStartHeld?: Partial<Pick<Employee, "role" | "department" | "location">>;
+  // Entered by hand (manual_employees) for a period they aren't in the Rippling upload for.
+  // Pay and hours cover the whole scorecard period, so cards use them as-is.
+  manual?: boolean;
 };
 
 // Manual department/manager correction that survives Rippling uploads. Applies to every
@@ -172,6 +175,8 @@ export type AppData = {
   goalAssignments: GoalAssignment[];
   employeeScorecardSettings: EmployeeScorecardSettings[];
   employeeOverrides?: EmployeeOverride[];
+  // Manually entered team members by period (ISO month; a quarter's first month for quarterly).
+  manualEmployees?: Record<string, Employee[]>;
 };
 
 export type HistoryFilters = {

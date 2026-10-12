@@ -50,6 +50,8 @@ import {
   configuredProfileFromRow,
   dataMode,
   employeeFromRow,
+  manualEmployeeFromRow,
+  manualEmployeeToRow,
   employeeToRow,
   employeeScorecardSettingsFromRow,
   goalAssignmentFromRow,
@@ -62,7 +64,7 @@ import {
   scorecardToRow,
   supabaseClient
 } from "../lib/supabase";
-import type { ActualsByKey, AppData, Employee, EmployeeOverride, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard, ScorecardGoal } from "../lib/types";
+import type { ActualsByKey, AppData, Employee, EmployeeOverride, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, PayType, ProfileRole, Scorecard, ScorecardGoal } from "../lib/types";
 import { AppShell, type NavGroup } from "@/components/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -881,15 +883,21 @@ export default function ScorecardsApp() {
       return;
     }
 
-    const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult, overridesResult] = await Promise.all([
+    const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult, overridesResult, manualResult] = await Promise.all([
       client.from("goals_bank").select("*").order("goal_tier").order("department").order("name"),
       client.from("scorecards").select("*").order("scorecard_month", { ascending: false }).order("employee_name"),
       client.from("rippling_employees").select("*").order("period", { ascending: false }),
       fetchAllRows(client, "actuals"),
       client.from("goal_assignments").select("*").order("created_at", { ascending: false }),
       client.from("employee_scorecard_settings").select("*"),
-      client.from("employee_overrides").select("*")
+      client.from("employee_overrides").select("*"),
+      client.from("manual_employees").select("*")
     ]);
+    // Empty (not an error) until the manual_employees migration has run.
+    const manualEmployees: Record<string, Employee[]> = {};
+    for (const row of manualResult.error ? [] : manualResult.data || []) {
+      manualEmployees[row.period] = [...(manualEmployees[row.period] || []), manualEmployeeFromRow(row)];
+    }
     // Empty (not an error) until the employee_overrides migration has run.
     const employeeOverrides = overridesResult.error ? [] : (overridesResult.data || []).map(employeeOverrideFromRow);
 
@@ -936,7 +944,7 @@ export default function ScorecardsApp() {
     const scorecards = (scorecardsResult.data || []).map(scorecardFromRow);
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
-    setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides }));
+    setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides, manualEmployees }));
     setMyGoals(rawGoals);
   }
 
@@ -1256,7 +1264,7 @@ export default function ScorecardsApp() {
     });
   }, [appData.goals, appData.actuals, appData.rippling, bankFilters, bankMonth, effectiveProfile]);
 
-  const allRipplingEmployees = useMemo(() => { const employees = Object.values(appData.rippling).flat(); if (Object.keys(titleOverrideMap).length === 0) return employees; return employees.map((emp) => titleOverrideMap[emp.name] ? { ...emp, role: titleOverrideMap[emp.name] } : emp); }, [appData.rippling, titleOverrideMap]);
+  const allRipplingEmployees = useMemo(() => { const employees = [...Object.values(appData.rippling).flat(), ...Object.values(appData.manualEmployees || {}).flat()]; if (Object.keys(titleOverrideMap).length === 0) return employees; return employees.map((emp) => titleOverrideMap[emp.name] ? { ...emp, role: titleOverrideMap[emp.name] } : emp); }, [appData.rippling, appData.manualEmployees, titleOverrideMap]);
 
   // Employee names in the effective profile's own reporting tree (via Employee.manager) — lets a
   // manager reopen/resubmit a scorecard for anyone under them, the same admin-only escape hatch
@@ -1340,10 +1348,20 @@ export default function ScorecardsApp() {
 
   // Current team members are the people in the latest Rippling upload; everyone else with
   // history (e.g. former team members backfilled from Drive) is "former". No uploads → all current.
+  // Someone entered manually (not in Rippling yet) is current unless Rippling has them later.
   const currentTeamNames = useMemo(() => {
     const latest = Object.keys(appData.rippling).filter((p) => appData.rippling[p]?.length).sort().pop();
-    return latest ? new Set(appData.rippling[latest].map((e) => e.name)) : null;
-  }, [appData.rippling]);
+    if (!latest) return null;
+    const names = new Set(appData.rippling[latest].map((e) => e.name));
+    const lastUpload = new Map<string, string>();
+    for (const [period, rows] of Object.entries(appData.rippling)) {
+      for (const e of rows) if ((lastUpload.get(e.name) || "") < period) lastUpload.set(e.name, period);
+    }
+    for (const [period, rows] of Object.entries(appData.manualEmployees || {})) {
+      for (const e of rows) if ((lastUpload.get(e.name) || "") < period) names.add(e.name);
+    }
+    return names;
+  }, [appData.rippling, appData.manualEmployees]);
 
   // Pending and returned scorecards stay out of Historical Data until approved. Scorecards
   // under an older name of a current team member (e.g. someone who left and came back) are
@@ -1997,6 +2015,20 @@ export default function ScorecardsApp() {
 
   // Manual department/manager correction for one employee, from isoMonth onward. Survives
   // uploads: rows stay as Rippling sent them and the override is re-applied on top.
+  async function saveManualEmployee(isoMonth: string, employee: Employee): Promise<boolean> {
+    if (!isFixture && sb) {
+      const result = await sb.from("manual_employees").upsert(manualEmployeeToRow(isoMonth, employee, currentUserEmail), { onConflict: "period,full_name" });
+      if (result.error) { showSupabaseError(result.error, "Details could not be saved."); return false; }
+    }
+    const saved: Employee = { ...employee, id: `manual:${employee.name}`, manual: true };
+    setAppData((current) => {
+      const manualEmployees = { ...(current.manualEmployees || {}) };
+      manualEmployees[isoMonth] = [...(manualEmployees[isoMonth] || []).filter((e) => e.name !== employee.name), saved];
+      return { ...current, manualEmployees };
+    });
+    return true;
+  }
+
   async function saveEmployeeOverride(employeeName: string, isoMonth: string, patch: { department?: string; managerId?: string }) {
     const existing = (appData.employeeOverrides || []).find((o) => o.employeeName === employeeName);
     const manager = patch.managerId ? adminUsers.find((u) => u.id === patch.managerId) : undefined;
@@ -2146,32 +2178,50 @@ export default function ScorecardsApp() {
   const isAdmin = role === "admin";
   const isManager = role === "manager" || isAdmin;
   // Users page "Build Scorecard": whether a user's linked employee still needs a scorecard for
-  // the current work period, and if Team Scorecards can't show their card, why not.
-  function buildScorecardFor(user: AdminManagedUser): { periodLabel: string; employee?: Employee; periodType: "monthly" | "quarterly"; blocked?: string } | null {
+  // the current work period. Someone not in that period's Rippling upload can still get one —
+  // the admin enters their details by hand (needsDetails), saved as a manual employee.
+  function buildScorecardFor(user: AdminManagedUser): BuildScorecardTarget | null {
     const name = user.linkedEmployeeName;
-    const periodType = name && employeePeriodTypes[name] === "quarterly" ? "quarterly" : "monthly";
-    const isoMonth = periodType === "quarterly" ? quarterToIsoMonth(quarterKeyForMonth(workMonth)) : workMonth;
-    const periodLabel = periodType === "quarterly" ? quarterKeyForMonth(workMonth) : formatMonthLabel(workMonth);
     // Accounts not linked to an employee (e.g. admins) aren't team members, so nothing to build.
     if (!name) return null;
+    const periodType = employeePeriodTypes[name] === "quarterly" ? "quarterly" : "monthly";
+    const isoMonth = periodType === "quarterly" ? quarterToIsoMonth(quarterKeyForMonth(workMonth)) : workMonth;
+    const periodLabel = periodType === "quarterly" ? quarterKeyForMonth(workMonth) : formatMonthLabel(workMonth);
     if (appData.scorecards.some((sc) => sc.employeeName === name && sc.scorecardMonth === periodLabel)) return null;
-    // Team Scorecards lists the period's own upload, falling back to the latest one.
+    const base = { name, periodLabel, periodType, isoMonth } as const;
+    // Team Scorecards lists the period's own upload (falling back to the latest one) plus
+    // anyone entered manually for the period.
     const upload = scorecardRippling[isoMonth]?.length ? scorecardRippling[isoMonth] : latestRipplingEmployees;
     const employee = upload.find((e) => e.name === name);
-    if (!employee) return { periodLabel, periodType, blocked: `not in ${formatMonthLabel(isoMonth)} Rippling` };
-    if (isDeactivatedForMonth(appData.actuals, name, isoMonth)) return { periodLabel, periodType, employee, blocked: `deactivated for ${periodLabel}` };
-    const actuals = { ...(appData.actuals[formatMonthLabel(isoMonth)] || {}), ...(appData.actuals[quarterKeyForMonth(isoMonth)] || {}) };
-    const goals = employeeGoalsForPeriod(employee, appData.goals.filter((g) => g.active), appData.goalAssignments, actuals, isoMonth);
+    if (!employee) {
+      // Prefill from their manual details, else their most recent Rippling row or scorecard.
+      const manual = (appData.manualEmployees?.[isoMonth] || []).find((e) => e.name === name);
+      const lastRow = latestRipplingEmployees.find((e) => e.name === name);
+      const lastScorecard = [...appData.scorecards].filter((sc) => sc.employeeName === name).sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""))[0];
+      const prefill: Employee = manual ?? (lastRow
+        ? { ...lastRow, grossEarnings: undefined, hoursWorked: undefined }
+        : { id: `manual:${name}`, name, role: lastScorecard?.role || "", department: lastScorecard?.department || "", location: lastScorecard?.location || "", manager: lastScorecard?.manager, payType: lastScorecard?.payType || "hourly", hourlyRate: lastScorecard?.hourlyRate, annualPay: lastScorecard?.annualPay });
+      return { ...base, needsDetails: true, employee: prefill, hasManualDetails: !!manual };
+    }
+    if (isDeactivatedForMonth(appData.actuals, name, isoMonth)) return { ...base, employee, blocked: `deactivated for ${periodLabel}` };
+    const goals = goalsForBuild(employee, isoMonth);
     const hasGoals = periodType === "quarterly" || goals.some((g) => g.periodType !== "quarterly") || !!employee.uploaded;
-    if (!hasGoals) return { periodLabel, periodType, employee, blocked: "no goals for their role" };
-    return { periodLabel, periodType, employee };
+    if (!hasGoals) return { ...base, employee, blocked: "no goals for their role" };
+    return { ...base, employee };
   }
-  function openBuildScorecard(user: AdminManagedUser) {
-    const target = buildScorecardFor(user);
-    if (!target?.employee || target.blocked) return;
-    setScorecardMonths([target.periodType === "quarterly" ? quarterToIsoMonth(quarterKeyForMonth(workMonth)) : workMonth]);
-    setScorecardFocus({ employeeKey: target.employee.id || target.employee.name, periodType: target.periodType, nonce: Date.now() });
+  function goalsForBuild(employee: Employee, isoMonth: string): Goal[] {
+    const actuals = { ...(appData.actuals[formatMonthLabel(isoMonth)] || {}), ...(appData.actuals[quarterKeyForMonth(isoMonth)] || {}) };
+    return employeeGoalsForPeriod(employee, appData.goals.filter((g) => g.active), appData.goalAssignments, actuals, isoMonth);
+  }
+  function openBuildScorecard(target: BuildScorecardTarget, employee: Employee) {
+    setScorecardMonths([target.isoMonth]);
+    setScorecardFocus({ employeeKey: employee.id || employee.name, periodType: target.periodType, nonce: Date.now() });
     mountScreen("scorecard");
+  }
+  async function saveManualAndBuild(target: BuildScorecardTarget, employee: Employee): Promise<boolean> {
+    if (!(await saveManualEmployee(target.isoMonth, employee))) return false;
+    openBuildScorecard(target, { ...employee, id: `manual:${employee.name}` });
+    return true;
   }
 
   const hasLinkedEmployee = !!effectiveProfile?.linkedEmployeeName;
@@ -2316,6 +2366,7 @@ export default function ScorecardsApp() {
                 onSaveTargetPair={(goal, period, target, min) => saveMonthTargetPair(goal, period, target, min)}
                 onSaveProrate={saveProrateDay}
                 employeeOverrides={appData.employeeOverrides}
+                manualEmployees={appData.manualEmployees}
                 managerOptions={adminUsers
                   .filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin"))
                   .map((u) => ({ id: u.id, label: u.fullName || u.linkedEmployeeName || u.email }))
@@ -2392,7 +2443,9 @@ export default function ScorecardsApp() {
               onReactivate={reactivateAdminUser}
               onDelete={deleteAdminUser}
               buildScorecardFor={buildScorecardFor}
+              goalsForBuild={goalsForBuild}
               onBuildScorecard={openBuildScorecard}
+              onSaveManualAndBuild={saveManualAndBuild}
               onViewAs={(user) => {
                 setViewAsProfile({ id: user.id, email: user.email, role: user.role, departments: user.departments, locations: user.locations, linkedEmployeeName: user.linkedEmployeeName, supervisorId: user.supervisorId, scorecardPeriodType: user.scorecardPeriodType, companyGoalsGrant: user.companyGoalsGrant });
                 setMode("landing");
@@ -3176,6 +3229,146 @@ function DashboardScreen({ data, profile, onMode }: {
   );
 }
 
+// Details for building a scorecard without Rippling data. Pay and hours cover the whole
+// scorecard period; gross earnings, when entered, is used as the bonus base as-is.
+function ManualEmployeeForm(props: {
+  target: BuildScorecardTarget;
+  users: AdminManagedUser[];
+  roleOptions: string[];
+  goalsFor: (employee: Employee) => Goal[];
+  onCancel: () => void;
+  onSubmit: (employee: Employee) => Promise<void>;
+}) {
+  const initial = props.target.employee;
+  const [draft, setDraft] = useState({
+    role: initial.role || "",
+    department: initial.department || "",
+    location: initial.location || "",
+    managerId: initial.assignedManagerId || props.users.find((u) => u.linkedEmployeeName && u.linkedEmployeeName === initial.manager)?.id || "",
+    payType: initial.payType || "hourly",
+    hourlyRate: initial.hourlyRate != null ? String(initial.hourlyRate) : "",
+    annualPay: initial.annualPay != null ? String(initial.annualPay) : "",
+    hoursWorked: initial.hoursWorked != null ? String(initial.hoursWorked) : "",
+    grossEarnings: initial.grossEarnings != null ? String(initial.grossEarnings) : "",
+  });
+  const [saving, setSaving] = useState(false);
+  const isQuarterly = props.target.periodType === "quarterly";
+  const managers = props.users.filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin") && u.linkedEmployeeName !== props.target.name);
+  const num = (v: string) => (v.trim() === "" || isNaN(Number(v)) ? undefined : Number(v));
+  const manager = managers.find((u) => u.id === draft.managerId);
+  const employee: Employee = {
+    id: `manual:${props.target.name}`,
+    name: props.target.name,
+    role: draft.role.trim(),
+    department: draft.department,
+    location: draft.location,
+    manager: manager ? manager.linkedEmployeeName || manager.email : undefined,
+    assignedManagerId: manager?.id,
+    payType: draft.payType as PayType,
+    hourlyRate: draft.payType === "hourly" ? num(draft.hourlyRate) : undefined,
+    annualPay: draft.payType === "salary" ? num(draft.annualPay) : undefined,
+    hoursWorked: num(draft.hoursWorked),
+    grossEarnings: num(draft.grossEarnings),
+    manual: true,
+  };
+  const missing = [
+    !employee.role && "role",
+    !employee.department && "department",
+    !employee.location && "location",
+    employee.hoursWorked == null && "hours worked",
+    employee.grossEarnings == null && (draft.payType === "hourly" ? employee.hourlyRate == null : employee.annualPay == null) && (draft.payType === "hourly" ? "hourly rate or gross earnings" : "annual pay or gross earnings"),
+  ].filter(Boolean) as string[];
+  const goalCount = employee.role && employee.department ? props.goalsFor(employee).length : null;
+  const set = (patch: Partial<typeof draft>) => setDraft((d) => ({ ...d, ...patch }));
+
+  return (
+    <div className="flex flex-col gap-3">
+      <DrawerField label="Role" htmlFor="manual-role">
+        <Input id="manual-role" list="manual-role-options" value={draft.role} onChange={(e) => set({ role: e.target.value })} placeholder="e.g. Design Specialist" />
+        <datalist id="manual-role-options">{props.roleOptions.map((r) => <option key={r} value={r} />)}</datalist>
+      </DrawerField>
+      <div className="flex flex-wrap gap-3">
+        <DrawerField label="Department" className="min-w-[10rem] flex-1">
+          <Select value={draft.department || undefined} onValueChange={(v) => set({ department: v })}>
+            <SelectTrigger className="w-full" aria-label="Department"><SelectValue placeholder="Select…" /></SelectTrigger>
+            <SelectContent>{departments.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
+          </Select>
+        </DrawerField>
+        <DrawerField label="Location" className="min-w-[8rem] flex-1">
+          <Select value={draft.location || undefined} onValueChange={(v) => set({ location: v })}>
+            <SelectTrigger className="w-full" aria-label="Location"><SelectValue placeholder="Select…" /></SelectTrigger>
+            <SelectContent>{["Utah", "Georgia", "Remote"].map((l) => <SelectItem key={l} value={l}>{l}</SelectItem>)}</SelectContent>
+          </Select>
+        </DrawerField>
+      </div>
+      <DrawerField label="Manager">
+        <Select value={draft.managerId || "__none__"} onValueChange={(v) => set({ managerId: v === "__none__" ? "" : v })}>
+          <SelectTrigger className="w-full" aria-label="Manager"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">No manager</SelectItem>
+            {managers.map((u) => <SelectItem key={u.id} value={u.id}>{u.fullName || u.linkedEmployeeName || u.email}</SelectItem>)}
+          </SelectContent>
+        </Select>
+      </DrawerField>
+      <div className="flex flex-wrap gap-3">
+        <DrawerField label="Pay type" className="w-[8rem]">
+          <Select value={draft.payType} onValueChange={(v) => set({ payType: v as PayType })}>
+            <SelectTrigger className="w-full" aria-label="Pay type"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="hourly">Hourly</SelectItem>
+              <SelectItem value="salary">Salary</SelectItem>
+            </SelectContent>
+          </Select>
+        </DrawerField>
+        {draft.payType === "hourly" ? (
+          <DrawerField label="Hourly rate ($)" htmlFor="manual-rate" className="min-w-[8rem] flex-1">
+            <Input id="manual-rate" inputMode="decimal" value={draft.hourlyRate} onChange={(e) => set({ hourlyRate: e.target.value })} placeholder="0.00" />
+          </DrawerField>
+        ) : (
+          <DrawerField label="Annual pay ($)" htmlFor="manual-annual" className="min-w-[8rem] flex-1">
+            <Input id="manual-annual" inputMode="decimal" value={draft.annualPay} onChange={(e) => set({ annualPay: e.target.value })} placeholder="0" />
+          </DrawerField>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-3">
+        <DrawerField label={`Hours worked (${isQuarterly ? "quarter" : "month"})`} htmlFor="manual-hours" className="min-w-[8rem] flex-1">
+          <Input id="manual-hours" inputMode="decimal" value={draft.hoursWorked} onChange={(e) => set({ hoursWorked: e.target.value })} placeholder="0" />
+        </DrawerField>
+        <DrawerField label={`Gross earnings (${isQuarterly ? "quarter" : "month"}, $)`} htmlFor="manual-gross" className="min-w-[8rem] flex-1">
+          <Input id="manual-gross" inputMode="decimal" value={draft.grossEarnings} onChange={(e) => set({ grossEarnings: e.target.value })} placeholder="Optional" />
+        </DrawerField>
+      </div>
+      <p className="text-[12px] text-muted-foreground">
+        Gross earnings is the bonus base when entered. Otherwise it&apos;s {draft.payType === "hourly" ? "hourly rate × hours" : `annual pay ÷ ${isQuarterly ? 4 : 12}`}.
+      </p>
+      {goalCount === 0 && (
+        <p className="rounded-md border border-[#FDE68A] bg-[#FEF3C7] px-3 py-2 text-[12px] text-[#92400E]">
+          No goals are set up for {employee.role} in {employee.department}{employee.location ? ` (${employee.location})` : ""} yet. The scorecard will be empty until you add goals.
+        </p>
+      )}
+      {missing.length > 0 && <p className="text-[12px] text-muted-foreground">Still needed: {missing.join(", ")}.</p>}
+      <div className="mt-1 flex justify-end gap-2">
+        <Button variant="outline" size="sm" onClick={props.onCancel}>Cancel</Button>
+        <Button size="sm" disabled={missing.length > 0 || saving} onClick={async () => { setSaving(true); await props.onSubmit(employee); setSaving(false); }}>
+          {saving ? "Saving…" : "Save & open scorecard"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+type BuildScorecardTarget = {
+  name: string;
+  periodLabel: string;
+  periodType: "monthly" | "quarterly";
+  isoMonth: string;
+  employee: Employee;
+  // Not in the period's Rippling upload: details are entered by hand (prefilled in employee).
+  needsDetails?: boolean;
+  hasManualDetails?: boolean;
+  blocked?: string;
+};
+
 function UsersScreen(props: {
   users: AdminManagedUser[];
   loading: boolean;
@@ -3195,10 +3388,13 @@ function UsersScreen(props: {
   onReactivate: (user: AdminManagedUser) => void;
   onDelete: (user: AdminManagedUser) => void;
   onViewAs: (user: AdminManagedUser) => void;
-  buildScorecardFor: (user: AdminManagedUser) => { periodLabel: string; blocked?: string } | null;
-  onBuildScorecard: (user: AdminManagedUser) => void;
+  buildScorecardFor: (user: AdminManagedUser) => BuildScorecardTarget | null;
+  goalsForBuild: (employee: Employee, isoMonth: string) => Goal[];
+  onBuildScorecard: (target: BuildScorecardTarget, employee: Employee) => void;
+  onSaveManualAndBuild: (target: BuildScorecardTarget, employee: Employee) => Promise<boolean>;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [manualTarget, setManualTarget] = useState<BuildScorecardTarget | null>(null);
   const [resendingId, setResendingId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<AdminManagedUser | null>(null);
   const sortedUsers = [...props.users].sort((a, b) => a.email.localeCompare(b.email));
@@ -3304,11 +3500,19 @@ function UsersScreen(props: {
                           // Only offered while they have no scorecard for the current period.
                           const build = props.buildScorecardFor(user);
                           if (!build) return null;
+                          const detail = build.blocked
+                            ? `Can't — ${build.blocked}`
+                            : build.needsDetails
+                            ? `${build.periodLabel} · ${build.hasManualDetails ? "manual details" : "not in Rippling — enter details"}`
+                            : build.periodLabel;
                           return (
-                            <DropdownMenuItem disabled={!!build.blocked} onSelect={() => props.onBuildScorecard(user)}>
+                            <DropdownMenuItem
+                              disabled={!!build.blocked}
+                              onSelect={() => (build.needsDetails ? setManualTarget(build) : props.onBuildScorecard(build, build.employee))}
+                            >
                               <span className="flex flex-col">
                                 <span>Build Scorecard</span>
-                                <span className="text-[11px] text-muted-foreground">{build.blocked ? `Can't — ${build.blocked}` : build.periodLabel}</span>
+                                <span className="text-[11px] text-muted-foreground">{detail}</span>
                               </span>
                             </DropdownMenuItem>
                           );
@@ -3369,6 +3573,42 @@ function UsersScreen(props: {
                   const saved = await props.onUpdate(payload);
                   if (saved) setEditingId(null);
                   return saved;
+                }}
+              />
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      {/* Build Scorecard for someone not in Rippling: enter their details by hand */}
+      <Sheet open={!!manualTarget} onOpenChange={(o) => { if (!o) setManualTarget(null); }}>
+        <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-md">
+          <SheetHeader>
+            <div className="flex items-start justify-between gap-3">
+              <div className="grid gap-1">
+                <SheetTitle>Build scorecard — {manualTarget?.name}</SheetTitle>
+                <SheetDescription>
+                  {manualTarget?.name} isn&apos;t in the Rippling upload for {manualTarget?.periodLabel}, so enter their details for {manualTarget?.periodType === "quarterly" ? "the quarter" : "the month"}. A later Rippling upload that includes them takes over.
+                </SheetDescription>
+              </div>
+              <SheetClose className="-mr-1 -mt-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50">
+                <X className="size-4" />
+                <span className="sr-only">Close</span>
+              </SheetClose>
+            </div>
+          </SheetHeader>
+          <div className="flex-1 overflow-y-auto p-5">
+            {manualTarget && (
+              <ManualEmployeeForm
+                key={`${manualTarget.name}-${manualTarget.isoMonth}`}
+                target={manualTarget}
+                users={props.users}
+                roleOptions={Array.from(new Set(props.employees.map((e) => e.role).filter(Boolean))).sort()}
+                goalsFor={(employee) => props.goalsForBuild(employee, manualTarget.isoMonth)}
+                onCancel={() => setManualTarget(null)}
+                onSubmit={async (employee) => {
+                  const saved = await props.onSaveManualAndBuild(manualTarget, employee);
+                  if (saved) setManualTarget(null);
                 }}
               />
             )}
@@ -5002,6 +5242,7 @@ function ScorecardsScreen(props: {
   onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
   // Admin-only manual department/manager corrections (see saveEmployeeOverride).
   employeeOverrides?: EmployeeOverride[];
+  manualEmployees?: Record<string, Employee[]>;
   managerOptions?: { id: string; label: string }[];
   onSaveEmployeeOverride?: (employeeName: string, isoMonth: string, patch: { department?: string; managerId?: string }) => void;
   onClearEmployeeOverride?: (employeeName: string) => void;
@@ -5076,10 +5317,16 @@ function ScorecardsScreen(props: {
     return result;
   }, [props.rippling]);
 
+  // People entered by hand for a period join that period's list; a Rippling row for them wins.
+  function withManualEmployees(isoMonth: string, employees: Employee[]): Employee[] {
+    const manual = (props.manualEmployees?.[isoMonth] || []).filter((m) => !employees.some((e) => e.name === m.name));
+    return manual.length ? [...employees, ...manual] : employees;
+  }
+
   // Use selected month's data if available, otherwise fall back to latest employees
   const monthRaw = singleMonthMode ? (props.rippling[selectedMonth] || []) : [];
   // The fallback rows come from an earlier upload, so apply overrides as of the month shown.
-  const monthEmployees = monthRaw.length > 0 ? monthRaw : (singleMonthMode ? applyEmployeeOverrides(selectedMonth, latestEmployees, props.employeeOverrides) : []);
+  const monthEmployees = withManualEmployees(selectedMonth, monthRaw.length > 0 ? monthRaw : (singleMonthMode ? applyEmployeeOverrides(selectedMonth, latestEmployees, props.employeeOverrides) : []));
   const teamEmployees = scopedEmployeesForProfile(monthEmployees, props.profile, props.allEmployees);
 
   // Earnings (hours + gross pay) come from the upload tagged to the same month being scored.
@@ -5088,6 +5335,8 @@ function ScorecardsScreen(props: {
   const payrollAvailable = earningsUpload.length > 0;
   function overrideControlsFor(employeeName: string, isoMonth: string) {
     if (!props.isAdmin || !props.onSaveEmployeeOverride) return undefined;
+    // Manually entered people are edited from Build Scorecard on the Users page, not as Rippling corrections.
+    if ((props.manualEmployees?.[isoMonth] || []).some((e) => e.name === employeeName) && !(props.rippling[isoMonth] || []).some((e) => e.name === employeeName)) return undefined;
     return {
       managerOptions: props.managerOptions || [],
       override: props.employeeOverrides?.find((o) => o.employeeName === employeeName),
@@ -5096,6 +5345,7 @@ function ScorecardsScreen(props: {
     };
   }
   function withActualEarnings(emp: Employee): Employee {
+    if (emp.manual) return emp; // pay and hours were entered for the period
     const src = earningsUpload.find((e) => e.name === emp.name);
     // Always override — if no upload for this month, earnings become undefined
     // so buildScorecard's payrollAvailable=false gate can enforce zero.
@@ -5144,7 +5394,7 @@ function ScorecardsScreen(props: {
     const forcedPeriod = props.employeePeriodTypes?.[e.name];
     if (forcedPeriod) return forcedPeriod === globalPeriodType;
     if (globalPeriodType === "quarterly") return false;
-    return goals.some((g) => g.periodType !== "quarterly") || !!e.uploaded;
+    return goals.some((g) => g.periodType !== "quarterly") || !!e.uploaded || !!e.manual;
   }
 
   const sortedTeam = [...teamEmployees].sort((a, b) => a.name.localeCompare(b.name));
@@ -5434,7 +5684,7 @@ function ScorecardsScreen(props: {
                     employee={withActualEarnings(emp)}
                     isoMonth={selectedMonth}
                     month={periodLabel}
-                    payrollAvailable={payrollAvailable}
+                    payrollAvailable={payrollAvailable || !!emp.manual}
                     baseGoals={goalsForEmployee(emp)}
                     allGoals={props.allGoals}
                     periodActuals={periodActuals}
@@ -5513,14 +5763,14 @@ function ScorecardsScreen(props: {
                 ...(props.allActuals[mLabel] || {}),
                 ...(props.allActuals[quarterKeyForMonth(m)] || {}),
               };
-              const mRaw = (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : applyEmployeeOverrides(m, latestEmployees, props.employeeOverrides);
+              const mRaw = withManualEmployees(m, (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : applyEmployeeOverrides(m, latestEmployees, props.employeeOverrides));
               const mTeam = scopedEmployeesForProfile(mRaw, props.profile, props.allEmployees);
               const mFiltered = mTeam
                 .filter((e) => {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
-                  if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
+                  if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
@@ -5542,7 +5792,7 @@ function ScorecardsScreen(props: {
                     const src = mEarningsUpload.find((e) => e.name === emp.name);
                     // Always override earnings — if no upload for this month, strip them to undefined
                     // so baseEarnings() can't fall back to annualPay/12 estimates.
-                    const empWithEarnings = { ...emp, grossEarnings: src?.grossEarnings, hoursWorked: src?.hoursWorked };
+                    const empWithEarnings = emp.manual ? emp : { ...emp, grossEarnings: src?.grossEarnings, hoursWorked: src?.hoursWorked };
                     const submitted = props.scorecards.find((sc) => sc.employeeName === emp.name && sc.scorecardMonth === mLabel);
                     return (
                       <LiveScorecardCard
@@ -5550,7 +5800,7 @@ function ScorecardsScreen(props: {
                         employee={empWithEarnings}
                         isoMonth={m}
                         month={mLabel}
-                        payrollAvailable={mPayrollAvailable}
+                        payrollAvailable={mPayrollAvailable || !!emp.manual}
                         baseGoals={goalsForEmployee(emp, mActuals, m)}
                         allGoals={props.allGoals}
                         periodActuals={mActuals}
@@ -5959,6 +6209,7 @@ function LiveScorecardCard({
   // (hourly → salaried) blend correctly; the blended total rides in grossEarnings so
   // baseEarnings uses it verbatim for the quarter.
   const [quarterlyEmployee, quarterlyPayrollAvailable, quarterlyEstimatedMonths, quarterlyMissingMonths] = useMemo((): [Employee, boolean, string[], string[]] => {
+    if (employee.manual) return [employee, true, [], []]; // entered for the whole quarter
     const [y, m] = isoMonth.split("-").map(Number);
     if (!y || !m) return [employee, false, [], []];
     const q = Math.ceil(m / 3);

@@ -125,6 +125,29 @@ export function employeeToRow(period: string, employee: Employee) {
   };
 }
 
+export function manualEmployeeFromRow(row: Record<string, any>): Employee {
+  return { ...employeeFromRow(row), id: `manual:${row.full_name}`, manual: true };
+}
+
+export function manualEmployeeToRow(period: string, employee: Employee, createdBy: string) {
+  return {
+    period,
+    full_name: employee.name,
+    role: employee.role || "",
+    department: employee.department || "",
+    location: employee.location || "",
+    manager: employee.manager || null,
+    assigned_manager_id: employee.assignedManagerId || null,
+    pay_type: employee.payType,
+    hourly_rate: employee.hourlyRate ?? null,
+    annual_pay: employee.annualPay ?? null,
+    hours_worked: employee.hoursWorked ?? null,
+    gross_earnings: employee.grossEarnings ?? null,
+    created_by: createdBy,
+    updated_at: new Date().toISOString()
+  };
+}
+
 export function profileFromRow(email: string, row: Record<string, any>): ManagerProfile {
   const role = parseProfileRole(row.role) ?? "user";
   return {
