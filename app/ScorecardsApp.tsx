@@ -360,6 +360,38 @@ function scopedScorecardsForProfile(scorecards: import("../lib/types").Scorecard
   });
 }
 
+// The goals on someone's scorecard for a period: their role/department goals active that month,
+// plus company goals individually assigned to them. Shared by Team Scorecards and the Users page.
+function employeeGoalsForPeriod(employee: Employee, allGoals: Goal[], goalAssignments: GoalAssignment[], actuals: Record<string, number | null>, month: string): Goal[] {
+  const regularGoals = allGoals.filter((goal) => {
+    if (actuals["__monthly_inactive__" + actualKey(goal)]) return false;
+    if (month && !goalActiveForMonth(goal, month)) return false;
+    if (goal.goalTier === "company") return false;
+    if (goal.goalTier === "department") return goal.department === employee.department && (!goal.location || goal.location === employee.location);
+    return goal.role === employee.role && goal.department === employee.department && (!goal.location || goal.location === employee.location);
+  });
+
+  // Company goals individually assigned to this employee that are active for this month.
+  // A goal can have more than one assignment row covering the same month (e.g. a
+  // re-assignment that duplicated an existing one) — dedupe by goal id so it only
+  // shows up once regardless of how many assignment rows reference it.
+  const assignedCompanyGoalIds = new Set<string>();
+  const assignedCompanyGoals = goalAssignments
+    .filter((a) =>
+      a.employeeName === employee.name &&
+      goalActiveForMonth({ startMonth: a.startMonth, endMonth: a.endMonth } as Goal, month)
+    )
+    .map((a) => allGoals.find((g) => g.id === a.goalId))
+    .filter((g): g is Goal => !!g && g.goalTier === "company" && goalActiveForMonth(g, month))
+    .filter((g) => (assignedCompanyGoalIds.has(g.id) ? false : (assignedCompanyGoalIds.add(g.id), true)));
+
+  // Deduplicate — avoid adding a goal already present via regular matching (unlikely for company goals but safe)
+  const alreadyIncluded = new Set(regularGoals.map((g) => g.id));
+  const extraGoals = assignedCompanyGoals.filter((g) => !alreadyIncluded.has(g.id));
+
+  return [...regularGoals, ...extraGoals];
+}
+
 function scopedEmployeesForProfile(employees: Employee[], profile: ManagerProfile | null, allEmployees: Employee[] = []) {
   if (!profile || profile.role === "admin") return employees;
   if (profile.role === "user") return [];
@@ -2113,6 +2145,35 @@ export default function ScorecardsApp() {
   const role = effectiveProfile?.role ?? "user";
   const isAdmin = role === "admin";
   const isManager = role === "manager" || isAdmin;
+  // Users page "Build Scorecard": whether a user's linked employee still needs a scorecard for
+  // the current work period, and if Team Scorecards can't show their card, why not.
+  function buildScorecardFor(user: AdminManagedUser): { periodLabel: string; employee?: Employee; periodType: "monthly" | "quarterly"; blocked?: string } | null {
+    const name = user.linkedEmployeeName;
+    const periodType = name && employeePeriodTypes[name] === "quarterly" ? "quarterly" : "monthly";
+    const isoMonth = periodType === "quarterly" ? quarterToIsoMonth(quarterKeyForMonth(workMonth)) : workMonth;
+    const periodLabel = periodType === "quarterly" ? quarterKeyForMonth(workMonth) : formatMonthLabel(workMonth);
+    // Accounts not linked to an employee (e.g. admins) aren't team members, so nothing to build.
+    if (!name) return null;
+    if (appData.scorecards.some((sc) => sc.employeeName === name && sc.scorecardMonth === periodLabel)) return null;
+    // Team Scorecards lists the period's own upload, falling back to the latest one.
+    const upload = scorecardRippling[isoMonth]?.length ? scorecardRippling[isoMonth] : latestRipplingEmployees;
+    const employee = upload.find((e) => e.name === name);
+    if (!employee) return { periodLabel, periodType, blocked: `not in ${formatMonthLabel(isoMonth)} Rippling` };
+    if (isDeactivatedForMonth(appData.actuals, name, isoMonth)) return { periodLabel, periodType, employee, blocked: `deactivated for ${periodLabel}` };
+    const actuals = { ...(appData.actuals[formatMonthLabel(isoMonth)] || {}), ...(appData.actuals[quarterKeyForMonth(isoMonth)] || {}) };
+    const goals = employeeGoalsForPeriod(employee, appData.goals.filter((g) => g.active), appData.goalAssignments, actuals, isoMonth);
+    const hasGoals = periodType === "quarterly" || goals.some((g) => g.periodType !== "quarterly") || !!employee.uploaded;
+    if (!hasGoals) return { periodLabel, periodType, employee, blocked: "no goals for their role" };
+    return { periodLabel, periodType, employee };
+  }
+  function openBuildScorecard(user: AdminManagedUser) {
+    const target = buildScorecardFor(user);
+    if (!target?.employee || target.blocked) return;
+    setScorecardMonths([target.periodType === "quarterly" ? quarterToIsoMonth(quarterKeyForMonth(workMonth)) : workMonth]);
+    setScorecardFocus({ employeeKey: target.employee.id || target.employee.name, periodType: target.periodType, nonce: Date.now() });
+    mountScreen("scorecard");
+  }
+
   const hasLinkedEmployee = !!effectiveProfile?.linkedEmployeeName;
   const navGroups: NavGroup<Screen>[] = [
     {
@@ -2330,6 +2391,8 @@ export default function ScorecardsApp() {
               onDeactivate={deactivateAdminUser}
               onReactivate={reactivateAdminUser}
               onDelete={deleteAdminUser}
+              buildScorecardFor={buildScorecardFor}
+              onBuildScorecard={openBuildScorecard}
               onViewAs={(user) => {
                 setViewAsProfile({ id: user.id, email: user.email, role: user.role, departments: user.departments, locations: user.locations, linkedEmployeeName: user.linkedEmployeeName, supervisorId: user.supervisorId, scorecardPeriodType: user.scorecardPeriodType, companyGoalsGrant: user.companyGoalsGrant });
                 setMode("landing");
@@ -3132,6 +3195,8 @@ function UsersScreen(props: {
   onReactivate: (user: AdminManagedUser) => void;
   onDelete: (user: AdminManagedUser) => void;
   onViewAs: (user: AdminManagedUser) => void;
+  buildScorecardFor: (user: AdminManagedUser) => { periodLabel: string; blocked?: string } | null;
+  onBuildScorecard: (user: AdminManagedUser) => void;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [resendingId, setResendingId] = useState<string | null>(null);
@@ -3235,6 +3300,19 @@ function UsersScreen(props: {
                           {resendingId === user.id ? "Sending…" : "Resend invite"}
                         </DropdownMenuItem>
                         <DropdownMenuItem onSelect={() => setEditingId(user.id)}>Edit user</DropdownMenuItem>
+                        {(() => {
+                          // Only offered while they have no scorecard for the current period.
+                          const build = props.buildScorecardFor(user);
+                          if (!build) return null;
+                          return (
+                            <DropdownMenuItem disabled={!!build.blocked} onSelect={() => props.onBuildScorecard(user)}>
+                              <span className="flex flex-col">
+                                <span>Build Scorecard</span>
+                                <span className="text-[11px] text-muted-foreground">{build.blocked ? `Can't — ${build.blocked}` : build.periodLabel}</span>
+                              </span>
+                            </DropdownMenuItem>
+                          );
+                        })()}
                         <DropdownMenuSeparator />
                         {user.status === "deactivated" ? (
                           <DropdownMenuItem onSelect={() => props.onReactivate(user)}>Reactivate</DropdownMenuItem>
@@ -5057,33 +5135,16 @@ function ScorecardsScreen(props: {
   const showLocationFilter = teamLocations.length > 1;
 
   function goalsForEmployee(employee: Employee, actuals: Record<string, number | null> = periodActuals, month: string = selectedMonth): Goal[] {
-    const regularGoals = props.allGoals.filter((goal) => {
-      if (actuals["__monthly_inactive__" + actualKey(goal)]) return false;
-      if (month && !goalActiveForMonth(goal, month)) return false;
-      if (goal.goalTier === "company") return false;
-      if (goal.goalTier === "department") return goal.department === employee.department && (!goal.location || goal.location === employee.location);
-      return goal.role === employee.role && goal.department === employee.department && (!goal.location || goal.location === employee.location);
-    });
+    return employeeGoalsForPeriod(employee, props.allGoals, props.goalAssignments, actuals, month);
+  }
 
-    // Company goals individually assigned to this employee that are active for this month.
-    // A goal can have more than one assignment row covering the same month (e.g. a
-    // re-assignment that duplicated an existing one) — dedupe by goal id so it only
-    // shows up once regardless of how many assignment rows reference it.
-    const assignedCompanyGoalIds = new Set<string>();
-    const assignedCompanyGoals = props.goalAssignments
-      .filter((a) =>
-        a.employeeName === employee.name &&
-        goalActiveForMonth({ startMonth: a.startMonth, endMonth: a.endMonth } as Goal, month)
-      )
-      .map((a) => props.allGoals.find((g) => g.id === a.goalId))
-      .filter((g): g is Goal => !!g && g.goalTier === "company" && goalActiveForMonth(g, month))
-      .filter((g) => (assignedCompanyGoalIds.has(g.id) ? false : (assignedCompanyGoalIds.add(g.id), true)));
-
-    // Deduplicate — avoid adding a goal already present via regular matching (unlikely for company goals but safe)
-    const alreadyIncluded = new Set(regularGoals.map((g) => g.id));
-    const extraGoals = assignedCompanyGoals.filter((g) => !alreadyIncluded.has(g.id));
-
-    return [...regularGoals, ...extraGoals];
+  // Which tab someone's scorecard lives on: an explicit period type wins; everyone else is
+  // monthly-only. Manually edited employees stay visible even without goals, so the edit can be undone.
+  function onCurrentPeriodTab(e: Employee, goals: Goal[]): boolean {
+    const forcedPeriod = props.employeePeriodTypes?.[e.name];
+    if (forcedPeriod) return forcedPeriod === globalPeriodType;
+    if (globalPeriodType === "quarterly") return false;
+    return goals.some((g) => g.periodType !== "quarterly") || !!e.uploaded;
   }
 
   const sortedTeam = [...teamEmployees].sort((a, b) => a.name.localeCompare(b.name));
@@ -5098,13 +5159,7 @@ function ScorecardsScreen(props: {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
       if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
     }
-    // If this employee has an explicit period type set, only show them on that tab
-    const forcedPeriod = props.employeePeriodTypes?.[e.name];
-    if (forcedPeriod) return forcedPeriod === globalPeriodType;
-    // Employees without an explicit designation are treated as monthly-only
-    if (globalPeriodType === "quarterly") return false;
-    // Manually edited employees stay visible even without goals, so the edit can be undone.
-    return goalsForEmployee(e).some((g) => g.periodType !== "quarterly") || !!e.uploaded;
+    return onCurrentPeriodTab(e, goalsForEmployee(e));
   });
 
   // Employees deactivated for the selected month — shown separately with a Reactivate option
@@ -5153,15 +5208,20 @@ function ScorecardsScreen(props: {
     return result;
   })();
 
-  // Display months for multi-month mode:
-  //   "All months" (0 selected) → only months with rippling data or submitted scorecards (avoid showing 36 empty months)
-  //   Specific months selected → exactly those months, descending
+  // Display periods for multi-period mode (each quarter is its first ISO month, like selectedMonths):
+  //   "All months/quarters" (0 selected) → only periods with rippling data or submitted scorecards (avoid showing 36 empty months)
+  //   Specific periods selected → exactly those, descending
+  const isQuarterly = globalPeriodType === "quarterly";
+  const periodLabelFor = (isoMonth: string) => (isQuarterly ? quarterKeyForMonth(isoMonth) : formatMonthLabel(isoMonth));
   const displayMonths = !singleMonthMode
     ? (props.selectedMonths.length === 0
-        ? props.months.filter((m) =>
-            /^\d{4}-\d{2}$/.test(m) &&
-            ((props.rippling[m]?.length ?? 0) > 0 || props.scorecards.some((sc) => sc.scorecardMonth === formatMonthLabel(m)))
-          )
+        ? Array.from(new Set(props.months
+            .filter((m) =>
+              /^\d{4}-\d{2}$/.test(m) &&
+              ((props.rippling[m]?.length ?? 0) > 0 || props.scorecards.some((sc) => sc.scorecardMonth === periodLabelFor(m)))
+            )
+            .map((m) => (isQuarterly ? quarterToIsoMonth(quarterKeyForMonth(m)) : m))))
+            .sort().reverse()
         : [...props.selectedMonths].sort().reverse()
       )
     : [];
@@ -5434,7 +5494,7 @@ function ScorecardsScreen(props: {
       ) : (
         <section style={{ background: "transparent", border: "none", boxShadow: "none", padding: 0 }}>
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 px-0.5 pb-3 pt-1">
-            <h2 className="text-[13px] font-semibold text-foreground">{displayMonths.length} month{displayMonths.length !== 1 ? "s" : ""}</h2>
+            <h2 className="text-[13px] font-semibold text-foreground">{displayMonths.length} {isQuarterly ? "quarter" : "month"}{displayMonths.length !== 1 ? "s" : ""}</h2>
             <span className="text-[12px] text-muted-foreground">
               {filterEmployees.length === 1
                 ? filterEmployees[0]
@@ -5448,7 +5508,11 @@ function ScorecardsScreen(props: {
             {displayMonths.length === 0 ? (
               <div className="no-goals-msg" style={{ display: "block" }}>No data available. Upload a Rippling CSV to get started.</div>
             ) : displayMonths.map((m) => {
-              const mLabel = formatMonthLabel(m);
+              const mLabel = periodLabelFor(m);
+              const mActuals = {
+                ...(props.allActuals[mLabel] || {}),
+                ...(props.allActuals[quarterKeyForMonth(m)] || {}),
+              };
               const mRaw = (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : applyEmployeeOverrides(m, latestEmployees, props.employeeOverrides);
               const mTeam = scopedEmployeesForProfile(mRaw, props.profile, props.allEmployees);
               const mFiltered = mTeam
@@ -5456,21 +5520,17 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
-                  if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[mLabel]))) return false;
+                  if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
                     if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
                   }
-                  return true;
+                  return onCurrentPeriodTab(e, goalsForEmployee(e, mActuals, m));
                 })
                 .sort((a, b) => a.name.localeCompare(b.name));
               const mEarningsUpload = props.rippling[m] || [];
               const mPayrollAvailable = mEarningsUpload.length > 0;
-              const mActuals = {
-                ...(props.allActuals[mLabel] || {}),
-                ...(props.allActuals[quarterKeyForMonth(m)] || {}),
-              };
               return (
                 <div key={m} className="flex flex-col gap-2.5">
                   <div className="px-0.5 pb-0 pt-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
