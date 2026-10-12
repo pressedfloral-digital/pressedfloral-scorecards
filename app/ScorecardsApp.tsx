@@ -12,7 +12,8 @@ import {
   type AdminUserPayload
 } from "../lib/adminUsers";
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
-import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
+import { fixtureData, fixtureManager, fixtureMonth } from "../lib/fixtures";
+import { buildCanonicalNameMap } from "../lib/employeeIdentity";
 import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
 import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
@@ -352,9 +353,11 @@ function scopedScorecardsForProfile(scorecards: import("../lib/types").Scorecard
   if (profile.linkedEmployeeName) {
     return scorecards.filter((sc) => managed.has(sc.employeeName));
   }
+  // An unlinked manager with no departments isn't set up yet, so scope grants nothing
+  // (only people explicitly assigned to them). Mirrors private.scorecards_can_read_scorecard.
   return scorecards.filter((sc) => {
     if (managed.has(sc.employeeName)) return true;
-    const deptOk = !profile.departments.length || profile.departments.includes(sc.department || "");
+    const deptOk = profile.departments.includes(sc.department || "");
     const locOk = !profile.locations.length || profile.locations.includes(sc.location || "");
     return deptOk && locOk;
   });
@@ -481,7 +484,7 @@ export default function ScorecardsApp() {
   // Rippling uploads always target the previous (completed) month
 
   const [historyFilters, setHistoryFilters] = useState<HistoryFilters>({
-    period: fixturePeriod,
+    period: "",
     search: "",
     location: "",
     department: "",
@@ -1313,17 +1316,25 @@ export default function ScorecardsApp() {
     return latest ? new Set(appData.rippling[latest].map((e) => e.name)) : null;
   }, [appData.rippling]);
 
-  // Pending and returned scorecards stay out of Historical Data until approved.
-  const historyScorecards = useMemo(
-    () => scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)
-      .filter(isFinalizedForHistory)
+  // Pending and returned scorecards stay out of Historical Data until approved. Scorecards
+  // under an older name of a current team member (e.g. someone who left and came back) are
+  // shown under their current name, so their history isn't split into Former.
+  const historyScorecards = useMemo(() => {
+    const scoped = scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees).filter(isFinalizedForHistory);
+    const canonical = currentTeamNames
+      ? buildCanonicalNameMap(scoped.map((sc) => sc.employeeName), currentTeamNames, effectiveProfile?.knownProfiles || [])
+      : new Map<string, string>();
+    return scoped
+      .map((sc) => {
+        const name = canonical.get(sc.employeeName);
+        return name ? { ...sc, employeeName: name } : sc;
+      })
       .filter((sc) => {
         if (historyFilters.teamStatus === "all" || !currentTeamNames) return true;
         return currentTeamNames.has(sc.employeeName) === (historyFilters.teamStatus === "current");
       })
-      .filter((sc) => historyFilters.periodType === "all" || isQuarterLabel(sc.scorecardMonth) === (historyFilters.periodType === "quarterly")),
-    [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, historyFilters.periodType, currentTeamNames]
-  );
+      .filter((sc) => historyFilters.periodType === "all" || isQuarterLabel(sc.scorecardMonth) === (historyFilters.periodType === "quarterly"));
+  }, [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, historyFilters.periodType, currentTeamNames]);
 
   const filteredHistory = useMemo(() => {
     return historyScorecards.filter((scorecard) => {
@@ -6448,8 +6459,8 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
   const [reopening, setReopening] = useState(false);
   const [reopenNote, setReopenNote] = useState("");
   // The assigned reviewer can always act; a manager above them in the chain can step in too
-  // (e.g. the assigned reviewer is OOO), since the DB-level RLS already scopes writes by
-  // department/location and doesn't otherwise enforce the specific reviewer_id.
+  // (e.g. the assigned reviewer is OOO), since the DB-level RLS scopes writes by reporting
+  // tree (or department/location for unlinked managers) and doesn't require the specific reviewer_id.
   const canReview = !!currentUserProfileId && !!scorecard.reviewerId &&
     (scorecard.reviewerId === currentUserProfileId || !!reviewChainIds?.has(scorecard.reviewerId));
   const canReopenThis = canReopen ?? isAdmin;
@@ -6765,17 +6776,42 @@ function HistoryScreen(props: {
     Array.from(new Set(props.allScorecards.map((sc) => sc.department).filter(Boolean))).sort(),
     [props.allScorecards]
   );
-  const allEmployeeNames = useMemo(() =>
-    Array.from(new Set(props.allScorecards.map((sc) => sc.employeeName))).sort(),
+  // Newest first; a quarter sits just above its last month.
+  const periodOptions = useMemo(() =>
+    Array.from(new Set(props.allScorecards.map((sc) => sc.scorecardMonth)))
+      .sort((a, b) => historyPeriodOrder(historyPeriodKey(b)).localeCompare(historyPeriodOrder(historyPeriodKey(a)))),
     [props.allScorecards]
+  );
+  // Only people with a scorecard in the chosen period (Table/Cards) or range (Grid/Chart)
+  // are listed, so nobody without data for that time shows up as an option.
+  const isReportView = props.view === "grid" || props.view === "chart";
+  const allEmployeeNames = useMemo(() =>
+    Array.from(new Set(props.allScorecards
+      .filter((sc) => {
+        if (isReportView) {
+          const order = historyPeriodOrder(historyPeriodKey(sc.scorecardMonth));
+          if (fromMonth && order < historyPeriodOrder(fromMonth)) return false;
+          if (toMonth && order > historyPeriodOrder(toMonth)) return false;
+          return true;
+        }
+        return !props.filters.period || sc.scorecardMonth === props.filters.period;
+      })
+      .map((sc) => sc.employeeName))).sort(),
+    [props.allScorecards, isReportView, fromMonth, toMonth, props.filters.period]
   );
   const allGoalNames = useMemo(() =>
     Array.from(new Set(props.allScorecards.flatMap((sc) => sc.goals.map((g) => g.name)))).sort(),
     [props.allScorecards]
   );
 
-  // Employee selection is shared by every view; empty means all employees.
+  // Employee selection is shared by every view; empty means all employees. Drop anyone
+  // picked earlier who has no scorecard in the period now chosen (unless that's everyone
+  // picked — an empty selection means all employees, so keep it and show no results).
   const selEmployees = props.filters.employees;
+  useEffect(() => {
+    const kept = selEmployees.filter((n) => allEmployeeNames.includes(n));
+    if (kept.length && kept.length !== selEmployees.length) props.onFilters({ ...props.filters, employees: kept });
+  }, [allEmployeeNames]); // eslint-disable-line react-hooks/exhaustive-deps
   const employeeOptions = useMemo(() => allEmployeeNames.map((n) => ({ value: n, label: n })), [allEmployeeNames]);
   const teamStatusPicker = (
     <Select value={props.filters.teamStatus} onValueChange={(v) => props.onFilters({ ...props.filters, teamStatus: v as HistoryFilters["teamStatus"], employees: [] })}>
@@ -6929,7 +6965,7 @@ function HistoryScreen(props: {
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={ALL_LOCATIONS}>All periods</SelectItem>
-                    {Array.from(new Set(props.allScorecards.map((sc) => sc.scorecardMonth))).map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
+                    {periodOptions.map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
                   </SelectContent>
                 </Select>
                 <Select value={props.filters.location || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, location: v === ALL_LOCATIONS ? "" : v })}>
@@ -7008,7 +7044,7 @@ function HistoryScreen(props: {
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={ALL_LOCATIONS}>All periods</SelectItem>
-                    {Array.from(new Set(props.allScorecards.map((sc) => sc.scorecardMonth))).map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
+                    {periodOptions.map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
                   </SelectContent>
                 </Select>
                 <Select value={props.filters.location || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, location: v === ALL_LOCATIONS ? "" : v })}>
