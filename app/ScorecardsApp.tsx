@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   normalizeAdminUserPayload,
+  parseNameAliases,
   scopeSummary,
   SCORECARD_DEPARTMENTS,
   SCORECARD_LOCATIONS,
@@ -12,10 +13,12 @@ import {
 } from "../lib/adminUsers";
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth, fixturePeriod } from "../lib/fixtures";
-import { currentMonthValue, formatMonthLabel } from "../lib/periods";
-import { getReportingTree, profileNode } from "../lib/reportingTree";
-import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
-import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
+import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
+import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
+import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
+import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
+import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
@@ -58,7 +61,7 @@ import {
   scorecardToRow,
   supabaseClient
 } from "../lib/supabase";
-import type { ActualsByKey, AppData, Employee, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard, ScorecardGoal } from "../lib/types";
+import type { ActualsByKey, AppData, Employee, EmployeeOverride, EmployeeScorecardSettings, Goal, GoalAssignment, GoalTier, HistoryFilters, ManagerProfile, ProfileRole, Scorecard, ScorecardGoal } from "../lib/types";
 import { AppShell, type NavGroup } from "@/components/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -219,6 +222,32 @@ const fixtureManagedUsers: AdminManagedUser[] = [
   }
 ];
 
+// Whether the viewer is this team member's direct manager: the manager matched at upload (or set
+// by an admin override) when there is one, otherwise the Rippling Manager name.
+function isDirectReportOf(employee: Pick<Employee, "manager" | "assignedManagerId">, profileId: string | undefined, profileNames: string[]): boolean {
+  if (employee.assignedManagerId) return employee.assignedManagerId === profileId;
+  return profileNames.some((n) => normalizePersonName(n) === normalizePersonName(employee.manager));
+}
+
+// Names of goals on a scorecard that have no actual yet; submission is blocked until empty.
+function scorecardGoalsMissingActuals(scorecard: Pick<Scorecard, "goals">): string[] {
+  return Array.from(new Set(scorecard.goals.filter((g) => g.actual == null || Number.isNaN(g.actual)).map((g) => g.name)));
+}
+
+// Duplicate Goals Bank entries (same tier/location/department/name/role or employee) share one
+// target/min/actual slot, so a scorecard keeps only the first of them.
+function dedupeGoalIds(ids: string[], goals: Goal[]): string[] {
+  const seen = new Set<string>();
+  return ids.filter((id) => {
+    const goal = goals.find((g) => g.id === id);
+    if (!goal) return true;
+    const key = actualKey(goal);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function actualKey(goal: Pick<Goal, "goalTier" | "location" | "department" | "name" | "role" | "employeeName">) {
   // Individual-tier goals of the same name/department/location can be assigned per role or
   // per employee (e.g. "Individual Ratio" for Senior/Design/Master Design Specialist) — fold
@@ -303,6 +332,7 @@ function scopedForProfile<T extends { department?: string; location?: string }>(
 function managedEmployeeNames(profile: ManagerProfile, allEmployees: Employee[]): Set<string> {
   const roots = [
     profile.linkedEmployeeName || "",
+    ...(profile.linkedNameAliases || []),
     profileNode(profile.id),
     ...(profile.descendantProfileIds || []).map(profileNode),
   ];
@@ -401,8 +431,8 @@ export default function ScorecardsApp() {
   const effectiveProfile = useMemo<ManagerProfile | null>(() => {
     if (!baseEffectiveProfile) return null;
     const known = adminUsers.length > 0
-      ? adminUsers.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }))
-      : subordinateProfiles.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, supervisorId: u.supervisorId }));
+      ? adminUsers.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, linkedNameAliases: u.linkedNameAliases, supervisorId: u.supervisorId }))
+      : subordinateProfiles.map((u) => ({ id: u.id, linkedEmployeeName: u.linkedEmployeeName, linkedNameAliases: u.linkedNameAliases, supervisorId: u.supervisorId }));
     return { ...baseEffectiveProfile, descendantProfileIds: [...reviewChainIds], knownProfiles: known };
   }, [baseEffectiveProfile, reviewChainIds, adminUsers, subordinateProfiles]);
 
@@ -452,7 +482,10 @@ export default function ScorecardsApp() {
     search: "",
     location: "",
     department: "",
-    goal: ""
+    goal: "",
+    employees: [],
+    teamStatus: "current",
+    periodType: "all"
   });
   const [historyView, setHistoryView] = useState<HistoryView>("table");
 
@@ -576,7 +609,9 @@ export default function ScorecardsApp() {
 
   useEffect(() => {
     if (!authenticated || profile?.role !== "admin") return;
-    if (mode !== "users" && mode !== "rippling" && !(mode === "todos" && viewAsProfile)) return;
+    // Team Scorecards needs the user list for the manual manager picker.
+    if (mode !== "users" && mode !== "rippling" && mode !== "scorecard" && !(mode === "todos" && viewAsProfile)) return;
+    if (mode === "scorecard" && adminUsers.length > 0) return;
     void loadAdminUsers();
   }, [authenticated, profile?.role, mode, viewAsProfile, isFixture, sb]);
 
@@ -609,7 +644,7 @@ export default function ScorecardsApp() {
       setReviewChainIds(chain);
       // The person any scorecard viewAsProfile submits routes to — their own supervisor.
       const viewAsReviewer = viewAsProfile.supervisorId ? adminUsers.find((u) => u.id === viewAsProfile.supervisorId) : undefined;
-      setReviewerName(viewAsReviewer ? (viewAsReviewer.linkedEmployeeName || viewAsReviewer.email) : null);
+      setReviewerName(viewAsReviewer ? (viewAsReviewer.fullName || viewAsReviewer.linkedEmployeeName || viewAsReviewer.email) : null);
       return;
     }
     // Normal mode: fetch on login so badge count is accurate from the start.
@@ -628,6 +663,7 @@ export default function ScorecardsApp() {
               departments: Array.isArray(row.departments) ? row.departments : [],
               locations: Array.isArray(row.locations) ? row.locations : [],
               linkedEmployeeName: typeof row.linked_employee_name === "string" && row.linked_employee_name.trim() ? row.linked_employee_name.trim() : undefined,
+              linkedNameAliases: parseNameAliases(row.linked_name_aliases),
               supervisorId: typeof row.supervisor_id === "string" ? row.supervisor_id : undefined,
               companyGoalsGrant: row.company_goals_grant === true,
             })));
@@ -761,7 +797,7 @@ export default function ScorecardsApp() {
         ? client.from("scorecards").select("*").eq("employee_name", linkedName).order("scorecard_month", { ascending: false })
         : client.from("scorecards").select("*").order("scorecard_month", { ascending: false });
 
-      const [scResult, goalsResult, actualsResult, ripplingResult, assignmentsResult, settingsResult] = await Promise.all([
+      const [scResult, goalsResult, actualsResult, ripplingResult, assignmentsResult, settingsResult, overridesResult] = await Promise.all([
         scQuery,
         client.from("goals_bank").select("*").order("goal_tier").order("department").order("name"),
         fetchAllRows(client, "actuals"),
@@ -774,7 +810,12 @@ export default function ScorecardsApp() {
         linkedName
           ? client.from("employee_scorecard_settings").select("*").eq("employee_name", linkedName)
           : client.from("employee_scorecard_settings").select("*"),
+        linkedName
+          ? client.from("employee_overrides").select("*").eq("employee_name", linkedName)
+          : client.from("employee_overrides").select("*"),
       ]);
+      // Empty (not an error) until the employee_overrides migration has run.
+      const employeeOverrides = overridesResult.error ? [] : (overridesResult.data || []).map(employeeOverrideFromRow);
 
       const scorecards = (scResult.data || []).map(scorecardFromRow);
       const goals = (goalsResult.data || []).map(goalFromRow);
@@ -782,7 +823,7 @@ export default function ScorecardsApp() {
       const rippling: Record<string, Employee[]> = {};
       for (const row of ripplingResult.data || []) {
         const period = row.period || fixtureMonth;
-        const emp = employeeFromRow(row);
+        const [emp] = applyEmployeeOverrides(period, [employeeFromRow(row)], employeeOverrides);
         rippling[period] = [...(rippling[period] || []), emp];
       }
 
@@ -800,25 +841,28 @@ export default function ScorecardsApp() {
       const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
       const employeeScorecardSettings: EmployeeScorecardSettings[] = dedupeSettings((settingsResult.data || []).map(employeeScorecardSettingsFromRow));
 
-      setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
+      setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides }));
       setMyGoals(goals);
       return;
     }
 
-    const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult] = await Promise.all([
+    const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult, overridesResult] = await Promise.all([
       client.from("goals_bank").select("*").order("goal_tier").order("department").order("name"),
       client.from("scorecards").select("*").order("scorecard_month", { ascending: false }).order("employee_name"),
       client.from("rippling_employees").select("*").order("period", { ascending: false }),
       fetchAllRows(client, "actuals"),
       client.from("goal_assignments").select("*").order("created_at", { ascending: false }),
-      client.from("employee_scorecard_settings").select("*")
+      client.from("employee_scorecard_settings").select("*"),
+      client.from("employee_overrides").select("*")
     ]);
+    // Empty (not an error) until the employee_overrides migration has run.
+    const employeeOverrides = overridesResult.error ? [] : (overridesResult.data || []).map(employeeOverrideFromRow);
 
     const rippling: Record<string, Employee[]> = {};
     const allEmployees: Employee[] = [];
     for (const row of ripplingResult.data || []) {
       const period = row.period || fixtureMonth;
-      const emp = employeeFromRow(row);
+      const [emp] = applyEmployeeOverrides(period, [employeeFromRow(row)], employeeOverrides);
       rippling[period] = [...(rippling[period] || []), emp];
       allEmployees.push(emp);
     }
@@ -857,7 +901,7 @@ export default function ScorecardsApp() {
     const scorecards = (scorecardsResult.data || []).map(scorecardFromRow);
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
-    setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings }));
+    setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides }));
     setMyGoals(rawGoals);
   }
 
@@ -1204,6 +1248,10 @@ export default function ScorecardsApp() {
     return result;
   }, [appData.rippling]);
 
+  // Rippling rows with title/department/location locked to day 1 of each month — what every
+  // scorecard is built from, so a mid-month change only takes effect the following month.
+  const scorecardRippling = useMemo(() => lockMonthStartProfiles(appData.rippling), [appData.rippling]);
+
   // Employee record for the logged-in user (for the Personal Scorecard panel).
   // Falls back to the most recent submitted scorecard if the employee isn't in Rippling,
   // so the personal scorecard always shows applicable goals even before payroll data is uploaded.
@@ -1255,19 +1303,39 @@ export default function ScorecardsApp() {
       });
   }, [effectiveProfile, appData.scorecards]);
 
+  // Current team members are the people in the latest Rippling upload; everyone else with
+  // history (e.g. former team members backfilled from Drive) is "former". No uploads → all current.
+  const currentTeamNames = useMemo(() => {
+    const latest = Object.keys(appData.rippling).filter((p) => appData.rippling[p]?.length).sort().pop();
+    return latest ? new Set(appData.rippling[latest].map((e) => e.name)) : null;
+  }, [appData.rippling]);
+
+  // Pending and returned scorecards stay out of Historical Data until approved.
+  const historyScorecards = useMemo(
+    () => scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)
+      .filter(isFinalizedForHistory)
+      .filter((sc) => {
+        if (historyFilters.teamStatus === "all" || !currentTeamNames) return true;
+        return currentTeamNames.has(sc.employeeName) === (historyFilters.teamStatus === "current");
+      })
+      .filter((sc) => historyFilters.periodType === "all" || isQuarterLabel(sc.scorecardMonth) === (historyFilters.periodType === "quarterly")),
+    [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, historyFilters.periodType, currentTeamNames]
+  );
+
   const filteredHistory = useMemo(() => {
-    return scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees).filter((scorecard) => {
+    return historyScorecards.filter((scorecard) => {
       if (historyFilters.period && scorecard.scorecardMonth !== historyFilters.period) return false;
       if (historyFilters.location && scorecard.location !== historyFilters.location) return false;
       if (historyFilters.department && scorecard.department !== historyFilters.department) return false;
       if (historyFilters.goal && !scorecard.goals.some((goal) => goal.name === historyFilters.goal)) return false;
+      if (historyFilters.employees.length && !historyFilters.employees.includes(scorecard.employeeName)) return false;
       if (historyFilters.search) {
         const haystack = [scorecard.employeeName, scorecard.role, scorecard.department, scorecard.location, scorecard.manager].join(" ").toLowerCase();
         if (!haystack.includes(historyFilters.search.toLowerCase())) return false;
       }
       return true;
     });
-  }, [appData.scorecards, historyFilters, effectiveProfile, allRipplingEmployees]);
+  }, [historyScorecards, historyFilters]);
 
   // workMonth = the most recently completed month (always previous calendar month)
   const workMonth = useMemo(() => {
@@ -1810,12 +1878,16 @@ export default function ScorecardsApp() {
         return;
       }
     }
-    setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: employees } }));
+    setAppData((current) => ({ ...current, rippling: { ...current.rippling, [month]: applyEmployeeOverrides(month, employees, current.employeeOverrides) } }));
     persistRippling(month, employees);
     const refreshed = await refreshSubmittedEarnings(month, { ...appData.rippling, [month]: employees });
-    showToast(refreshed > 0
-      ? `Rippling data saved — updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}`
-      : "Rippling data saved");
+    const held = lockMonthStartProfiles({ ...appData.rippling, [month]: applyEmployeeOverrides(month, employees, appData.employeeOverrides) })[month]
+      .filter((e) => e.monthStartHeld).length;
+    const notes = [
+      refreshed > 0 ? `updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}` : "",
+      held > 0 ? `${held} mid-month title/department change${held === 1 ? "" : "s"} will apply from ${formatMonthLabel(nextIsoMonth(month))}` : ""
+    ].filter(Boolean);
+    showToast(notes.length > 0 ? `Rippling data saved — ${notes.join("; ")}` : "Rippling data saved");
   }
 
   // Submitted scorecards freeze their earnings at submit time, so a payroll upload that lands
@@ -1878,7 +1950,50 @@ export default function ScorecardsApp() {
     showToast("Rippling data cleared for " + formatMonthLabel(month));
   }
 
+  // Manual department/manager correction for one employee, from isoMonth onward. Survives
+  // uploads: rows stay as Rippling sent them and the override is re-applied on top.
+  async function saveEmployeeOverride(employeeName: string, isoMonth: string, patch: { department?: string; managerId?: string }) {
+    const existing = (appData.employeeOverrides || []).find((o) => o.employeeName === employeeName);
+    const manager = patch.managerId ? adminUsers.find((u) => u.id === patch.managerId) : undefined;
+    if (!patch.department && !patch.managerId) return clearEmployeeOverride(employeeName);
+    const override: EmployeeOverride = {
+      employeeName,
+      department: patch.department,
+      managerId: patch.managerId,
+      managerName: manager ? manager.linkedEmployeeName || manager.email : undefined,
+      effectiveFrom: existing && existing.effectiveFrom < isoMonth ? existing.effectiveFrom : isoMonth,
+      updatedBy: currentUserEmail,
+      updatedAt: new Date().toISOString()
+    };
+    if (!isFixture && sb) {
+      const result = await sb.from("employee_overrides").upsert(employeeOverrideToRow(override), { onConflict: "employee_name" });
+      if (result.error) { showSupabaseError(result.error, "Manual change could not be saved."); return; }
+    }
+    setAppData((current) => {
+      const employeeOverrides = [...(current.employeeOverrides || []).filter((o) => o.employeeName !== employeeName), override];
+      return { ...current, employeeOverrides, rippling: applyEmployeeOverridesToAll(current.rippling, employeeOverrides) };
+    });
+    showToast(`Saved — applies to ${employeeName} from ${formatMonthLabel(override.effectiveFrom)} on, including future uploads`);
+  }
+
+  async function clearEmployeeOverride(employeeName: string) {
+    if (!isFixture && sb) {
+      const result = await sb.from("employee_overrides").delete().eq("employee_name", employeeName);
+      if (result.error) { showSupabaseError(result.error, "Manual change could not be removed."); return; }
+    }
+    setAppData((current) => {
+      const employeeOverrides = (current.employeeOverrides || []).filter((o) => o.employeeName !== employeeName);
+      return { ...current, employeeOverrides, rippling: applyEmployeeOverridesToAll(current.rippling, employeeOverrides) };
+    });
+    showToast(`${employeeName} reset to Rippling's department and manager`);
+  }
+
   async function submitScorecardDirect(scorecard: Scorecard) {
+    const missingActuals = scorecardGoalsMissingActuals(scorecard);
+    if (missingActuals.length > 0) {
+      showToast(`Scorecard not submitted — missing actual${missingActuals.length === 1 ? "" : "s"} for ${missingActuals.join(", ")}`);
+      return;
+    }
     // Look up the submitting manager's supervisor to determine review routing
     const submittingProfile = profile; // the currently logged-in manager
     const supervisorId = submittingProfile?.supervisorId;
@@ -2058,10 +2173,11 @@ export default function ScorecardsApp() {
                   scorecards={myOwnScorecards}
                   employeeName={effectiveProfile?.linkedEmployeeName || ""}
                   myEmployee={myEmployee}
+                  titleOverride={effectiveProfile?.titleOverride}
                   periodType={effectiveProfile?.scorecardPeriodType}
                   allGoals={myGoals.filter((g) => g.active)}
                   allActuals={appData.actuals}
-                  rippling={appData.rippling}
+                  rippling={scorecardRippling}
                   goalAssignments={appData.goalAssignments}
                   empSettings={appData.employeeScorecardSettings.filter((s) => s.employeeName === (effectiveProfile?.linkedEmployeeName || ""))}
                 />
@@ -2109,7 +2225,7 @@ export default function ScorecardsApp() {
                 selectedMonths={scorecardMonths}
                 months={months}
                 profile={effectiveProfile}
-                rippling={appData.rippling}
+                rippling={scorecardRippling}
                 allEmployees={allRipplingEmployees}
                 scorecards={scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)}
                 allGoals={appData.goals.filter((g) => g.active)}
@@ -2125,6 +2241,13 @@ export default function ScorecardsApp() {
                 onSaveGoal={saveGoal}
                 onSaveTargetPair={(goal, period, target, min) => saveMonthTargetPair(goal, period, target, min)}
                 onSaveProrate={saveProrateDay}
+                employeeOverrides={appData.employeeOverrides}
+                managerOptions={adminUsers
+                  .filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin"))
+                  .map((u) => ({ id: u.id, label: u.fullName || u.linkedEmployeeName || u.email }))
+                  .sort((a, b) => a.label.localeCompare(b.label))}
+                onSaveEmployeeOverride={profile?.role === "admin" ? saveEmployeeOverride : undefined}
+                onClearEmployeeOverride={profile?.role === "admin" ? clearEmployeeOverride : undefined}
                 isAdmin={effectiveProfile?.role === "admin"}
                 companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
                 allowedDepartments={effectiveProfile?.role === "admin" ? undefined : (effectiveProfile?.departments || [])}
@@ -2147,7 +2270,7 @@ export default function ScorecardsApp() {
               filters={historyFilters}
               view={historyView}
               scorecards={filteredHistory}
-              allScorecards={scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees)}
+              allScorecards={historyScorecards}
               readonly={effectiveProfile?.role === "user"}
               onFilters={setHistoryFilters}
               onView={setHistoryView}
@@ -2158,6 +2281,7 @@ export default function ScorecardsApp() {
               defaultMonth={workMonth}
               users={adminUsers.filter((u) => u.status !== "deactivated")}
               usersLoading={adminUsersLoading}
+              employeeOverrides={appData.employeeOverrides}
               saved={appData.rippling}
               onSaveForMonth={saveRipplingForMonth}
               onClearMonth={clearRipplingForMonth}
@@ -2211,7 +2335,7 @@ export default function ScorecardsApp() {
               allGoals={appData.goals.filter((g) => g.active)}
               companyGoalAccess={resolveCompanyGoalAccess(effectiveProfile)}
               subordinateProfiles={subordinateProfiles}
-              rippling={appData.rippling}
+              rippling={scorecardRippling}
               scorecards={appData.scorecards}
               allEmployees={allRipplingEmployees}
               goalAssignments={appData.goalAssignments}
@@ -2344,11 +2468,12 @@ function AuthScreen(props: {
 }
 
 function PersonalScorecardPanel({
-  scorecards, employeeName, myEmployee, periodType, allGoals, allActuals, rippling, goalAssignments, empSettings
+  scorecards, employeeName, myEmployee: latestEmployee, titleOverride, periodType, allGoals, allActuals, rippling, goalAssignments, empSettings
 }: {
   scorecards: Scorecard[];
   employeeName: string;
   myEmployee: Employee | null;
+  titleOverride?: string;
   periodType?: "monthly" | "quarterly";
   allGoals: Goal[];
   allActuals: Record<string, ActualsByKey>;
@@ -2427,6 +2552,15 @@ function PersonalScorecardPanel({
   const isQuarterly = /^Q\d /.test(currentPeriod);
   const quarterKey = periodISO ? quarterKeyForMonth(periodISO) : "";
 
+  // Title/department/location as locked for this period (see lockMonthStartProfiles); periods
+  // without an upload use the latest Rippling data.
+  const myEmployee = useMemo((): Employee | null => {
+    if (!latestEmployee || !periodISO) return latestEmployee;
+    const row = (rippling[periodISO] || []).find((e) => e.name === latestEmployee.name);
+    if (!row) return latestEmployee;
+    return { ...latestEmployee, role: titleOverride ?? row.role, department: row.department, location: row.location };
+  }, [latestEmployee, periodISO, rippling, titleOverride]);
+
   const periodActuals = useMemo(() => ({
     ...(allActuals[currentPeriod] || {}),
     ...(quarterKey ? allActuals[quarterKey] || {} : {}),
@@ -2502,6 +2636,8 @@ function PersonalScorecardPanel({
         .filter((g): g is Goal => !!g);
       goalList = [...kept, ...extras];
     }
+    const keptIds = new Set(dedupeGoalIds(goalList.map((g) => g.id), goalList));
+    goalList = goalList.filter((g) => keptIds.has(g.id));
 
     // 4. Map to EditableGoal — manager weight overrides take precedence over stored weights
     const weightOverrides: Record<string, number> = settings?.weightOverrides ?? {};
@@ -3031,7 +3167,7 @@ function UsersScreen(props: {
         <Table className="text-[12.5px]">
           <TableHeader className="bg-muted/40 [&_th]:h-9 [&_th]:px-4 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
             <TableRow className="hover:bg-transparent">
-              <TableHead>Email</TableHead>
+              <TableHead>User</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Role</TableHead>
               <TableHead>Scope</TableHead>
@@ -3050,7 +3186,9 @@ function UsersScreen(props: {
                 <TableRow>
                   <TableCell>
                     <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-medium text-foreground">{user.email}</span>
+                      {user.fullName
+                        ? <span className="flex flex-col"><span className="font-medium text-foreground">{user.fullName}</span><span className="text-[11.5px] text-muted-foreground">{user.email}</span></span>
+                        : <span className="font-medium text-foreground">{user.email}</span>}
                       {user.id === props.currentUserId && <Badge variant="secondary" className="font-medium">You</Badge>}
                       {!user.hasProfile && <Badge variant="outline" className="font-medium text-[#9B2C2C]">No profile</Badge>}
                     </span>
@@ -3290,10 +3428,12 @@ function UserPermissionForm(props: {
     const saved = await props.onSubmit({
       id: draft.id,
       email: draft.email,
+      fullName: draft.fullName?.trim() || undefined,
       role: draft.role,
       departments: isManager ? (allDepts ? [] : draft.departments) : [],
       locations: isManager ? (allLocs ? [] : draft.locations) : [],
       linkedEmployeeName: draft.linkedEmployeeName || undefined,
+      linkedNameAliases: draft.linkedEmployeeName ? draft.aliasesText.split(",").map((name) => name.trim()).filter(Boolean) : [],
       titleOverride: (draft as AdminUserPayload & { titleOverride?: string }).titleOverride || undefined,
       supervisorId: (draft as AdminUserPayload & { supervisorId?: string }).supervisorId || undefined,
       allDepartments: !isManager || allDepts,
@@ -3307,6 +3447,9 @@ function UserPermissionForm(props: {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-end gap-3">
+        <DrawerField label="Name" htmlFor="user-full-name" className="min-w-[12rem] flex-1">
+          <Input id="user-full-name" aria-label="Name" value={draft.fullName ?? ""} onChange={(e) => setDraft({ ...draft, fullName: e.target.value })} placeholder="First and last name" />
+        </DrawerField>
         <DrawerField label="Email" htmlFor="user-email" className="min-w-[14rem] flex-1">
           <Input id="user-email" aria-label="Email" type="email" value={draft.email} onChange={(e) => setDraft({ ...draft, email: e.target.value })} placeholder="name@pressedfloral.com" />
         </DrawerField>
@@ -3325,13 +3468,7 @@ function UserPermissionForm(props: {
       {draft.role === "admin" && (
         <div className="flex flex-wrap items-end gap-3">
           <DrawerField label="Linked employee (optional)" className="min-w-[12rem] flex-1">
-            <Select value={draft.linkedEmployeeName || "__none__"} onValueChange={(v) => setDraft({ ...draft, linkedEmployeeName: v === "__none__" ? "" : v })}>
-              <SelectTrigger className="w-full" aria-label="Linked employee"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__none__">No linked employee</SelectItem>
-                {employeeNames.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <LinkedNameInput ariaLabel="Linked employee" placeholder="No linked employee" names={employeeNames} value={draft.linkedEmployeeName} onChange={(v) => setDraft({ ...draft, linkedEmployeeName: v })} />
           </DrawerField>
         </div>
       )}
@@ -3345,13 +3482,7 @@ function UserPermissionForm(props: {
             <MultiSelectDropdown label="All locations" emptyLabel="No locations" triggerClassName="w-full" options={locationOptions} selected={draft.locations} onChange={(values) => setDraft({ ...draft, locations: values })} />
           </DrawerField>
           <DrawerField label="Reporting tree root" className="min-w-[12rem] flex-1">
-            <Select value={draft.linkedEmployeeName || ALL_LOCATIONS} onValueChange={(v) => v === ALL_LOCATIONS ? setDraft({ ...draft, linkedEmployeeName: "" }) : setLinkedEmployee(v)}>
-              <SelectTrigger className="w-full" aria-label="Reporting tree root"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL_LOCATIONS}>No linked employee</SelectItem>
-                {employeeNames.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <LinkedNameInput ariaLabel="Reporting tree root" placeholder="No linked employee" names={employeeNames} value={draft.linkedEmployeeName} onChange={setLinkedEmployee} />
           </DrawerField>
         </div>
       )}
@@ -3367,7 +3498,7 @@ function UserPermissionForm(props: {
               <SelectContent>
                 <SelectItem value="__none__">No supervisor</SelectItem>
                 {(props.allUsers || []).filter((u) => u.id !== draft.id && (u.role === "manager" || u.role === "admin")).map((u) => (
-                  <SelectItem key={u.id} value={u.id}>{u.linkedEmployeeName || u.email}</SelectItem>
+                  <SelectItem key={u.id} value={u.id}>{u.fullName || u.linkedEmployeeName || u.email}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -3378,12 +3509,20 @@ function UserPermissionForm(props: {
       {draft.role === "user" && (
         <div className="flex flex-wrap items-end gap-3">
           <DrawerField label="Linked employee" className="min-w-[12rem] flex-1">
-            <Select value={draft.linkedEmployeeName || undefined} onValueChange={(v) => setDraft({ ...draft, linkedEmployeeName: v })}>
-              <SelectTrigger className="w-full" aria-label="Linked employee"><SelectValue placeholder="Choose employee" /></SelectTrigger>
-              <SelectContent>
-                {employeeNames.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <LinkedNameInput ariaLabel="Linked employee" placeholder="Choose or type a name" names={employeeNames} value={draft.linkedEmployeeName} onChange={(v) => setDraft({ ...draft, linkedEmployeeName: v })} />
+          </DrawerField>
+        </div>
+      )}
+
+      {draft.linkedEmployeeName && (
+        <div className="flex flex-wrap items-end gap-3">
+          <DrawerField label="Also appears in Rippling as" className="min-w-[12rem] flex-1">
+            <Input
+              placeholder="e.g. a former last name — separate several with commas"
+              value={draft.aliasesText}
+              onChange={(e) => setDraft({ ...draft, aliasesText: e.target.value })}
+              aria-label="Also appears in Rippling as"
+            />
           </DrawerField>
         </div>
       )}
@@ -3431,14 +3570,32 @@ function UserPermissionForm(props: {
   );
 }
 
-function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email: string; linkedEmployeeName: string; allDepartments: boolean; allLocations: boolean } {
+// Linked employee name: suggests names from Rippling but accepts any typed name, for people
+// (e.g. owners) who don't appear in a Rippling export. Clearing the box unlinks the user.
+function LinkedNameInput({ value, names, onChange, ariaLabel, placeholder }: { value: string; names: string[]; onChange: (value: string) => void; ariaLabel: string; placeholder: string }) {
+  const listId = React.useId();
+  const notInRippling = !!value.trim() && !names.some((name) => normalizePersonName(name) === normalizePersonName(value));
+  return (
+    <div className="flex flex-col gap-1">
+      <Input list={listId} aria-label={ariaLabel} placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} onBlur={(e) => { const trimmed = e.target.value.replace(/\s+/g, " ").trim(); if (trimmed !== e.target.value) onChange(trimmed); }} />
+      <datalist id={listId}>
+        {names.map((name) => <option key={name} value={name} />)}
+      </datalist>
+      {notInRippling && <span className="text-[11px] text-muted-foreground">Not in Rippling data — entered manually</span>}
+    </div>
+  );
+}
+
+function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email: string; linkedEmployeeName: string; aliasesText: string; allDepartments: boolean; allLocations: boolean } {
   if (!user) {
     return {
       email: "",
+      fullName: "",
       role: "" as ProfileRole,
       departments: [],
       locations: [],
       linkedEmployeeName: "",
+      aliasesText: "",
       allDepartments: false,
       allLocations: false,
       scorecardPeriodType: "monthly" as const,
@@ -3451,11 +3608,13 @@ function userDraftFromUser(user?: AdminManagedUser): AdminUserPayload & { email:
   return {
     id: user.id,
     email: user.email,
+    fullName: user.fullName || "",
     role: user.role,
     // Expand "all access" (empty array) to every option selected so the multi-select shows it.
     departments: isManager ? (allDepts ? [...departments] : user.departments) : [],
     locations: isManager ? (allLocs ? [...locations] : user.locations) : [],
     linkedEmployeeName: user.linkedEmployeeName || "",
+    aliasesText: (user.linkedNameAliases || []).join(", "),
     titleOverride: user.titleOverride || "",
     supervisorId: user.supervisorId || "",
     allDepartments: allDepts,
@@ -4395,7 +4554,7 @@ function MultiSelectDropdown({ label, options, selected, onChange, emptyLabel, t
         <span className="truncate">{displayLabel}</span>
         <ChevronDown className="size-4 shrink-0 text-muted-foreground opacity-50" />
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-[var(--radix-dropdown-menu-trigger-width)]">
+      <DropdownMenuContent align="start" className="max-h-80 min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto">
         <DropdownMenuCheckboxItem checked={allChecked} onCheckedChange={toggleAll} onSelect={(e) => e.preventDefault()} className="text-[13px] font-medium">
           Select all
         </DropdownMenuCheckboxItem>
@@ -4737,6 +4896,11 @@ function ScorecardsScreen(props: {
   onSaveGoal: (goal: Goal) => Promise<Goal | null>;
   onSaveTargetPair: (goal: Goal, period: string, target: string, min: string) => void;
   onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
+  // Admin-only manual department/manager corrections (see saveEmployeeOverride).
+  employeeOverrides?: EmployeeOverride[];
+  managerOptions?: { id: string; label: string }[];
+  onSaveEmployeeOverride?: (employeeName: string, isoMonth: string, patch: { department?: string; managerId?: string }) => void;
+  onClearEmployeeOverride?: (employeeName: string) => void;
   isAdmin?: boolean;
   companyGoalAccess?: boolean;
   allowedDepartments?: string[];
@@ -4760,6 +4924,7 @@ function ScorecardsScreen(props: {
   const [globalPeriodType, setGlobalPeriodType] = useState<"monthly" | "quarterly">("monthly");
   const [hideCompleted, setHideCompleted] = useState(false);
   const [hideIneligible, setHideIneligible] = useState(false);
+  const [directReportsOnly, setDirectReportsOnly] = useState(false);
   const [viewMode, setViewMode] = useState<"cards" | "progress">("cards");
   const [progressStatusFilter, setProgressStatusFilter] = useState<ScorecardCompletionStatus[]>([]);
 
@@ -4787,6 +4952,9 @@ function ScorecardsScreen(props: {
   // Single-month mode = exactly one month selected → live draft cards
   // Multi/all mode = 0 or 2+ months → live draft cards per month, grouped by month
   const singleMonthMode = props.selectedMonths.length === 1;
+  // The viewer's own names as they appear in Rippling's Manager column — to tell whether they're
+  // a team member's direct manager when submitting.
+  const currentUserNames = [props.profile?.linkedEmployeeName, ...(props.profile?.linkedNameAliases || [])].filter((n): n is string => !!n);
   const selectedMonth = singleMonthMode ? props.selectedMonths[0] : "";
   const periodLabel = globalPeriodType === "quarterly" ? quarterKeyForMonth(selectedMonth) : formatMonthLabel(selectedMonth);
 
@@ -4797,7 +4965,8 @@ function ScorecardsScreen(props: {
     const result: Employee[] = [];
     for (const period of periods) {
       for (const emp of props.rippling[period] || []) {
-        if (!seen.has(emp.name)) { seen.add(emp.name); result.push(emp); }
+        // Standing in for a later month, so any held-back mid-month change now applies.
+        if (!seen.has(emp.name)) { seen.add(emp.name); result.push(unlockMonthStartProfile(emp)); }
       }
     }
     return result;
@@ -4805,13 +4974,23 @@ function ScorecardsScreen(props: {
 
   // Use selected month's data if available, otherwise fall back to latest employees
   const monthRaw = singleMonthMode ? (props.rippling[selectedMonth] || []) : [];
-  const monthEmployees = monthRaw.length > 0 ? monthRaw : (singleMonthMode ? latestEmployees : []);
+  // The fallback rows come from an earlier upload, so apply overrides as of the month shown.
+  const monthEmployees = monthRaw.length > 0 ? monthRaw : (singleMonthMode ? applyEmployeeOverrides(selectedMonth, latestEmployees, props.employeeOverrides) : []);
   const teamEmployees = scopedEmployeesForProfile(monthEmployees, props.profile, props.allEmployees);
 
   // Earnings (hours + gross pay) come from the upload tagged to the same month being scored.
   // payrollAvailable = false for current/future months that have no upload yet.
   const earningsUpload = props.rippling[selectedMonth] || [];
   const payrollAvailable = earningsUpload.length > 0;
+  function overrideControlsFor(employeeName: string, isoMonth: string) {
+    if (!props.isAdmin || !props.onSaveEmployeeOverride) return undefined;
+    return {
+      managerOptions: props.managerOptions || [],
+      override: props.employeeOverrides?.find((o) => o.employeeName === employeeName),
+      onSave: (patch: { department?: string; managerId?: string }) => props.onSaveEmployeeOverride!(employeeName, isoMonth, patch),
+      onClear: () => props.onClearEmployeeOverride?.(employeeName),
+    };
+  }
   function withActualEarnings(emp: Employee): Employee {
     const src = earningsUpload.find((e) => e.name === emp.name);
     // Always override — if no upload for this month, earnings become undefined
@@ -4825,6 +5004,21 @@ function ScorecardsScreen(props: {
 
   // Latest employees scoped to profile — used for multi-month mode filters
   const multiMonthTeam = scopedEmployeesForProfile(latestEmployees, props.profile, props.allEmployees);
+
+  // Who someone reports to for a period. Quarterly views list the team from the quarter's first
+  // month, but use the latest upload in the quarter for reporting lines, so a manager change
+  // during the quarter (e.g. Lauren Cox moving to Braden in September) counts for that quarter.
+  function reportingRowFor(name: string, isoMonth: string): Employee | undefined {
+    if (globalPeriodType !== "quarterly" || !/^\d{4}-\d{2}$/.test(isoMonth)) return undefined;
+    return latestRowInQuarter(props.rippling, name, quarterToIsoMonth(quarterKeyForMonth(isoMonth)));
+  }
+
+  // "Direct reports only" is offered to anyone whose team spans more than one level.
+  const isDirectReport = (e: Employee, isoMonth: string = selectedMonth) =>
+    isDirectReportOf(reportingRowFor(e.name, isoMonth) ?? e, props.profile?.id, currentUserNames);
+  const visibleTeam = singleMonthMode ? teamEmployees : multiMonthTeam;
+  const hasMultipleLevels = visibleTeam.some((e) => isDirectReport(e)) && visibleTeam.some((e) => !isDirectReport(e) && e.name !== props.profile?.linkedEmployeeName);
+  const directOnly = directReportsOnly && hasMultipleLevels;
 
   // Filter options from team employees (single) or latest scoped team (multi/all)
   const teamDepts = singleMonthMode
@@ -4873,6 +5067,7 @@ function ScorecardsScreen(props: {
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
     if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
+    if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
       if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -4882,7 +5077,8 @@ function ScorecardsScreen(props: {
     if (forcedPeriod) return forcedPeriod === globalPeriodType;
     // Employees without an explicit designation are treated as monthly-only
     if (globalPeriodType === "quarterly") return false;
-    return goalsForEmployee(e).some((g) => g.periodType !== "quarterly");
+    // Manually edited employees stay visible even without goals, so the edit can be undone.
+    return goalsForEmployee(e).some((g) => g.periodType !== "quarterly") || !!e.uploaded;
   });
 
   // Employees deactivated for the selected month — shown separately with a Reactivate option
@@ -4894,11 +5090,13 @@ function ScorecardsScreen(props: {
 
   const employeeOptions = singleMonthMode
     ? sortedTeam.filter((e) =>
+        (!directOnly || isDirectReport(e)) &&
         (filterLocations.length === 0 || filterLocations.includes(e.location)) &&
         (filterDepts.length === 0 || filterDepts.includes(e.department))
       ).map((e) => e.name)
     : [...multiMonthTeam]
         .filter((e) =>
+          (!directOnly || isDirectReport(e)) &&
           (filterDepts.length === 0 || filterDepts.includes(e.department)) &&
           (filterLocations.length === 0 || filterLocations.includes(e.location))
         )
@@ -5067,15 +5265,23 @@ function ScorecardsScreen(props: {
               onChange={(v) => setProgressStatusFilter(v as ScorecardCompletionStatus[])}
             />
           )}
-          <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
-          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Hides scorecards that are Approved or Submitted with no reviewer — i.e. already finalized">
-            <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
-            Hide completed
-          </label>
-          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title={`Hides scorecards for team members who worked under ${MIN_HOURS_FOR_SCORECARD} hours in the period`}>
-            <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
-            Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
-          </label>
+          {/* The checkboxes sit together on their own line, left-aligned under the filters. */}
+          <div className="flex min-w-0 basis-full flex-wrap items-center gap-x-3 gap-y-2 px-0.5">
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Hides scorecards that are Approved or Submitted with no reviewer — i.e. already finalized">
+              <Checkbox checked={hideCompleted} onCheckedChange={(v) => setHideCompleted(v === true)} />
+              Hide completed
+            </label>
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title={`Hides scorecards for team members who worked under ${MIN_HOURS_FOR_SCORECARD} hours in the period`}>
+              <Checkbox checked={hideIneligible} onCheckedChange={(v) => setHideIneligible(v === true)} />
+              Hide ineligible (&lt;{MIN_HOURS_FOR_SCORECARD} hrs)
+            </label>
+            {hasMultipleLevels && (
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-muted-foreground" title="Shows only team members who report directly to you">
+                <Checkbox checked={directReportsOnly} onCheckedChange={(v) => setDirectReportsOnly(v === true)} />
+                Direct reports only
+              </label>
+            )}
+          </div>
         </div>
       </section>
 
@@ -5159,6 +5365,7 @@ function ScorecardsScreen(props: {
                     onSaveGoal={props.onSaveGoal}
                     onSaveTargetPair={props.onSaveTargetPair}
                     onSaveProrate={props.onSaveProrate}
+                    overrideControls={overrideControlsFor(emp.name, selectedMonth)}
                     teamEmployees={teamEmployees}
                     isAdmin={props.isAdmin}
                     companyGoalAccess={props.companyGoalAccess}
@@ -5169,6 +5376,7 @@ function ScorecardsScreen(props: {
                     currentUserProfileId={props.currentUserProfileId}
                     reviewChainIds={props.reviewChainIds}
                     reviewerName={props.reviewerName}
+                    isDirectReport={isDirectReport(emp)}
                     autoOpen={!!props.focusEmployeeKey && props.focusEmployeeKey === (emp.id || emp.name)}
                     autoOpenNonce={props.focusNonce}
                   />
@@ -5215,7 +5423,7 @@ function ScorecardsScreen(props: {
               <div className="no-goals-msg" style={{ display: "block" }}>No data available. Upload a Rippling CSV to get started.</div>
             ) : displayMonths.map((m) => {
               const mLabel = formatMonthLabel(m);
-              const mRaw = (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : latestEmployees;
+              const mRaw = (props.rippling[m]?.length ?? 0) > 0 ? props.rippling[m] : applyEmployeeOverrides(m, latestEmployees, props.employeeOverrides);
               const mTeam = scopedEmployeesForProfile(mRaw, props.profile, props.allEmployees);
               const mFiltered = mTeam
                 .filter((e) => {
@@ -5223,6 +5431,7 @@ function ScorecardsScreen(props: {
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
                   if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[mLabel]))) return false;
+                  if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
                     if (sc && (sc.reviewStatus === "approved" || !sc.reviewStatus)) return false;
@@ -5272,6 +5481,7 @@ function ScorecardsScreen(props: {
                         onSaveGoal={props.onSaveGoal}
                         onSaveTargetPair={props.onSaveTargetPair}
                         onSaveProrate={props.onSaveProrate}
+                        overrideControls={overrideControlsFor(emp.name, m)}
                         teamEmployees={mTeam}
                         isAdmin={props.isAdmin}
                         companyGoalAccess={props.companyGoalAccess}
@@ -5282,6 +5492,7 @@ function ScorecardsScreen(props: {
                         currentUserProfileId={props.currentUserProfileId}
                         reviewChainIds={props.reviewChainIds}
                         reviewerName={props.reviewerName}
+                    isDirectReport={isDirectReport(emp, m)}
                       />
                     );
                   })}
@@ -5471,7 +5682,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, isDirectReport, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -5493,6 +5704,12 @@ function LiveScorecardCard({
   onSaveGoal: (goal: Goal) => Promise<Goal | null>;
   onSaveTargetPair: (goal: Goal, period: string, target: string, min: string) => void;
   onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
+  overrideControls?: {
+    managerOptions: { id: string; label: string }[];
+    override?: EmployeeOverride;
+    onSave: (patch: { department?: string; managerId?: string }) => void;
+    onClear: () => void;
+  };
   teamEmployees: Employee[];
   isAdmin?: boolean;
   companyGoalAccess?: boolean;
@@ -5503,6 +5720,7 @@ function LiveScorecardCard({
   currentUserProfileId?: string;
   reviewChainIds?: Set<string>;
   reviewerName?: string;
+  isDirectReport?: boolean; // whether the viewer is this team member's direct manager for the period
   autoOpen?: boolean;
   autoOpenNonce?: number;
 }) {
@@ -5515,12 +5733,12 @@ function LiveScorecardCard({
 
   function computeGoalIds(pt: "monthly" | "quarterly", s?: EmployeeScorecardSettings): string[] {
     const base = baseIdsForPeriod(pt);
-    if (!s) return base;
+    if (!s) return dedupeGoalIds(base, [...baseGoals, ...allGoals]);
     const excluded = new Set(s.excludedGoalIds);
     const kept = base.filter((id) => !excluded.has(id));
     // Extra goals the manager manually added that aren't in base (and still exist in allGoals)
     const extras = s.addedGoalIds.filter((id) => !base.includes(id) && allGoals.some((g) => g.id === id));
-    return [...kept, ...extras];
+    return dedupeGoalIds([...kept, ...extras], [...baseGoals, ...allGoals]);
   }
 
   function settingsForPeriod(pt: "monthly" | "quarterly"): EmployeeScorecardSettings | undefined {
@@ -5777,6 +5995,9 @@ function LiveScorecardCard({
   const totalWeight = Number(currentGoals.reduce((sum, g) => sum + g.scWeight, 0).toFixed(1));
   const weightsValid = currentGoals.length === 0 || (!hasUnsetWeights && totalWeight === 100);
   const hasQuarterlyMismatch = cardPeriodType === "monthly" && currentGoals.some((g) => g.periodType === "quarterly");
+  // A scorecard saves its actuals at submission, so every goal needs one first —
+  // otherwise an actual entered later never reaches the submitted scorecard.
+  const missingActualGoals = scorecardGoalsMissingActuals(liveScorecard);
   const availableToAdd = allGoals.filter((g) => {
     if (goalIds.includes(g.id)) return false;
     // Company-tier goals are normally excluded from this list (they're assigned via Goals &
@@ -5805,7 +6026,15 @@ function LiveScorecardCard({
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13.5px] font-medium text-foreground">{employee.name}</span>
           <span className="block truncate text-[11.5px] text-muted-foreground">
-            {employee.role}{employee.department ? ` · ${employee.department}` : ""}{employee.location ? ` · ${employee.location}` : ""}
+            {/* A submitted scorecard shows the title/department it was scored under. */}
+            {(displayedSubmitted ?? employee).role}{(displayedSubmitted ?? employee).department ? ` · ${(displayedSubmitted ?? employee).department}` : ""}{(displayedSubmitted ?? employee).location ? ` · ${(displayedSubmitted ?? employee).location}` : ""}
+            {employee.uploaded ? <span title="Department or manager was changed manually and overrides Rippling" className="font-medium text-foreground"> · Edited</span> : null}
+            {employee.monthStartHeld && !displayedSubmitted ? (
+              <span
+                title={`Locked to their ${formatMonthLabel(isoMonth)} start. Rippling shows ${[employee.monthStartHeld.role, employee.monthStartHeld.department, employee.monthStartHeld.location].filter(Boolean).join(" · ")}, which applies from ${formatMonthLabel(nextIsoMonth(isoMonth))}.`}
+                className="font-medium text-foreground"
+              > · Changed mid-month</span>
+            ) : null}
           </span>
         </span>
         {currentGoals.length > 0 && !ineligible ? (
@@ -5882,6 +6111,52 @@ function LiveScorecardCard({
                 </div>
               </div>
             )}
+            {overrideControls && (() => {
+              // Only an override that covers this card's month is shown as the current value.
+              const active = overrideControls.override && isoMonth >= overrideControls.override.effectiveFrom ? overrideControls.override : undefined;
+              const uploaded = employee.uploaded ?? { department: employee.department, manager: employee.manager };
+              const departmentOptions = Array.from(new Set([...SCORECARD_DEPARTMENTS, uploaded.department].filter(Boolean))).sort();
+              return (
+                <div className="flex flex-wrap items-end gap-2" onClick={(e) => e.stopPropagation()}>
+                  <div>
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Department{active?.department ? " · edited" : ""}</div>
+                    <Select
+                      value={active?.department || uploaded.department || undefined}
+                      onValueChange={(v) => overrideControls.onSave({ department: v === uploaded.department ? undefined : v, managerId: active?.managerId })}
+                    >
+                      <SelectTrigger className="h-7 w-[170px] text-[12px]" aria-label="Department override"><SelectValue placeholder="Department" /></SelectTrigger>
+                      <SelectContent>
+                        {departmentOptions.map((d) => <SelectItem key={d} value={d}>{d}{d === uploaded.department ? " (Rippling)" : ""}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Manager{active?.managerId ? " · edited" : ""}</div>
+                    <Select
+                      value={active?.managerId || "__rippling__"}
+                      onValueChange={(v) => overrideControls.onSave({ department: active?.department, managerId: v === "__rippling__" ? undefined : v })}
+                    >
+                      <SelectTrigger className="h-7 w-[190px] text-[12px]" aria-label="Manager override"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__rippling__">{uploaded.manager ? `${uploaded.manager} (Rippling)` : "From Rippling"}</SelectItem>
+                        {overrideControls.managerOptions.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {active && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-[12px]"
+                      title={`Manual change since ${formatMonthLabel(active.effectiveFrom)}${active.updatedBy ? ` by ${active.updatedBy}` : ""}`}
+                      onClick={overrideControls.onClear}
+                    >
+                      Reset to Rippling
+                    </Button>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           {hasNoTarget && (
@@ -6091,12 +6366,23 @@ function LiveScorecardCard({
                 Remove quarterly goals before submitting a monthly scorecard
               </span>
             )}
+            {!isCurrentMonth && !isFutureMonth && missingActualGoals.length > 0 && (
+              <span className="text-[11.5px] font-semibold text-destructive">
+                Missing actual{missingActualGoals.length === 1 ? "" : "s"}: {missingActualGoals.join(", ")}
+              </span>
+            )}
             <Button
               size="sm"
               className="ml-auto"
-              disabled={isCurrentMonth || isFutureMonth || hasNoTarget || currentGoals.length === 0 || !weightsValid || hasQuarterlyMismatch}
-              title={isCurrentMonth || isFutureMonth ? "Scorecards can only be submitted for past months" : hasNoTarget ? "Set goal values and minimums first" : hasUnsetWeights ? "Assign goal weights in Goals & Actuals first" : !weightsValid ? "Weights must add up to 100%" : hasQuarterlyMismatch ? "Remove quarterly goals before submitting a monthly scorecard" : undefined}
+              disabled={isCurrentMonth || isFutureMonth || hasNoTarget || currentGoals.length === 0 || !weightsValid || hasQuarterlyMismatch || missingActualGoals.length > 0}
+              title={isCurrentMonth || isFutureMonth ? "Scorecards can only be submitted for past months" : hasNoTarget ? "Set goal values and minimums first" : hasUnsetWeights ? "Assign goal weights in Goals & Actuals first" : !weightsValid ? "Weights must add up to 100%" : hasQuarterlyMismatch ? "Remove quarterly goals before submitting a monthly scorecard" : missingActualGoals.length > 0 ? "Enter every goal's actual before submitting" : undefined}
               onClick={() => {
+                // An indirect manager can submit on the direct manager's behalf, but confirms first —
+                // the scorecard routes to the submitter's own manager, not the direct manager's.
+                if (employee.manager && isDirectReport === false) {
+                  const routing = reviewerName ? `It will be sent to ${reviewerName} for approval.` : "It will be sent to your manager for approval.";
+                  if (!window.confirm(`You are submitting the scorecard on behalf of ${employee.manager}. ${routing} Do you wish to proceed?`)) return;
+                }
                 const submitScorecard = prorationFactor < 1
                   ? { ...liveScorecard, bonusAmount: Math.round(proratedBonus * 100) / 100 }
                   : liveScorecard;
@@ -6396,7 +6682,34 @@ function parseMonthLabel(label: string): string {
   return `${y}-${String(m + 1).padStart(2, "0")}`;
 }
 
+function isQuarterLabel(label: string): boolean {
+  return /^Q[1-4] \d{4}$/.test(label.trim());
+}
+
+// Historical Data report periods: "YYYY-MM" for months, "YYYY-Qn" for quarters.
+function historyPeriodKey(label: string): string {
+  const qm = label.trim().match(/^Q([1-4]) (\d{4})$/);
+  return qm ? `${qm[2]}-Q${qm[1]}` : parseMonthLabel(label);
+}
+
+// Chronological order: a quarter sorts right after its last month.
+function historyPeriodOrder(key: string): string {
+  const qm = key.match(/^(\d{4})-Q([1-4])$/);
+  return qm ? `${qm[1]}-${String(Number(qm[2]) * 3).padStart(2, "0")}-1` : `${key}-0`;
+}
+
+function sortHistoryPeriods(keys: string[]): string[] {
+  return keys.sort((a, b) => historyPeriodOrder(a).localeCompare(historyPeriodOrder(b)));
+}
+
+function historyPeriodLabel(key: string): string {
+  const qm = key.match(/^(\d{4})-Q([1-4])$/);
+  return qm ? `Q${qm[2]} ${qm[1]}` : formatMonthLabel(key);
+}
+
 function shortMonthLabel(iso: string): string {
+  const qm = iso.match(/^(\d{4})-Q([1-4])$/);
+  if (qm) return `Q${qm[2]} '${qm[1].slice(2)}`;
   const names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   const [y, m] = iso.split("-").map(Number);
   if (!y || !m) return iso;
@@ -6439,14 +6752,15 @@ function HistoryScreen(props: {
   const [toMonth, setToMonth] = useState("");
   const [selLocation, setSelLocation] = useState("");
   const [selDept, setSelDept] = useState("");
-  const [selEmployee, setSelEmployee] = useState("");
   const [metric, setMetric] = useState<"achievement" | "bonus" | "goal">("achievement");
   const [metricGoal, setMetricGoal] = useState("");
   const [groupBy, setGroupBy] = useState<"employee" | "department" | "location">("employee");
+  // The range options change with the scorecard type (months vs quarters), so start over.
+  useEffect(() => { setFromMonth(""); setToMonth(""); }, [props.filters.periodType]);
 
   // Options derived from all scorecards
   const allMonthIsos = useMemo(() =>
-    Array.from(new Set(props.allScorecards.map((sc) => parseMonthLabel(sc.scorecardMonth)))).filter(Boolean).sort(),
+    sortHistoryPeriods(Array.from(new Set(props.allScorecards.map((sc) => historyPeriodKey(sc.scorecardMonth)))).filter(Boolean)),
     [props.allScorecards]
   );
   const allLocations = useMemo(() =>
@@ -6466,22 +6780,56 @@ function HistoryScreen(props: {
     [props.allScorecards]
   );
 
+  // Employee selection is shared by every view; empty means all employees.
+  const selEmployees = props.filters.employees;
+  const employeeOptions = useMemo(() => allEmployeeNames.map((n) => ({ value: n, label: n })), [allEmployeeNames]);
+  const teamStatusPicker = (
+    <Select value={props.filters.teamStatus} onValueChange={(v) => props.onFilters({ ...props.filters, teamStatus: v as HistoryFilters["teamStatus"], employees: [] })}>
+      <SelectTrigger size="sm" className="min-w-[8.5rem] text-[12px]" aria-label="Team members"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="current">Current team</SelectItem>
+        <SelectItem value="former">Former team</SelectItem>
+        <SelectItem value="all">All team members</SelectItem>
+      </SelectContent>
+    </Select>
+  );
+  const periodTypePicker = (
+    <Select value={props.filters.periodType} onValueChange={(v) => props.onFilters({ ...props.filters, periodType: v as HistoryFilters["periodType"], period: "" })}>
+      <SelectTrigger size="sm" className="min-w-[8.5rem] text-[12px]" aria-label="Scorecard type"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all">Monthly &amp; quarterly</SelectItem>
+        <SelectItem value="monthly">Monthly</SelectItem>
+        <SelectItem value="quarterly">Quarterly</SelectItem>
+      </SelectContent>
+    </Select>
+  );
+  const employeePicker = (triggerClassName: string) => (
+    <MultiSelectDropdown
+      label="All employees"
+      emptyLabel="All employees"
+      triggerClassName={triggerClassName}
+      options={employeeOptions}
+      selected={selEmployees}
+      onChange={(values) => props.onFilters({ ...props.filters, employees: values.length === employeeOptions.length ? [] : values })}
+    />
+  );
+
   // Filtered scorecards for report views
   const reportScorecards = useMemo(() =>
     props.allScorecards.filter((sc) => {
-      const iso = parseMonthLabel(sc.scorecardMonth);
-      if (fromMonth && iso < fromMonth) return false;
-      if (toMonth && iso > toMonth) return false;
+      const order = historyPeriodOrder(historyPeriodKey(sc.scorecardMonth));
+      if (fromMonth && order < historyPeriodOrder(fromMonth)) return false;
+      if (toMonth && order > historyPeriodOrder(toMonth)) return false;
       if (selLocation && sc.location !== selLocation) return false;
       if (selDept && sc.department !== selDept) return false;
-      if (selEmployee && sc.employeeName !== selEmployee) return false;
+      if (selEmployees.length && !selEmployees.includes(sc.employeeName)) return false;
       return true;
     }),
-    [props.allScorecards, fromMonth, toMonth, selLocation, selDept, selEmployee]
+    [props.allScorecards, fromMonth, toMonth, selLocation, selDept, selEmployees]
   );
 
   const reportMonths = useMemo(() =>
-    Array.from(new Set(reportScorecards.map((sc) => parseMonthLabel(sc.scorecardMonth)))).filter(Boolean).sort(),
+    sortHistoryPeriods(Array.from(new Set(reportScorecards.map((sc) => historyPeriodKey(sc.scorecardMonth)))).filter(Boolean)),
     [reportScorecards]
   );
 
@@ -6503,7 +6851,7 @@ function HistoryScreen(props: {
 
   function getGroupMonthValue(groupKey: string, isoMonth: string): number | null {
     const scs = reportScorecards.filter((sc) => {
-      if (parseMonthLabel(sc.scorecardMonth) !== isoMonth) return false;
+      if (historyPeriodKey(sc.scorecardMonth) !== isoMonth) return false;
       if (groupBy === "employee") return sc.employeeName === groupKey;
       if (groupBy === "department") return sc.department === groupKey;
       return sc.location === groupKey;
@@ -6580,6 +6928,9 @@ function HistoryScreen(props: {
                   <Input value={props.filters.search} onChange={(e) => props.onFilters({ ...props.filters, search: e.target.value })} placeholder="Search employee, location…" className="h-8 w-[220px] pl-8 text-[12px]" />
                 </div>
                 <Separator orientation="vertical" className="mx-0.5 hidden h-5 sm:block" />
+                {teamStatusPicker}
+                {periodTypePicker}
+                {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -6656,6 +7007,9 @@ function HistoryScreen(props: {
           {!props.readonly && (
             <section style={{ padding: 0 }} className="overflow-hidden">
               <div className="flex flex-wrap items-center gap-2 p-2.5">
+                {teamStatusPicker}
+                {periodTypePicker}
+                {employeePicker("min-w-[9rem]")}
                 <Select value={props.filters.period || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, period: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -6700,7 +7054,7 @@ function HistoryScreen(props: {
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={ALL_LOCATIONS}>Earliest</SelectItem>
-                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{formatMonthLabel(m)}</SelectItem>)}
+                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{historyPeriodLabel(m)}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </ReportControl>
@@ -6709,7 +7063,7 @@ function HistoryScreen(props: {
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={ALL_LOCATIONS}>Latest</SelectItem>
-                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{formatMonthLabel(m)}</SelectItem>)}
+                    {allMonthIsos.map((m) => <SelectItem key={m} value={m}>{historyPeriodLabel(m)}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </ReportControl>
@@ -6731,14 +7085,14 @@ function HistoryScreen(props: {
                   </SelectContent>
                 </Select>
               </ReportControl>
+              <ReportControl label="Team members">
+                {teamStatusPicker}
+              </ReportControl>
+              <ReportControl label="Scorecard type">
+                {periodTypePicker}
+              </ReportControl>
               <ReportControl label="Employee">
-                <Select value={selEmployee || ALL_LOCATIONS} onValueChange={(v) => setSelEmployee(v === ALL_LOCATIONS ? "" : v)}>
-                  <SelectTrigger size="sm" className="min-w-[9rem] text-[12px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_LOCATIONS}>All employees</SelectItem>
-                    {allEmployeeNames.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                {employeePicker("min-w-[9rem]")}
               </ReportControl>
               <ReportControl label="Group by">
                 <Select value={groupBy} onValueChange={(v) => setGroupBy(v as "employee" | "department" | "location")}>
@@ -6944,6 +7298,7 @@ function RipplingScreen(props: {
   defaultMonth: string;
   users: AssignableUser[];
   usersLoading: boolean;
+  employeeOverrides?: EmployeeOverride[];
   saved: Record<string, Employee[]>;
   onSaveForMonth: (month: string, employees: Employee[]) => void;
   onClearMonth: (month: string) => void;
@@ -6958,9 +7313,15 @@ function RipplingScreen(props: {
 
   // Re-resolved whenever the user list arrives/changes, so a file dropped before users load
   // still gets checked.
+  // Employees with a manual manager override aren't flagged — the override decides their manager.
+  const resolveWithOverrides = (rows: Employee[], month: string) => {
+    const resolved = resolveUploadManagers(rows, props.users);
+    return { ...resolved, issues: resolved.issues.filter((i) => !activeOverride(i.employeeName, month, props.employeeOverrides)?.managerId) };
+  };
   const { employees: preview, issues: managerIssues } = useMemo(
-    () => resolveUploadManagers(parsed, props.users),
-    [parsed, props.users]
+    () => resolveWithOverrides(parsed, uploadMonth),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [parsed, props.users, props.employeeOverrides, uploadMonth]
   );
   const unresolvedCount = managerIssues.filter((i) => !managerChoices[i.employeeName]).length;
 
@@ -6970,7 +7331,7 @@ function RipplingScreen(props: {
     setParsed(rows);
     setPreviewFileName(file.name);
     setManagerChoices({});
-    setShowManagerIssues(resolveUploadManagers(rows, props.users).issues.length > 0);
+    setShowManagerIssues(resolveWithOverrides(rows, uploadMonth).issues.length > 0);
   }
 
   function discardPreview() {

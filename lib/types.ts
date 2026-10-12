@@ -5,10 +5,12 @@ export type ProfileRole = "admin" | "manager" | "user";
 export type ManagerProfile = {
   id: string;
   email: string;
+  fullName?: string;     // display name entered by an admin (manager_profiles.full_name)
   role: ProfileRole;
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  linkedNameAliases?: string[]; // other names this person goes by in Rippling (e.g. a former last name in the Manager column)
   titleOverride?: string;      // overrides the role/title from Rippling on their scorecard
   supervisorId?: string;   // profile id of this manager's supervisor
   scorecardPeriodType?: "monthly" | "quarterly";
@@ -16,7 +18,7 @@ export type ManagerProfile = {
   // Client-only: users below this one in the supervisor chain, and the user list known to the
   // client — used to resolve upload-assigned team members in the reporting tree.
   descendantProfileIds?: string[];
-  knownProfiles?: { id: string; linkedEmployeeName?: string; supervisorId?: string }[];
+  knownProfiles?: { id: string; linkedEmployeeName?: string; linkedNameAliases?: string[]; supervisorId?: string }[];
 };
 
 export type Goal = {
@@ -60,6 +62,23 @@ export type Employee = {
   isExempt?: boolean;
   isManager?: boolean;
   employmentType?: string;
+  // Set when an EmployeeOverride changed this row: the values Rippling actually uploaded.
+  uploaded?: { department: string; manager?: string; assignedManagerId?: string };
+  // Set by lockMonthStartProfiles when Rippling's upload for this month changed these fields
+  // mid-month: the uploaded values, held back until the following month.
+  monthStartHeld?: Partial<Pick<Employee, "role" | "department" | "location">>;
+};
+
+// Manual department/manager correction that survives Rippling uploads. Applies to every
+// month from effectiveFrom (ISO month) onward; earlier months keep their uploaded values.
+export type EmployeeOverride = {
+  employeeName: string;
+  department?: string;
+  managerId?: string;
+  managerName?: string;
+  effectiveFrom: string;
+  updatedBy?: string;
+  updatedAt?: string;
 };
 
 // Set on Individual Ratio rows that were split by time spent in each production department
@@ -152,6 +171,7 @@ export type AppData = {
   scorecards: Scorecard[];
   goalAssignments: GoalAssignment[];
   employeeScorecardSettings: EmployeeScorecardSettings[];
+  employeeOverrides?: EmployeeOverride[];
 };
 
 export type HistoryFilters = {
@@ -160,5 +180,8 @@ export type HistoryFilters = {
   location: string;
   department: string;
   goal: string;
+  employees: string[]; // empty = all employees
+  teamStatus: "current" | "former" | "all"; // current = in the latest Rippling upload
+  periodType: "all" | "monthly" | "quarterly";
 };
 

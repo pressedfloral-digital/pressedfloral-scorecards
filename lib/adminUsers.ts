@@ -21,10 +21,12 @@ export const SCORECARD_LOCATIONS = ["Utah", "Georgia", "Remote"];
 export type AdminManagedUser = {
   id: string;
   email: string;
+  fullName?: string;
   role: ProfileRole;
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  linkedNameAliases?: string[];
   titleOverride?: string;
   supervisorId?: string;
   scorecardPeriodType?: "monthly" | "quarterly";
@@ -41,10 +43,12 @@ export type AdminManagedUser = {
 export type AdminUserPayload = {
   id?: string;
   email?: string;
+  fullName?: string;
   role: ProfileRole;
   departments: string[];
   locations: string[];
   linkedEmployeeName?: string;
+  linkedNameAliases?: string[];
   titleOverride?: string;
   supervisorId?: string;
   scorecardPeriodType?: "monthly" | "quarterly";
@@ -63,6 +67,11 @@ type NormalizeOptions = {
 type NormalizeResult =
   | { ok: true; value: AdminUserPayload }
   | { ok: false; error: string };
+
+export function parseNameAliases(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((v): v is string => typeof v === "string").map((v) => v.trim().replace(/\s+/g, " ")).filter(Boolean))];
+}
 
 export function parseProfileRole(value: unknown): ProfileRole | null {
   return PROFILE_ROLES.includes(value as ProfileRole) ? value as ProfileRole : null;
@@ -93,6 +102,10 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
   const departments = uniqueAllowedStrings(source.departments, allowedDepartments);
   const locations = uniqueAllowedStrings(source.locations, allowedLocations);
   const linkedEmployeeName = normalizeOptionalString(source.linkedEmployeeName);
+  const fullName = normalizeOptionalString(typeof source.fullName === "string" ? source.fullName.replace(/\s+/g, " ") : source.fullName);
+  // Other names the person appears under in Rippling, so upload Manager names still match.
+  const linkedNameAliases = parseNameAliases(source.linkedNameAliases)
+    .filter((alias) => alias.toLowerCase() !== (linkedEmployeeName || "").toLowerCase());
   const supervisorId = normalizeOptionalString(source.supervisorId);
   const scorecardPeriodType: "monthly" | "quarterly" = source.scorecardPeriodType === "quarterly" ? "quarterly" : "monthly";
   const companyGoalsGrant = source.companyGoalsGrant === true;
@@ -100,7 +113,7 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
   if (role === "admin") {
     return {
       ok: true,
-      value: { id, email, role, departments: [], locations: [], allDepartments: true, allLocations: true, linkedEmployeeName, scorecardPeriodType }
+      value: { id, email, fullName, role, departments: [], locations: [], allDepartments: true, allLocations: true, linkedEmployeeName, linkedNameAliases, scorecardPeriodType }
     };
   }
 
@@ -108,7 +121,7 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
     if (!linkedEmployeeName) return { ok: false, error: "Choose the employee this viewer can access." };
     return {
       ok: true,
-      value: { id, email, role, departments: [], locations: [], linkedEmployeeName, allDepartments: true, allLocations: true, scorecardPeriodType, companyGoalsGrant }
+      value: { id, email, fullName, role, departments: [], locations: [], linkedEmployeeName, linkedNameAliases, allDepartments: true, allLocations: true, scorecardPeriodType, companyGoalsGrant }
     };
   }
 
@@ -124,10 +137,12 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
     value: {
       id,
       email,
+      fullName,
       role,
       departments: allDepartments ? [] : departments,
       locations: allLocations ? [] : locations,
       linkedEmployeeName,
+      linkedNameAliases,
       supervisorId: supervisorId || undefined,
       scorecardPeriodType,
       companyGoalsGrant,
@@ -137,13 +152,18 @@ export function normalizeAdminUserPayload(input: unknown, options: NormalizeOpti
   };
 }
 
-export function adminProfileToRow(userId: string, payload: AdminUserPayload) {
+// includeAliases: only send linked_name_aliases when the column is known to exist (or there are
+// aliases to save), so saving users keeps working before the migration that adds it has run.
+export function adminProfileToRow(userId: string, payload: AdminUserPayload, options: { includeAliases?: boolean } = {}) {
+  const aliases = payload.linkedNameAliases || [];
   return {
     id: userId,
+    full_name: payload.fullName || null,
     role: payload.role,
     departments: payload.departments,
     locations: payload.locations,
     linked_employee_name: payload.linkedEmployeeName || null,
+    ...(options.includeAliases || aliases.length > 0 ? { linked_name_aliases: aliases } : {}),
     title_override: payload.titleOverride || null,
     supervisor_id: payload.supervisorId || null,
     scorecard_period_type: payload.scorecardPeriodType || "monthly",

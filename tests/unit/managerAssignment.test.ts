@@ -18,6 +18,13 @@ describe("resolveUploadManagers", () => {
     expect(employees[0].assignedManagerId).toBe("u-sarah");
   });
 
+  it("matches a CSV manager by one of the user's alternate names", () => {
+    const hannah: AssignableUser = { id: "u-hannah", email: "hannah@x.com", role: "manager", departments: [], locations: [], linkedEmployeeName: "Hannah Ruth", linkedNameAliases: ["Hannah Zander"] };
+    const { employees, issues } = resolveUploadManagers([emp("Ava", "hannah zander"), emp("Mia", "Hannah Ruth")], [hannah, tom]);
+    expect(issues).toEqual([]);
+    expect(employees.map((e) => e.assignedManagerId)).toEqual(["u-hannah", "u-hannah"]);
+  });
+
   it("flags a conflict with the team member's app supervisor", () => {
     const ava: AssignableUser = { id: "u-ava", email: "ava@x.com", role: "user", departments: [], locations: [], linkedEmployeeName: "Ava", supervisorId: "u-tom" };
     const { employees, issues } = resolveUploadManagers([emp("Ava", "Sarah Miller")], [sarah, tom, ava]);
@@ -58,5 +65,14 @@ describe("applyManagerChoices + reporting tree", () => {
   it("keeps the plain Rippling name chain working", () => {
     const rows = [emp("Lead", "Sarah Miller"), emp("Ava", "Lead")];
     expect([...getReportingTree("Sarah Miller", rows)].sort()).toEqual(["Ava", "Lead"]);
+  });
+});
+
+describe("getReportingTree aliases", () => {
+  it("follows an alternate name in the Manager column through to the user's assigned reports", () => {
+    const employees = [emp("Hannah Zander", "Sarah Ebert"), emp("Ava", "Someone Else", { assignedManagerId: "u-hannah" })];
+    const profiles = [{ id: "u-hannah", linkedEmployeeName: "Hannah Ruth", linkedNameAliases: ["Hannah Zander"] }];
+    expect([...getReportingTree("Sarah Ebert", employees, profiles)].sort()).toEqual(["Ava", "Hannah Zander"]);
+    expect([...getReportingTree("Sarah Ebert", employees, [])]).toEqual(["Hannah Zander"]);
   });
 });

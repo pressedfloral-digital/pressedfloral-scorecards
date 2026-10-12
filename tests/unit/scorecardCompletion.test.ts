@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeScorecardCompletion, scorecardHours } from "../../lib/scorecardCompletion";
+import { computeScorecardCompletion, isFinalizedForHistory, scorecardHours } from "../../lib/scorecardCompletion";
 import { opsHoursKey } from "../../lib/crossDeptRatio";
 import type { Employee, EmployeeScorecardSettings, Goal, Scorecard } from "../../lib/types";
 
@@ -159,5 +159,14 @@ describe("scorecardHours", () => {
     expect(scorecardHours(employee, {})).toBe(160);
     expect(scorecardHours(employee, undefined)).toBe(160);
     expect(scorecardHours(employee, { [opsHoursKey(employee.name)]: 0 })).toBe(0);
+  });
+});
+
+describe("isFinalizedForHistory", () => {
+  it("includes approved and no-review scorecards, excludes pending and returned", () => {
+    expect(isFinalizedForHistory({ reviewStatus: "approved" })).toBe(true);
+    expect(isFinalizedForHistory({ reviewStatus: undefined })).toBe(true);
+    expect(isFinalizedForHistory({ reviewStatus: "pending_review" })).toBe(false);
+    expect(isFinalizedForHistory({ reviewStatus: "returned" })).toBe(false);
   });
 });
