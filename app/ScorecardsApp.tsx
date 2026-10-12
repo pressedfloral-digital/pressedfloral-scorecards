@@ -1374,7 +1374,8 @@ export default function ScorecardsApp() {
     const today = new Date();
     const currentMonthVal = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
     const currentLabel = formatMonthLabel(currentMonthVal);
-    const currentActuals = { ...(appData.actuals[currentLabel] || {}), ...(appData.actuals[quarterKeyForMonth(currentMonthVal)] || {}) };
+    const monthActuals = appData.actuals[currentLabel] || {};
+    const quarterActuals = appData.actuals[quarterKeyForMonth(currentMonthVal)] || {};
     const isAdmin = roleAtLeast(effectiveProfile, "admin");
     const canSeeCompany = isAdmin || resolveCompanyGoalAccess(effectiveProfile);
     return appData.goals.filter((g) =>
@@ -1382,7 +1383,7 @@ export default function ScorecardsApp() {
       (canSeeCompany ? true : g.goalTier !== "company") &&
       (g.goalTier === "company" || g.goalTier === "department") &&
       scopedForProfile([g], effectiveProfile).length > 0 &&
-      currentActuals[metaKey("target", g)] == null
+      (g.periodType === "quarterly" ? quarterActuals : monthActuals)[metaKey("target", g)] == null
     );
   }, [appData.goals, appData.actuals, appData.rippling, effectiveProfile, adminUsers, companyGoalGrantedNames, hasCompanyGoalAccess]);
 
@@ -1391,7 +1392,8 @@ export default function ScorecardsApp() {
     const next = new Date(today.getFullYear(), today.getMonth() + 1, 1);
     const nextVal = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
     const nextLabel = formatMonthLabel(nextVal);
-    const nextActuals = { ...(appData.actuals[nextLabel] || {}), ...(appData.actuals[quarterKeyForMonth(nextVal)] || {}) };
+    const monthActuals = appData.actuals[nextLabel] || {};
+    const quarterActuals = appData.actuals[quarterKeyForMonth(nextVal)] || {};
     const isAdmin = roleAtLeast(effectiveProfile, "admin");
     const canSeeCompany = isAdmin || resolveCompanyGoalAccess(effectiveProfile);
     return appData.goals.filter((g) =>
@@ -1399,7 +1401,7 @@ export default function ScorecardsApp() {
       (canSeeCompany ? true : g.goalTier !== "company") &&
       (g.goalTier === "company" || g.goalTier === "department") &&
       scopedForProfile([g], effectiveProfile).length > 0 &&
-      nextActuals[metaKey("target", g)] == null
+      (g.periodType === "quarterly" ? quarterActuals : monthActuals)[metaKey("target", g)] == null
     );
   }, [appData.goals, appData.actuals, appData.rippling, effectiveProfile, adminUsers, companyGoalGrantedNames, hasCompanyGoalAccess]);
 
@@ -2347,18 +2349,22 @@ export default function ScorecardsApp() {
                 mountScreen("scorecard");
               }}
               onSaveTarget={saveMonthTarget}
+              // Quarterly goals live under the quarter ("Q4 2026"), not the month — the Goals
+              // table and scorecards only read quarterly values from there.
               onSaveCurrentTargetPair={(goal, target, min) => {
                 const today = new Date();
-                const period = formatMonthLabel(`${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`);
+                const iso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+                const period = goal.periodType === "quarterly" ? quarterKeyForMonth(iso) : formatMonthLabel(iso);
                 return saveMonthTargetPair(goal, period, target, min);
               }}
               onSaveTargetPair={(goal, target, min) => {
                 const today = new Date();
                 const next = new Date(today.getFullYear(), today.getMonth() + 1, 1);
-                const period = formatMonthLabel(`${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`);
+                const iso = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
+                const period = goal.periodType === "quarterly" ? quarterKeyForMonth(iso) : formatMonthLabel(iso);
                 return saveMonthTargetPair(goal, period, target, min);
               }}
-              onSaveActual={(goal, value) => saveActual(goal, value, formatMonthLabel(workMonth))}
+              onSaveActual={(goal, value) => saveActual(goal, value, goal.periodType === "quarterly" ? quarterKeyForMonth(workMonth) : formatMonthLabel(workMonth))}
               onRipplingUpload={(employees) => saveRipplingForMonth(workMonth, employees)}
             />
           )}
@@ -3913,7 +3919,6 @@ function GoalsScreen(props: {
     props.onSaveTargetPair(goal, target, min, period);
   };
 
-  const mergedActuals = { ...props.actuals, ...quarterActuals };
 
   function locLabel(loc?: string) {
     if (!loc) return "—";
@@ -4376,7 +4381,8 @@ function GoalsScreen(props: {
             <GoalEditor
               key={props.editingGoal.id}
               goal={props.editingGoal}
-              actuals={mergedActuals}
+              actuals={props.editingGoal.periodType === "quarterly" ? quarterActuals : props.actuals}
+              periodLabel={props.editingGoal.periodType === "quarterly" ? quarterKey : formatMonthLabel(props.month)}
               isAdmin={props.isAdmin}
               companyGoalAccess={props.companyGoalAccess}
               allowedDepartments={props.allowedDepartments}
@@ -4618,12 +4624,16 @@ function DrawerField({ label, required, htmlFor, className, children }: {
   );
 }
 
-function GoalEditor({ goal, actuals, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, teamEmployees, onSave, onSaveTargetPair, onCancel }: { goal: Goal; actuals: ActualsByKey; isAdmin?: boolean; companyGoalAccess?: boolean; allowedDepartments?: string[]; allowedLocations?: string[]; teamEmployees?: Employee[]; onSave: (goal: Goal) => Goal | null | void | Promise<Goal | null | void>; onSaveTargetPair: (goal: Goal, target: string, min: string) => void | Promise<void>; onCancel: () => void }) {
+function GoalEditor({ goal, actuals, periodLabel, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, teamEmployees, onSave, onSaveTargetPair, onCancel }: { goal: Goal; actuals: ActualsByKey; periodLabel?: string; isAdmin?: boolean; companyGoalAccess?: boolean; allowedDepartments?: string[]; allowedLocations?: string[]; teamEmployees?: Employee[]; onSave: (goal: Goal) => Goal | null | void | Promise<Goal | null | void>; onSaveTargetPair: (goal: Goal, target: string, min: string) => void | Promise<void>; onCancel: () => void }) {
   const canManageCompany = isAdmin || companyGoalAccess;
   const isNew = goal.name === "";
   const [draft, setDraft] = useState(goal);
-  const [target, setTarget] = useState(actuals[metaKey("target", goal)] != null ? String(actuals[metaKey("target", goal)]) : String(goal.goalValue || ""));
-  const [min, setMin] = useState(actuals[metaKey("min", goal)] != null ? String(actuals[metaKey("min", goal)]) : String(goal.minValue || ""));
+  // Only prefill with this period's own values. Prefilling with the bank default (goalValue/minValue,
+  // often last quarter's numbers) made an unset period look set, and saving the drawer for any other
+  // edit silently wrote those stale numbers into the period.
+  const periodHasTargets = actuals[metaKey("target", goal)] != null || actuals[metaKey("min", goal)] != null;
+  const [target, setTarget] = useState(actuals[metaKey("target", goal)] != null ? String(actuals[metaKey("target", goal)]) : "");
+  const [min, setMin] = useState(actuals[metaKey("min", goal)] != null ? String(actuals[metaKey("min", goal)]) : "");
   const [weightVal, setWeightVal] = useState(goal.weight != null ? String(goal.weight) : "");
 
   // Required fields that must be explicitly chosen — blank ("" or "__unset__") on new goals
@@ -4801,12 +4811,17 @@ function GoalEditor({ goal, actuals, isAdmin, companyGoalAccess, allowedDepartme
 
           <div className="grid grid-cols-2 gap-3">
             <DrawerField label="Goal" htmlFor="goal-target">
-              <Input id="goal-target" type="number" value={target} onChange={(e) => setTarget(e.target.value)} />
+              <Input id="goal-target" type="number" value={target} placeholder={goal.goalValue ? String(goal.goalValue) : undefined} onChange={(e) => setTarget(e.target.value)} />
             </DrawerField>
             <DrawerField label="Minimum" htmlFor="goal-min">
-              <Input id="goal-min" type="number" value={min} onChange={(e) => setMin(e.target.value)} />
+              <Input id="goal-min" type="number" value={min} placeholder={goal.minValue ? String(goal.minValue) : undefined} onChange={(e) => setMin(e.target.value)} />
             </DrawerField>
           </div>
+          {!isNew && !periodHasTargets && periodLabel && (
+            <p className="-mt-2 text-[12px] text-muted-foreground">
+              No goal set for {periodLabel} yet.{goal.goalValue ? " Grey numbers are the bank defaults, shown for reference only." : ""}
+            </p>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <DrawerField label="Lower is better" required>
@@ -7686,16 +7701,30 @@ function TodosScreen({
   const [draftCurrentTargets, setDraftCurrentTargets] = useState<Record<string, { target: string; min: string }>>({});
   const [draftActuals, setDraftActuals] = useState<Record<string, string>>({});
 
+  // Merge quarterly-period actuals so quarterly goals stored under "Q2 2025" are found when checking "June 2025".
+  // Quarterly goals' keys are dropped from the month bucket first, so a stray value saved under the
+  // month can't make a quarterly goal look "set" here while the Goals table (which reads only the
+  // quarter) shows it blank.
+  const quarterOnlyKeys = useMemo(() => {
+    const keysFor = (g: Goal) => [actualKey(g), metaKey("target", g), metaKey("min", g)];
+    const monthlyKeys = new Set(allGoals.filter((g) => g.periodType !== "quarterly").flatMap(keysFor));
+    return allGoals.filter((g) => g.periodType === "quarterly").flatMap(keysFor).filter((k) => !monthlyKeys.has(k));
+  }, [allGoals]);
+  function periodActualsFor(isoMonth: string): ActualsByKey {
+    const month = { ...(allActuals[formatMonthLabel(isoMonth)] || {}) };
+    for (const k of quarterOnlyKeys) delete month[k];
+    return { ...month, ...(allActuals[quarterKeyForMonth(isoMonth)] || {}) };
+  }
+
   const workMonthLabel = formatMonthLabel(workMonth);
-  // Merge quarterly-period actuals so quarterly goals stored under "Q2 2025" are found when checking "June 2025"
-  const workActuals = { ...(allActuals[workMonthLabel] || {}), ...(allActuals[quarterKeyForMonth(workMonth)] || {}) };
+  const workActuals = periodActualsFor(workMonth);
 
   const currentMonthValue = useMemo(() => {
     const today = new Date();
     return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
   }, []);
   const currentMonthLabel = useMemo(() => formatMonthLabel(currentMonthValue), [currentMonthValue]);
-  const currentActuals = { ...(allActuals[currentMonthLabel] || {}), ...(allActuals[quarterKeyForMonth(currentMonthValue)] || {}) };
+  const currentActuals = periodActualsFor(currentMonthValue);
 
   const nextMonthValue = useMemo(() => {
     const today = new Date();
@@ -7703,7 +7732,7 @@ function TodosScreen({
     return `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
   }, []);
   const nextMonthLabel = useMemo(() => formatMonthLabel(nextMonthValue), [nextMonthValue]);
-  const nextActuals = { ...(allActuals[nextMonthLabel] || {}), ...(allActuals[quarterKeyForMonth(nextMonthValue)] || {}) };
+  const nextActuals = periodActualsFor(nextMonthValue);
 
   const isAdmin = roleAtLeast(profile, "admin");
   const canSeeCompany = isAdmin || companyGoalAccess;
