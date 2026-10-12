@@ -58,6 +58,13 @@ describe("supabase mappers", () => {
       .toEqual({ "department|Utah|Design|Rework": 4 });
   });
 
+  it("keeps last-day proration rows under their own keys", () => {
+    expect(actualsFromRows([
+      { goal_tier: "__meta__", location: null, department: null, goal_name: "__prorate_day__|Ava Jensen", actual_value: 15 },
+      { goal_tier: "__meta__", location: null, department: null, goal_name: "__prorate_qday__|Ava Jensen", actual_value: 77 }
+    ])).toEqual({ "__prorate_day__|Ava Jensen": 15, "__prorate_qday__|Ava Jensen": 77 });
+  });
+
   it("round trips scorecards through legacy table columns", () => {
     const row = scorecardToRow(fixtureScorecards[0]);
     expect(row.employee_name).toBe("Ava Jensen");
