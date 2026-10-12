@@ -14,7 +14,7 @@ import {
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth } from "../lib/fixtures";
 import { buildCanonicalNameMap } from "../lib/employeeIdentity";
-import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
+import { currentMonthValue, formatMonthLabel, monthValueFromLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
 import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
@@ -291,6 +291,31 @@ function quarterKeyForMonth(isoMonth: string): string {
   const [y, m] = isoMonth.split("-").map(Number);
   if (!y || !m) return "";
   return `Q${Math.ceil(m / 3)} ${y}`;
+}
+
+// Latest last day ("YYYY-MM-DD") set on any of the employee's scorecards — monthly cards store
+// day-of-month under the month, quarterly cards day-of-quarter under the quarter.
+function employeeLastDay(allActuals: Record<string, ActualsByKey>, employeeName: string): string | null {
+  let latest: string | null = null;
+  for (const [period, actuals] of Object.entries(allActuals)) {
+    const quarterly = /^Q\d \d{4}$/.test(period);
+    const day = actuals[`${quarterly ? "__prorate_qday__" : "__prorate_day__"}|${employeeName}`];
+    if (day == null) continue;
+    const startMonth = quarterly ? quarterToIsoMonth(period) : monthValueFromLabel(period);
+    const [y, m] = startMonth.split("-").map(Number);
+    if (!y || !m) continue;
+    const d = new Date(y, m - 1, Math.round(day), 12);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    if (!latest || iso > latest) latest = iso;
+  }
+  return latest;
+}
+
+// True when the employee's last day falls before this month starts, so they get no scorecard
+// for it (or any later month/quarter) even while later views fall back to an older roster.
+function leftBeforeMonth(allActuals: Record<string, ActualsByKey>, employeeName: string, isoMonth: string): boolean {
+  const lastDay = employeeLastDay(allActuals, employeeName);
+  return lastDay != null && lastDay < `${isoMonth}-01`;
 }
 
 function quarterToIsoMonth(quarter: string): string {
@@ -5405,6 +5430,7 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
+    if (singleMonthMode && leftBeforeMonth(props.allActuals, e.name, selectedMonth)) return false;
     if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
     if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
@@ -5772,6 +5798,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
+                  if (leftBeforeMonth(props.allActuals, e.name, m)) return false;
                   if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
