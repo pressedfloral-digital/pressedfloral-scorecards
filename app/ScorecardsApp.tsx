@@ -294,6 +294,13 @@ function quarterKeyForMonth(isoMonth: string): string {
   return `Q${Math.ceil(m / 3)} ${y}`;
 }
 
+// First month ("YYYY-MM") of the quarter containing isoMonth.
+function quarterStartMonth(isoMonth: string): string {
+  const [y, m] = isoMonth.split("-").map(Number);
+  if (!y || !m) return isoMonth;
+  return `${y}-${String(Math.floor((m - 1) / 3) * 3 + 1).padStart(2, "0")}`;
+}
+
 // Latest last day ("YYYY-MM-DD") set on any of the employee's scorecards — monthly cards store
 // day-of-month under the month, quarterly cards day-of-quarter under the quarter.
 function employeeLastDay(allActuals: Record<string, ActualsByKey>, employeeName: string): string | null {
@@ -1318,6 +1325,19 @@ export default function ScorecardsApp() {
     }
     return result;
   }, [appData.rippling]);
+
+  // Latest Rippling rows plus anyone entered by hand who isn't in Rippling — the people a goal
+  // can be assigned to from Goals & Actuals. A Rippling row wins over a manual one.
+  const latestTeamEmployees = useMemo(() => {
+    const seen = new Set(latestRipplingEmployees.map((e) => e.name));
+    const result = [...latestRipplingEmployees];
+    for (const period of Object.keys(appData.manualEmployees || {}).sort().reverse()) {
+      for (const emp of appData.manualEmployees?.[period] || []) {
+        if (!seen.has(emp.name)) { seen.add(emp.name); result.push(emp); }
+      }
+    }
+    return result;
+  }, [latestRipplingEmployees, appData.manualEmployees]);
 
   // Rippling rows with title/department/location locked to day 1 of each month — what every
   // scorecard is built from, so a mid-month change only takes effect the following month.
@@ -2350,7 +2370,7 @@ export default function ScorecardsApp() {
               actuals={appData.actuals[formatMonthLabel(bankMonth)] || {}}
               allActuals={appData.actuals}
               editingGoal={editingGoal}
-              teamEmployees={scopedEmployeesForProfile(latestRipplingEmployees, effectiveProfile, allRipplingEmployees)}
+              teamEmployees={scopedEmployeesForProfile(latestTeamEmployees, effectiveProfile, allRipplingEmployees)}
               allGoals={appData.goals}
               scorecards={appData.scorecards}
               onMonth={setBankMonth}
@@ -4394,7 +4414,7 @@ function GoalsScreen(props: {
                     <DropdownMenuItem disabled>Set goal first</DropdownMenuItem>
                   ) : null}
                   {canEdit && goal.goalTier === "company" && canManageCompany && props.onAssignGoal && (
-                    <DropdownMenuItem onClick={() => { setAssigningGoal(goal); setAssignEmployeeNames([]); setAssignStartMonth(props.month); }}>
+                    <DropdownMenuItem onClick={() => { setAssigningGoal(goal); setAssignEmployeeNames([]); setAssignStartMonth(goal.periodType === "quarterly" ? quarterStartMonth(props.month) : props.month); }}>
                       Add to individual scorecard
                     </DropdownMenuItem>
                   )}
@@ -4795,8 +4815,20 @@ function GoalsScreen(props: {
                 <SelectTrigger className="h-8 text-[12.5px]"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {(() => {
-                    const opts: string[] = [];
                     const now = new Date();
+                    if (assigningGoal?.periodType === "quarterly") {
+                      // Quarterly goals start on a quarter's first month — the month quarterly scorecards are keyed on.
+                      const opts: string[] = [];
+                      const qStart = Math.floor(now.getMonth() / 3) * 3;
+                      for (let i = -4; i <= 2; i++) {
+                        const d = new Date(now.getFullYear(), qStart + i * 3, 1);
+                        opts.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+                      }
+                      return opts.reverse().map((m) => (
+                        <SelectItem key={m} value={m} className="text-[12.5px]">{quarterKeyForMonth(m)}</SelectItem>
+                      ));
+                    }
+                    const opts: string[] = [];
                     for (let i = -11; i <= 2; i++) {
                       const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
                       opts.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
@@ -4807,7 +4839,7 @@ function GoalsScreen(props: {
                   })()}
                 </SelectContent>
               </Select>
-              <p className="text-[11.5px] text-muted-foreground">Goal will appear on scorecards from this month forward.</p>
+              <p className="text-[11.5px] text-muted-foreground">Goal will appear on scorecards from this {assigningGoal?.periodType === "quarterly" ? "quarter" : "month"} forward.</p>
             </div>
             {assignEligibleEmployees.length > 0 ? (
               <div className="flex flex-col gap-2">
@@ -6145,6 +6177,7 @@ function LiveScorecardCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoOpen, autoOpenNonce]);
   const [creatingGoal, setCreatingGoal] = useState<Goal | null>(null);
+  const [addingGoals, setAddingGoals] = useState(false);
   const ratioTierTargets = React.useContext(RatioTierTargetsContext);
   const effectivePeriodType = forcePeriodType ?? globalPeriodType;
 
@@ -6403,6 +6436,20 @@ function LiveScorecardCard({
     const isExcludedAssignedCompanyGoal = g.goalTier === "company" && baseGoals.some((bg) => bg.id === g.id);
     if (!isGoalApplicable(g) && !isExcludedAssignedCompanyGoal) return false;
     return cardPeriodType === "quarterly" ? g.periodType === "quarterly" : g.periodType !== "quarterly";
+  });
+  // Every other goal already in the bank for this period type, so a manager can search the whole
+  // bank from the card. Company goals need company-goal access; department/individual goals stay
+  // within the viewer's own department/location scope (unrestricted for admins).
+  const suggestedIds = new Set(availableToAdd.map((g) => g.id));
+  const otherGoalsToAdd = allGoals.filter((g) => {
+    if (goalIds.includes(g.id) || suggestedIds.has(g.id)) return false;
+    if (!goalActiveForMonth(g, isoMonth)) return false;
+    if (cardPeriodType === "quarterly" ? g.periodType !== "quarterly" : g.periodType === "quarterly") return false;
+    if (g.goalTier === "company") return !!(isAdmin || companyGoalAccess);
+    if (isAdmin) return true;
+    const deptOk = !allowedDepartments?.length || !g.department || allowedDepartments.includes(g.department);
+    const locOk = !allowedLocations?.length || !g.location || allowedLocations.includes(g.location);
+    return deptOk && locOk;
   });
   const achColor = liveScorecard.weightedAchievement >= 100 ? "#2D6B1A" : "var(--brick)";
   const hasAnyActual = liveScorecard.goals.some((g) => g.actual != null);
@@ -6688,38 +6735,34 @@ function LiveScorecardCard({
           )}
 
           <div className="flex flex-wrap items-center gap-2.5 border-t border-border px-4 py-3" onClick={(e) => e.stopPropagation()}>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="sm" className="text-[12px]">+ Add goal</Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" side="top" className="max-h-[240px] w-56 overflow-y-auto">
-                <DropdownMenuItem className="text-[12.5px] font-medium" onSelect={() => {
-                  setCreatingGoal({
-                    ...emptyGoal,
-                    id: `goal-${Date.now()}`,
-                    goalTier: "individual",
-                    location: employee.location,
-                    department: employee.department,
-                    role: employee.role || undefined,
-                    periodType: cardPeriodType,
-                    startMonth: isoMonth,
-                    name: "",
-                  });
-                }}>
-                  Create new goal…
-                </DropdownMenuItem>
-                {availableToAdd.length > 0 && <DropdownMenuSeparator />}
-                {availableToAdd.map((g) => (
-                  <DropdownMenuItem key={g.id} onSelect={() => {
-                    const next = [...goalIds, g.id];
-                    setGoalIds(next);
-                    saveSettingsNow(next, weightOverrides, cardPeriodType);
-                  }} className="text-[12.5px]">
-                    <span className="flex items-center gap-1.5">{g.name}<GoalScopeTags location={g.location} department={g.department} /></span>
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <Button variant="outline" size="sm" className="text-[12px]" onClick={() => setAddingGoals(true)}>+ Add goal</Button>
+            <AddGoalSheet
+              open={addingGoals}
+              onOpenChange={setAddingGoals}
+              employeeName={employee.name}
+              periodType={cardPeriodType}
+              periodLabel={activeMonth}
+              suggested={availableToAdd}
+              others={otherGoalsToAdd}
+              onAdd={(ids) => {
+                const next = [...goalIds, ...ids.filter((id) => !goalIds.includes(id))];
+                setGoalIds(next);
+                saveSettingsNow(next, weightOverrides, cardPeriodType);
+              }}
+              onCreateNew={() => {
+                setCreatingGoal({
+                  ...emptyGoal,
+                  id: `goal-${Date.now()}`,
+                  goalTier: "individual",
+                  location: employee.location,
+                  department: employee.department,
+                  role: employee.role || undefined,
+                  periodType: cardPeriodType,
+                  startMonth: cardPeriodType === "quarterly" ? quarterStartMonth(isoMonth) : isoMonth,
+                  name: "",
+                });
+              }}
+            />
 
             <Sheet open={!!creatingGoal} onOpenChange={(open) => { if (!open) setCreatingGoal(null); }}>
               <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-md">
@@ -6793,6 +6836,106 @@ function LiveScorecardCard({
         </>
       )}
     </div>
+  );
+}
+
+// "+ Add goal" from a team scorecard card: search the goal bank for this period type, tick one or
+// more goals, and add them — or start a brand-new goal for this person.
+function AddGoalSheet({ open, onOpenChange, employeeName, periodType, periodLabel, suggested, others, onAdd, onCreateNew }: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  employeeName: string;
+  periodType: "monthly" | "quarterly";
+  periodLabel: string;
+  suggested: Goal[];
+  others: Goal[];
+  onAdd: (goalIds: string[]) => void;
+  onCreateNew: () => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  useEffect(() => { if (open) { setSearch(""); setSelected([]); } }, [open]);
+
+  const q = search.trim().toLowerCase();
+  const matches = (g: Goal) => !q || [g.name, g.department, g.location, g.employeeName, g.goalTier].some((v) => v?.toLowerCase().includes(q));
+  const byName = (a: Goal, b: Goal) => a.name.localeCompare(b.name);
+  const groups = [
+    { title: `Suggested for ${employeeName}`, goals: suggested.filter(matches).sort(byName) },
+    { title: "Company goals", goals: others.filter((g) => g.goalTier === "company" && matches(g)).sort(byName) },
+    { title: "Other department & individual goals", goals: others.filter((g) => g.goalTier !== "company" && matches(g)).sort(byName) },
+  ].filter((group) => group.goals.length > 0);
+  const periodWord = periodType === "quarterly" ? "quarterly" : "monthly";
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-md">
+        <SheetHeader className="border-b px-5 py-4">
+          <SheetTitle>Add goals</SheetTitle>
+          <SheetDescription>{employeeName} · <span className="capitalize">{periodWord}</span> · {periodLabel}</SheetDescription>
+        </SheetHeader>
+        <div className="flex flex-col gap-3 border-b px-5 py-3">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              autoFocus
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={`Search ${periodWord} goals…`}
+              aria-label={`Search ${periodWord} goals`}
+              className="h-8 pl-8 text-[12.5px]"
+            />
+          </div>
+          <Button variant="outline" size="sm" className="justify-start text-[12.5px]" onClick={() => { onOpenChange(false); onCreateNew(); }}>
+            + Create new {periodWord} goal…
+          </Button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-3">
+          {groups.length === 0 ? (
+            <p className="py-8 text-center text-[12.5px] text-muted-foreground">
+              {q ? `No ${periodWord} goals match “${search.trim()}”.` : `No other ${periodWord} goals in the bank for ${periodLabel}.`}
+            </p>
+          ) : groups.map((group) => (
+            <div key={group.title} className="mb-4">
+              <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{group.title}</div>
+              <div className="divide-y rounded-md border">
+                {group.goals.map((g) => {
+                  const checked = selected.includes(g.id);
+                  return (
+                    <label key={g.id} data-slot="goal-option" className="flex cursor-pointer items-start gap-3 px-3 py-2.5 transition-colors hover:bg-accent/50">
+                      <Checkbox
+                        className="mt-0.5"
+                        checked={checked}
+                        onCheckedChange={(v) => setSelected(v ? [...selected, g.id] : selected.filter((id) => id !== g.id))}
+                      />
+                      <span className="flex min-w-0 flex-1 flex-col gap-1 select-none">
+                        <span className="text-[12.5px] leading-snug">{g.name}</span>
+                        <span className="flex flex-wrap items-center gap-1.5">
+                          <TierBadge tier={g.goalTier} />
+                          <GoalScopeTags location={g.location} department={g.department} />
+                          {g.employeeName && <span className="text-[11px] text-muted-foreground">{g.employeeName}</span>}
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+        <SheetFooter className="flex gap-2 border-t px-5 py-4">
+          <SheetClose asChild>
+            <Button variant="outline" className="flex-1">Cancel</Button>
+          </SheetClose>
+          <Button
+            className="flex-1"
+            disabled={selected.length === 0}
+            onClick={() => { onAdd(selected); onOpenChange(false); }}
+          >
+            {selected.length > 0 ? `Add ${selected.length} goal${selected.length > 1 ? "s" : ""}` : "Add goals"}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
 
