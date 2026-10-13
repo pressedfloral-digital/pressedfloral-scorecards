@@ -70,6 +70,8 @@ export type Employee = {
   // Entered by hand (manual_employees) for a period they aren't in the Rippling upload for.
   // Pay and hours cover the whole scorecard period, so cards use them as-is.
   manual?: boolean;
+  // Period (ISO month) the manual entry in effect was made for; later periods carry it forward.
+  manualFrom?: string;
 };
 
 // Manual department/manager correction that survives Rippling uploads. Applies to every

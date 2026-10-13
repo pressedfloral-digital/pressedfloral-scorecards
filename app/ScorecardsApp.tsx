@@ -14,6 +14,7 @@ import {
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth } from "../lib/fixtures";
 import { buildCanonicalNameMap } from "../lib/employeeIdentity";
+import { lastDayStillApplies, manualEmployeesForPeriod } from "../lib/manualEmployees";
 import { currentMonthValue, formatMonthLabel, monthValueFromLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
 import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
@@ -2049,7 +2050,7 @@ export default function ScorecardsApp() {
       const result = await sb.from("manual_employees").upsert(manualEmployeeToRow(isoMonth, employee, currentUserEmail), { onConflict: "period,full_name" });
       if (result.error) { showSupabaseError(result.error, "Details could not be saved."); return false; }
     }
-    const saved: Employee = { ...employee, id: `manual:${employee.name}`, manual: true };
+    const saved: Employee = { ...employee, id: `manual:${employee.name}`, manual: true, manualFrom: isoMonth };
     setAppData((current) => {
       const manualEmployees = { ...(current.manualEmployees || {}) };
       manualEmployees[isoMonth] = [...(manualEmployees[isoMonth] || []).filter((e) => e.name !== employee.name), saved];
@@ -2226,13 +2227,14 @@ export default function ScorecardsApp() {
     const employee = name ? upload.find((e) => e.name === name) : undefined;
     if (!employee) {
       // Prefill from their manual details, else their most recent Rippling row or scorecard.
-      const manual = (appData.manualEmployees?.[isoMonth] || []).find((e) => e.name === name);
+      // Their entry for this period, or the latest earlier one carried forward.
+      const manual = manualEmployeesForPeriod(appData.manualEmployees, isoMonth).find((e) => e.name === name);
       const lastRow = latestRipplingEmployees.find((e) => e.name === name);
       const lastScorecard = [...appData.scorecards].filter((sc) => sc.employeeName === name).sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""))[0];
       const prefill: Employee = manual ?? (lastRow
         ? { ...lastRow, grossEarnings: undefined, hoursWorked: undefined }
         : { id: `manual:${name}`, name, role: lastScorecard?.role || "", department: lastScorecard?.department || "", location: lastScorecard?.location || "", manager: lastScorecard?.manager, payType: lastScorecard?.payType || "hourly", hourlyRate: lastScorecard?.hourlyRate, annualPay: lastScorecard?.annualPay });
-      return { ...base, needsDetails: true, employee: prefill, hasManualDetails: !!manual };
+      return { ...base, needsDetails: true, employee: prefill, hasManualDetails: manual?.manualFrom === isoMonth };
     }
     if (isDeactivatedForMonth(appData.actuals, name, isoMonth)) return { ...base, employee, blocked: `deactivated for ${periodLabel}` };
     const goals = goalsForBuild(employee, isoMonth);
@@ -5369,7 +5371,7 @@ function ScorecardsScreen(props: {
 
   // People entered by hand for a period join that period's list; a Rippling row for them wins.
   function withManualEmployees(isoMonth: string, employees: Employee[]): Employee[] {
-    const manual = (props.manualEmployees?.[isoMonth] || []).filter((m) => !employees.some((e) => e.name === m.name));
+    const manual = manualEmployeesForPeriod(props.manualEmployees, isoMonth).filter((m) => !employees.some((e) => e.name === m.name));
     return manual.length ? [...employees, ...manual] : employees;
   }
 
@@ -5386,7 +5388,7 @@ function ScorecardsScreen(props: {
   function overrideControlsFor(employeeName: string, isoMonth: string) {
     if (!props.isAdmin || !props.onSaveEmployeeOverride) return undefined;
     // Manually entered people are edited from Build Scorecard on the Users page, not as Rippling corrections.
-    if ((props.manualEmployees?.[isoMonth] || []).some((e) => e.name === employeeName) && !(props.rippling[isoMonth] || []).some((e) => e.name === employeeName)) return undefined;
+    if (manualEmployeesForPeriod(props.manualEmployees, isoMonth).some((e) => e.name === employeeName) && !(props.rippling[isoMonth] || []).some((e) => e.name === employeeName)) return undefined;
     return {
       managerOptions: props.managerOptions || [],
       override: props.employeeOverrides?.find((o) => o.employeeName === employeeName),
@@ -5453,8 +5455,8 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
-    // Someone entered manually for the period is working it (e.g. a rehire), whatever an old last day says.
-    if (singleMonthMode && !e.manual && leftBeforeMonth(props.allActuals, e.name, selectedMonth)) return false;
+    // A manual entry after an old last day (e.g. a rehire) keeps them visible.
+    if (singleMonthMode && leftBeforeMonth(props.allActuals, e.name, selectedMonth) && lastDayStillApplies(e, employeeLastDay(props.allActuals, e.name)!)) return false;
     if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
     if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
@@ -5822,7 +5824,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
-                  if (!e.manual && leftBeforeMonth(props.allActuals, e.name, m)) return false;
+                  if (leftBeforeMonth(props.allActuals, e.name, m) && lastDayStillApplies(e, employeeLastDay(props.allActuals, e.name)!)) return false;
                   if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {

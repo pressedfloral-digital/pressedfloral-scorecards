@@ -126,7 +126,7 @@ export function employeeToRow(period: string, employee: Employee) {
 }
 
 export function manualEmployeeFromRow(row: Record<string, any>): Employee {
-  return { ...employeeFromRow(row), id: `manual:${row.full_name}`, manual: true };
+  return { ...employeeFromRow(row), id: `manual:${row.full_name}`, manual: true, manualFrom: row.period };
 }
 
 export function manualEmployeeToRow(period: string, employee: Employee, createdBy: string) {
