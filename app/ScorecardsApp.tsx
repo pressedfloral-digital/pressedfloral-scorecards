@@ -5445,7 +5445,8 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
-    if (singleMonthMode && leftBeforeMonth(props.allActuals, e.name, selectedMonth)) return false;
+    // Someone entered manually for the period is working it (e.g. a rehire), whatever an old last day says.
+    if (singleMonthMode && !e.manual && leftBeforeMonth(props.allActuals, e.name, selectedMonth)) return false;
     if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
     if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
@@ -5813,7 +5814,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
-                  if (leftBeforeMonth(props.allActuals, e.name, m)) return false;
+                  if (!e.manual && leftBeforeMonth(props.allActuals, e.name, m)) return false;
                   if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
