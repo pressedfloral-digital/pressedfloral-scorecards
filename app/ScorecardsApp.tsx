@@ -3287,7 +3287,12 @@ function ManualEmployeeForm(props: {
   const isQuarterly = props.target.periodType === "quarterly";
   const name = draft.name.trim().replace(/\s+/g, " ");
   const managers = props.users.filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin") && u.linkedEmployeeName !== name);
-  const num = (v: string) => (v.trim() === "" || isNaN(Number(v)) ? undefined : Number(v));
+  // Accepts "$72,000.00" as well as "72000".
+  const num = (v: string) => {
+    const cleaned = v.replace(/[$,\s]/g, "");
+    return cleaned === "" || isNaN(Number(cleaned)) ? undefined : Number(cleaned);
+  };
+  const isSalary = draft.payType === "salary";
   const manager = managers.find((u) => u.id === draft.managerId);
   const employee: Employee = {
     id: `manual:${name}`,
@@ -3300,7 +3305,8 @@ function ManualEmployeeForm(props: {
     payType: draft.payType as PayType,
     hourlyRate: draft.payType === "hourly" ? num(draft.hourlyRate) : undefined,
     annualPay: draft.payType === "salary" ? num(draft.annualPay) : undefined,
-    hoursWorked: num(draft.hoursWorked),
+    // Salaried pay is annual pay ÷ 12 (or ÷ 4), so hours don't apply.
+    hoursWorked: isSalary ? undefined : num(draft.hoursWorked),
     grossEarnings: num(draft.grossEarnings),
     manual: true,
   };
@@ -3309,7 +3315,7 @@ function ManualEmployeeForm(props: {
     !employee.role && "role",
     !employee.department && "department",
     !employee.location && "location",
-    employee.hoursWorked == null && "hours worked",
+    !isSalary && employee.hoursWorked == null && "hours worked",
     employee.grossEarnings == null && (draft.payType === "hourly" ? employee.hourlyRate == null : employee.annualPay == null) && (draft.payType === "hourly" ? "hourly rate or gross earnings" : "annual pay or gross earnings"),
   ].filter(Boolean) as string[];
   const goalCount = employee.role && employee.department ? props.goalsFor(employee).length : null;
@@ -3371,9 +3377,11 @@ function ManualEmployeeForm(props: {
         )}
       </div>
       <div className="flex flex-wrap gap-3">
-        <DrawerField label={`Hours worked (${isQuarterly ? "quarter" : "month"})`} htmlFor="manual-hours" className="min-w-[8rem] flex-1">
-          <Input id="manual-hours" inputMode="decimal" value={draft.hoursWorked} onChange={(e) => set({ hoursWorked: e.target.value })} placeholder="0" />
-        </DrawerField>
+        {!isSalary && (
+          <DrawerField label={`Hours worked (${isQuarterly ? "quarter" : "month"})`} htmlFor="manual-hours" className="min-w-[8rem] flex-1">
+            <Input id="manual-hours" inputMode="decimal" value={draft.hoursWorked} onChange={(e) => set({ hoursWorked: e.target.value })} placeholder="0" />
+          </DrawerField>
+        )}
         <DrawerField label={`Gross earnings (${isQuarterly ? "quarter" : "month"}, $)`} htmlFor="manual-gross" className="min-w-[8rem] flex-1">
           <Input id="manual-gross" inputMode="decimal" value={draft.grossEarnings} onChange={(e) => set({ grossEarnings: e.target.value })} placeholder="Optional" />
         </DrawerField>
