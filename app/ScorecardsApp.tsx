@@ -14,7 +14,7 @@ import {
 import { downloadCsv, parseRipplingEmployees, scorecardsToCsv, toCsv } from "../lib/csv";
 import { fixtureData, fixtureManager, fixtureMonth } from "../lib/fixtures";
 import { buildCanonicalNameMap } from "../lib/employeeIdentity";
-import { currentMonthValue, formatMonthLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
+import { currentMonthValue, formatMonthLabel, monthValueFromLabel, nextMonthValue as nextIsoMonth } from "../lib/periods";
 import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
@@ -291,6 +291,31 @@ function quarterKeyForMonth(isoMonth: string): string {
   const [y, m] = isoMonth.split("-").map(Number);
   if (!y || !m) return "";
   return `Q${Math.ceil(m / 3)} ${y}`;
+}
+
+// Latest last day ("YYYY-MM-DD") set on any of the employee's scorecards — monthly cards store
+// day-of-month under the month, quarterly cards day-of-quarter under the quarter.
+function employeeLastDay(allActuals: Record<string, ActualsByKey>, employeeName: string): string | null {
+  let latest: string | null = null;
+  for (const [period, actuals] of Object.entries(allActuals)) {
+    const quarterly = /^Q\d \d{4}$/.test(period);
+    const day = actuals[`${quarterly ? "__prorate_qday__" : "__prorate_day__"}|${employeeName}`];
+    if (day == null) continue;
+    const startMonth = quarterly ? quarterToIsoMonth(period) : monthValueFromLabel(period);
+    const [y, m] = startMonth.split("-").map(Number);
+    if (!y || !m) continue;
+    const d = new Date(y, m - 1, Math.round(day), 12);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    if (!latest || iso > latest) latest = iso;
+  }
+  return latest;
+}
+
+// True when the employee's last day falls before this month starts, so they get no scorecard
+// for it (or any later month/quarter) even while later views fall back to an older roster.
+function leftBeforeMonth(allActuals: Record<string, ActualsByKey>, employeeName: string, isoMonth: string): boolean {
+  const lastDay = employeeLastDay(allActuals, employeeName);
+  return lastDay != null && lastDay < `${isoMonth}-01`;
 }
 
 function quarterToIsoMonth(quarter: string): string {
@@ -1713,9 +1738,11 @@ export default function ScorecardsApp() {
     showToast(isCurrentlyInactive ? "Goal activated for this month" : "Goal deactivated for this month");
   }
 
-  async function saveProrateDay(employeeName: string, isoMonth: string, day: number | null) {
-    const period = formatMonthLabel(isoMonth);
-    const key = `__prorate_day__|${employeeName}`;
+  async function saveProrateDay(employeeName: string, isoMonth: string, day: number | null, periodType: "monthly" | "quarterly" = "monthly") {
+    // Monthly cards store the last day as day-of-month under the month; quarterly cards store it
+    // as day-of-quarter under the quarter (a separate key, since card actuals merge both buckets).
+    const period = periodType === "quarterly" ? quarterKeyForMonth(isoMonth) : formatMonthLabel(isoMonth);
+    const key = `${periodType === "quarterly" ? "__prorate_qday__" : "__prorate_day__"}|${employeeName}`;
     const nextActuals = { ...(appData.actuals[period] || {}), [key]: day };
     if (!isFixture && sb) {
       const result = await sb.from("actuals").upsert({
@@ -5254,7 +5281,7 @@ function ScorecardsScreen(props: {
   onScorecardSettingsChange: (employeeName: string, periodType: "monthly" | "quarterly", patch: { excludedGoalIds: string[]; addedGoalIds: string[]; weightOverrides: Record<string, number> }) => void;
   onSaveGoal: (goal: Goal) => Promise<Goal | null>;
   onSaveTargetPair: (goal: Goal, period: string, target: string, min: string) => void;
-  onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
+  onSaveProrate: (employeeName: string, isoMonth: string, day: number | null, periodType?: "monthly" | "quarterly") => void;
   // Admin-only manual department/manager corrections (see saveEmployeeOverride).
   employeeOverrides?: EmployeeOverride[];
   manualEmployees?: Record<string, Employee[]>;
@@ -5418,6 +5445,7 @@ function ScorecardsScreen(props: {
     if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
     if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
+    if (singleMonthMode && leftBeforeMonth(props.allActuals, e.name, selectedMonth)) return false;
     if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
     if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
@@ -5785,6 +5813,7 @@ function ScorecardsScreen(props: {
                   if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
+                  if (leftBeforeMonth(props.allActuals, e.name, m)) return false;
                   if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
@@ -6054,7 +6083,7 @@ function LiveScorecardCard({
   onReturn: (scorecardId: string, note: string) => void;
   onSaveGoal: (goal: Goal) => Promise<Goal | null>;
   onSaveTargetPair: (goal: Goal, period: string, target: string, min: string) => void;
-  onSaveProrate: (employeeName: string, isoMonth: string, day: number | null) => void;
+  onSaveProrate: (employeeName: string, isoMonth: string, day: number | null, periodType?: "monthly" | "quarterly") => void;
   overrideControls?: {
     managerOptions: { id: string; label: string }[];
     override?: EmployeeOverride;
@@ -6108,16 +6137,9 @@ function LiveScorecardCard({
   const ratioTierTargets = React.useContext(RatioTierTargetsContext);
   const effectivePeriodType = forcePeriodType ?? globalPeriodType;
 
-  // Proration: optional last-day date input, stored as day-of-month in actuals
-  const prorateDayKey = `__prorate_day__|${employee.name}`;
-  const storedProrateDay = periodActuals[prorateDayKey];
-  const [lastDayInput, setLastDayInput] = useState<string>(() => {
-    if (storedProrateDay != null) {
-      const d = String(Math.round(storedProrateDay)).padStart(2, "0");
-      return `${isoMonth}-${d}`;
-    }
-    return "";
-  });
+  // Proration: optional last-day date input. Edits are held per period type so switching a
+  // card between monthly and quarterly shows that period's own last day.
+  const [lastDayEdits, setLastDayEdits] = useState<Partial<Record<"monthly" | "quarterly", string>>>({});
   const [cardPeriodType, setCardPeriodType] = useState<"monthly" | "quarterly">(effectivePeriodType);
   const initSettings = settingsForPeriod(effectivePeriodType);
   const [goalIds, setGoalIds] = useState<string[]>(() => computeGoalIds(globalPeriodType, initSettings));
@@ -6329,11 +6351,23 @@ function LiveScorecardCard({
 
   const liveScorecard = buildScorecard({ employee: activeEmployee, month: activeMonth, periodType: cardPeriodType, goals: currentGoals, submittedBy: currentUserEmail, payrollAvailable: activePayrollAvailable });
 
-  // Proration factor — 1 unless a last day is set
+  // Proration factor — 1 unless a last day is set. The window is the card's month, or the whole
+  // quarter on a quarterly card; the stored value is the day number within that window.
   const [py, pm] = isoMonth.split("-").map(Number);
-  const totalDaysInMonth = (py && pm) ? new Date(py, pm, 0).getDate() : 30;
+  const prorateStartMonth = cardPeriodType === "quarterly" && pm ? Math.floor((pm - 1) / 3) * 3 + 1 : pm;
+  const prorateMonthCount = cardPeriodType === "quarterly" ? 3 : 1;
+  const prorateStart = (py && pm) ? new Date(py, prorateStartMonth - 1, 1, 12) : null;
+  const prorateEnd = (py && pm) ? new Date(py, prorateStartMonth - 1 + prorateMonthCount, 0, 12) : null;
+  const toIsoDate = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const dayOfWindow = (d: Date) => prorateStart ? Math.round((d.getTime() - prorateStart.getTime()) / 86400000) + 1 : d.getDate();
+  const totalDaysInMonth = prorateEnd ? dayOfWindow(prorateEnd) : 30;
+  const storedProrateDay = periodActuals[`${cardPeriodType === "quarterly" ? "__prorate_qday__" : "__prorate_day__"}|${employee.name}`];
+  const storedLastDay = storedProrateDay != null && prorateStart
+    ? toIsoDate(new Date(prorateStart.getFullYear(), prorateStart.getMonth(), Math.round(storedProrateDay), 12))
+    : "";
+  const lastDayInput = lastDayEdits[cardPeriodType] ?? storedLastDay;
   const lastDayDate = lastDayInput ? new Date(lastDayInput + "T12:00:00") : null;
-  const proratedDays = lastDayDate ? lastDayDate.getDate() : null;
+  const proratedDays = lastDayDate ? dayOfWindow(lastDayDate) : null;
   const prorationFactor = proratedDays != null ? proratedDays / totalDaysInMonth : 1;
   const proratedBonus = liveScorecard.bonusAmount * prorationFactor;
 
@@ -6444,13 +6478,13 @@ function LiveScorecardCard({
               <Input
                 type="date"
                 value={lastDayInput}
-                min={`${isoMonth}-01`}
-                max={`${isoMonth}-${String(totalDaysInMonth).padStart(2, "0")}`}
+                min={prorateStart ? toIsoDate(prorateStart) : undefined}
+                max={prorateEnd ? toIsoDate(prorateEnd) : undefined}
                 onChange={(e) => {
                   const val = e.target.value;
-                  setLastDayInput(val);
-                  const day = val ? new Date(val + "T12:00:00").getDate() : null;
-                  onSaveProrate(employee.name, isoMonth, day);
+                  setLastDayEdits((prev) => ({ ...prev, [cardPeriodType]: val }));
+                  const day = val ? dayOfWindow(new Date(val + "T12:00:00")) : null;
+                  onSaveProrate(employee.name, isoMonth, day, cardPeriodType);
                 }}
                 className="h-7 w-[140px] text-[12px]"
               />
