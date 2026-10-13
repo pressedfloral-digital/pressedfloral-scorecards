@@ -744,8 +744,10 @@ export default function ScorecardsApp() {
     if (adminUsers.length > 0) {
       const map: Record<string, "monthly" | "quarterly"> = {};
       for (const u of adminUsers) {
-        if (u.linkedEmployeeName && u.scorecardPeriodType === "quarterly") {
-          map[u.linkedEmployeeName] = "quarterly";
+        // Unlinked accounts can still have a scorecard built under their name (Build Scorecard).
+        const name = u.linkedEmployeeName || u.fullName?.trim();
+        if (name && u.scorecardPeriodType === "quarterly") {
+          map[name] = "quarterly";
         }
       }
       setEmployeePeriodTypes(map);
@@ -2181,18 +2183,20 @@ export default function ScorecardsApp() {
   // the current work period. Someone not in that period's Rippling upload can still get one —
   // the admin enters their details by hand (needsDetails), saved as a manual employee.
   function buildScorecardFor(user: AdminManagedUser): BuildScorecardTarget | null {
-    const name = user.linkedEmployeeName;
-    // Accounts not linked to an employee (e.g. admins) aren't team members, so nothing to build.
-    if (!name) return null;
-    const periodType = employeePeriodTypes[name] === "quarterly" ? "quarterly" : "monthly";
+    // Accounts not linked to an employee build under their account name (editable in the form);
+    // the account itself stays unlinked. Admins aren't scored.
+    const linked = user.linkedEmployeeName;
+    if (!linked && user.role === "admin") return null;
+    const name = linked || user.fullName?.trim() || "";
+    const periodType = (name && employeePeriodTypes[name]) === "quarterly" || (!linked && user.scorecardPeriodType === "quarterly") ? "quarterly" : "monthly";
     const isoMonth = periodType === "quarterly" ? quarterToIsoMonth(quarterKeyForMonth(workMonth)) : workMonth;
     const periodLabel = periodType === "quarterly" ? quarterKeyForMonth(workMonth) : formatMonthLabel(workMonth);
-    if (appData.scorecards.some((sc) => sc.employeeName === name && sc.scorecardMonth === periodLabel)) return null;
-    const base = { name, periodLabel, periodType, isoMonth } as const;
+    if (name && appData.scorecards.some((sc) => sc.employeeName === name && sc.scorecardMonth === periodLabel)) return null;
+    const base = { name, periodLabel, periodType, isoMonth, nameEditable: !linked } as const;
     // Team Scorecards lists the period's own upload (falling back to the latest one) plus
     // anyone entered manually for the period.
     const upload = scorecardRippling[isoMonth]?.length ? scorecardRippling[isoMonth] : latestRipplingEmployees;
-    const employee = upload.find((e) => e.name === name);
+    const employee = name ? upload.find((e) => e.name === name) : undefined;
     if (!employee) {
       // Prefill from their manual details, else their most recent Rippling row or scorecard.
       const manual = (appData.manualEmployees?.[isoMonth] || []).find((e) => e.name === name);
@@ -3241,6 +3245,7 @@ function ManualEmployeeForm(props: {
 }) {
   const initial = props.target.employee;
   const [draft, setDraft] = useState({
+    name: props.target.name,
     role: initial.role || "",
     department: initial.department || "",
     location: initial.location || "",
@@ -3253,12 +3258,13 @@ function ManualEmployeeForm(props: {
   });
   const [saving, setSaving] = useState(false);
   const isQuarterly = props.target.periodType === "quarterly";
-  const managers = props.users.filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin") && u.linkedEmployeeName !== props.target.name);
+  const name = draft.name.trim().replace(/\s+/g, " ");
+  const managers = props.users.filter((u) => u.status !== "deactivated" && (u.role === "manager" || u.role === "admin") && u.linkedEmployeeName !== name);
   const num = (v: string) => (v.trim() === "" || isNaN(Number(v)) ? undefined : Number(v));
   const manager = managers.find((u) => u.id === draft.managerId);
   const employee: Employee = {
-    id: `manual:${props.target.name}`,
-    name: props.target.name,
+    id: `manual:${name}`,
+    name,
     role: draft.role.trim(),
     department: draft.department,
     location: draft.location,
@@ -3272,6 +3278,7 @@ function ManualEmployeeForm(props: {
     manual: true,
   };
   const missing = [
+    !name && "name",
     !employee.role && "role",
     !employee.department && "department",
     !employee.location && "location",
@@ -3283,6 +3290,12 @@ function ManualEmployeeForm(props: {
 
   return (
     <div className="flex flex-col gap-3">
+      {props.target.nameEditable && (
+        <DrawerField label="Employee name" htmlFor="manual-name">
+          <Input id="manual-name" value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="First and last name" />
+          <span className="text-[11.5px] text-muted-foreground">This account isn&apos;t linked to an employee, so the scorecard is saved under this name. The account&apos;s access doesn&apos;t change.</span>
+        </DrawerField>
+      )}
       <DrawerField label="Role" htmlFor="manual-role">
         <Input id="manual-role" list="manual-role-options" value={draft.role} onChange={(e) => set({ role: e.target.value })} placeholder="e.g. Design Specialist" />
         <datalist id="manual-role-options">{props.roleOptions.map((r) => <option key={r} value={r} />)}</datalist>
@@ -3363,6 +3376,8 @@ type BuildScorecardTarget = {
   periodType: "monthly" | "quarterly";
   isoMonth: string;
   employee: Employee;
+  // Account isn't linked to an employee: the form asks for the name to build under.
+  nameEditable?: boolean;
   // Not in the period's Rippling upload: details are entered by hand (prefilled in employee).
   needsDetails?: boolean;
   hasManualDetails?: boolean;
@@ -3586,9 +3601,9 @@ function UsersScreen(props: {
           <SheetHeader>
             <div className="flex items-start justify-between gap-3">
               <div className="grid gap-1">
-                <SheetTitle>Build scorecard — {manualTarget?.name}</SheetTitle>
+                <SheetTitle>Build scorecard{manualTarget?.name ? ` — ${manualTarget.name}` : ""}</SheetTitle>
                 <SheetDescription>
-                  {manualTarget?.name} isn&apos;t in the Rippling upload for {manualTarget?.periodLabel}, so enter their details for {manualTarget?.periodType === "quarterly" ? "the quarter" : "the month"}. A later Rippling upload that includes them takes over.
+                  {manualTarget?.name || "This person"} isn&apos;t in the Rippling upload for {manualTarget?.periodLabel}, so enter their details for {manualTarget?.periodType === "quarterly" ? "the quarter" : "the month"}. A later Rippling upload that includes them takes over.
                 </SheetDescription>
               </div>
               <SheetClose className="-mr-1 -mt-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50">
