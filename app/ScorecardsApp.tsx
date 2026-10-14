@@ -1348,7 +1348,7 @@ export default function ScorecardsApp() {
   // so the personal scorecard always shows applicable goals even before payroll data is uploaded.
   const myEmployee = useMemo(() => {
     if (!effectiveProfile?.linkedEmployeeName) return null;
-    const fromRippling = latestRipplingEmployees.find((e) => e.name === effectiveProfile.linkedEmployeeName);
+    const fromRippling = latestTeamEmployees.find((e) => e.name === effectiveProfile.linkedEmployeeName);
     if (fromRippling) {
       // Apply title override from manager profile if set
       return effectiveProfile.titleOverride
@@ -1377,7 +1377,7 @@ export default function ScorecardsApp() {
       } as Employee;
     }
     return null;
-  }, [effectiveProfile, latestRipplingEmployees, appData.scorecards]);
+  }, [effectiveProfile, latestTeamEmployees, appData.scorecards]);
 
   // Scorecards belonging to the effective user (for the Personal Scorecard panel)
   const myOwnScorecards = useMemo(() => {
@@ -2480,7 +2480,7 @@ export default function ScorecardsApp() {
             <UsersScreen
               users={adminUsers}
               loading={adminUsersLoading}
-              employees={latestRipplingEmployees}
+              employees={latestTeamEmployees}
               fixtureMode={isFixture}
               currentUserId={profile?.id || ""}
               maintenanceMode={maintenanceMode}
@@ -2758,6 +2758,8 @@ function PersonalScorecardPanel({
   // blend all three months via sumQuarterlyEmployee, matching the manager's card.
   const [empWithEarnings, personalPayrollAvailable] = useMemo((): [Employee | null, boolean] => {
     if (!myEmployee || !periodISO) return [myEmployee, false];
+    // Entered by hand (not in Rippling): earnings were typed in for the period, like the manager's card.
+    if (myEmployee.manual) return [myEmployee, true];
     if (isQuarterly) {
       const [y, m] = periodISO.split("-").map(Number);
       const qMonths = [0, 1, 2].map((i) => `${y}-${String(m + i).padStart(2, "0")}`);
