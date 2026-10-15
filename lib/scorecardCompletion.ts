@@ -25,7 +25,17 @@ export const MIN_HOURS_FOR_SCORECARD = 40;
 // eligibility matches their KPIs; everyone else uses the Rippling upload's hours. Pay is unaffected:
 // earnings always come from Rippling. `monthActuals` is that month's actuals map.
 export function scorecardHours(employee: Pick<Employee, "name" | "hoursWorked">, monthActuals: ActualsByKey | undefined): number | undefined {
-  return readOpsHours(monthActuals, employee.name) ?? employee.hoursWorked;
+  return opsScorecardHours(employee.name, monthActuals) ?? employee.hoursWorked;
+}
+
+// Production team members whose Ops Dashboard hours don't cover their real time worked (e.g. most
+// of it isn't clocked in Ops Dashboard), so their scorecard hours always come from Rippling.
+export const RIPPLING_HOURS_EMPLOYEES: readonly string[] = ["Mia Legas Boots"];
+
+// The Ops Dashboard hours scorecardHours uses for this employee, if any.
+export function opsScorecardHours(employeeName: string, monthActuals: ActualsByKey | undefined): number | undefined {
+  if (RIPPLING_HOURS_EMPLOYEES.includes(employeeName)) return undefined;
+  return readOpsHours(monthActuals, employeeName);
 }
 
 // Unknown hours (no upload, no Ops Dashboard row) never lock a scorecard.

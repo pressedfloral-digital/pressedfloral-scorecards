@@ -160,6 +160,11 @@ describe("scorecardHours", () => {
     expect(scorecardHours(employee, undefined)).toBe(160);
     expect(scorecardHours(employee, { [opsHoursKey(employee.name)]: 0 })).toBe(0);
   });
+
+  it("uses Rippling hours for people Ops Dashboard under-counts", () => {
+    const mia = { ...employee, name: "Mia Legas Boots", hoursWorked: 92 };
+    expect(scorecardHours(mia, { [opsHoursKey(mia.name)]: 3.26 })).toBe(92);
+  });
 });
 
 describe("isFinalizedForHistory", () => {

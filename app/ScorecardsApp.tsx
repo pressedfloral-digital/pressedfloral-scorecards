@@ -20,7 +20,7 @@ import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/report
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
-import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, opsScorecardHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
@@ -31,7 +31,6 @@ import {
   applyCrossDeptSplit,
   parseRatioTierTargets,
   readDeptHours,
-  readOpsHours,
   SPLIT_NOTE,
   splitSummary,
   type RatioTierTargets
@@ -6347,7 +6346,7 @@ function LiveScorecardCard({
   const ineligible = isBelowMinHours(monthHours);
 
   const activeEmployee = cardPeriodType === "quarterly" ? quarterlyEmployee : employee;
-  const cardHoursFromOps = cardPeriodType === "monthly" && readOpsHours(periodActuals, employee.name) != null;
+  const cardHoursFromOps = cardPeriodType === "monthly" && opsScorecardHours(employee.name, periodActuals) != null;
   const cardHours = cardPeriodType === "quarterly" ? quarterlyEmployee.hoursWorked : monthHours;
   const activeMonth = cardPeriodType === "quarterly" ? quarterKey : month;
 
