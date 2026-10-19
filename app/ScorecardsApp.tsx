@@ -21,7 +21,7 @@ import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, em
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, opsScorecardHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
-import { buildPayReport, changePct, entriesForMonth, entriesForYear, payTotals, reportYears, type PayReportEntry, type PayTotals } from "../lib/payReport";
+import { PAY_SKIP_LABELS, buildPayReport, changePct, entriesForMonth, entriesForYear, payTotals, payrollLookupFromRippling, reportYears, type PayReportEntry, type PaySkipReason, type PayTotals } from "../lib/payReport";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
@@ -2458,7 +2458,7 @@ export default function ScorecardsApp() {
               onView={setHistoryView}
             />
           )}
-          {mode === "pay" && isAdmin && <PayReportScreen scorecards={canonicalHistoryScorecards} />}
+          {mode === "pay" && isAdmin && <PayReportScreen scorecards={canonicalHistoryScorecards} rippling={appData.rippling} />}
           {mode === "rippling" && (
             <RipplingScreen
               defaultMonth={workMonth}
@@ -7902,8 +7902,12 @@ function PayDelta({ pct, label }: { pct: number | null; label?: string }) {
 }
 
 // Admin report: hourly rate + scorecard bonus ÷ hours worked, month to month and year to year.
-function PayReportScreen({ scorecards }: { scorecards: Scorecard[] }) {
-  const entries = useMemo(() => buildPayReport(scorecards), [scorecards]);
+function PayReportScreen({ scorecards, rippling }: { scorecards: Scorecard[]; rippling: Record<string, Employee[]> }) {
+  // Older scorecards often didn't save hours or a rate, so those come from that month's Rippling upload.
+  const { entries, skipped } = useMemo(() => buildPayReport(scorecards, payrollLookupFromRippling(rippling)), [scorecards, rippling]);
+  const skippedNotes = (Object.keys(skipped) as PaySkipReason[])
+    .filter((reason) => reason !== "notFinal" && skipped[reason] > 0)
+    .map((reason) => `${skipped[reason]} ${PAY_SKIP_LABELS[reason]}`);
   const [year, setYear] = useState("");
   const [dept, setDept] = useState("");
   const [location, setLocation] = useState("");
@@ -8123,7 +8127,7 @@ function PayReportScreen({ scorecards }: { scorecards: Scorecard[] }) {
               </Table>
             </div>
             <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
-              Effective rate = hourly rate + bonus ÷ hours worked (salaried: base earnings ÷ hours). Team and yearly figures are weighted by hours. <sup>Q</sup> marks a quarterly scorecard, whose rate covers all three months. Only approved scorecards with hours are included.
+              Effective rate = hourly rate + bonus ÷ hours worked (salaried: base earnings ÷ hours). Team and yearly figures are weighted by hours. <sup>Q</sup> marks a quarterly scorecard, whose rate covers all three months. Includes approved scorecards from Resin, Recreation, Design, Fulfillment, Preservation and Client Care; when a scorecard didn't save hours or a rate, that month's Rippling upload is used. {entries.length} scorecard{entries.length === 1 ? "" : "s"} included{skippedNotes.length ? <> · left out: {skippedNotes.join(", ")}</> : null}.
             </div>
           </section>
 
@@ -8199,7 +8203,10 @@ function PayReportScreen({ scorecards }: { scorecards: Scorecard[] }) {
                       <TableRow key={e.scorecardId} className="hover:bg-transparent">
                         <TableCell className="font-medium">{e.period}</TableCell>
                         <TableCell className="text-muted-foreground">{e.department}</TableCell>
-                        <TableCell className="text-right tabular-nums">{formatNumber(Math.round(e.hours * 100) / 100)}</TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {formatNumber(Math.round(e.hours * 100) / 100)}
+                          {e.hoursFromRippling && <span className="ml-1 text-[10px] text-muted-foreground" title="This scorecard didn't save hours, so they come from the Rippling upload">Rippling</span>}
+                        </TableCell>
                         <TableCell className="text-right tabular-nums">{formatRate(e.baseRate)}</TableCell>
                         <TableCell className="text-right tabular-nums">{formatCurrency(e.bonus)}</TableCell>
                         <TableCell className="text-right tabular-nums">{formatRate(e.bonusPerHour)}</TableCell>
