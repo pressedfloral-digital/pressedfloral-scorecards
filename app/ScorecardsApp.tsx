@@ -21,6 +21,7 @@ import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, em
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, opsScorecardHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { buildPayReport, changePct, entriesForMonth, entriesForYear, payTotals, reportYears, type PayReportEntry, type PayTotals } from "../lib/payReport";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
   DEFAULT_RATIO_TIER_TARGETS,
@@ -89,6 +90,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Circle,
+  DollarSign,
   Download,
   FileText,
   History,
@@ -112,7 +114,7 @@ import {
   X,
 } from "lucide-react";
 
-type Screen = "landing" | "setup" | "scorecard" | "history" | "rippling" | "guide" | "todos" | "migrate" | "whatif" | "personal" | "users";
+type Screen = "landing" | "setup" | "scorecard" | "history" | "pay" | "rippling" | "guide" | "todos" | "migrate" | "whatif" | "personal" | "users";
 type HistoryView = "table" | "scorecard" | "grid" | "chart";
 
 // A value the pf-dashboard KPI sync (app/api/cron/sync-pf-kpis) wrote into `actuals`.
@@ -1413,22 +1415,24 @@ export default function ScorecardsApp() {
   // Pending and returned scorecards stay out of Historical Data until approved. Scorecards
   // under an older name of a current team member (e.g. someone who left and came back) are
   // shown under their current name, so their history isn't split into Former.
-  const historyScorecards = useMemo(() => {
+  const canonicalHistoryScorecards = useMemo(() => {
     const scoped = scopedScorecardsForProfile(appData.scorecards, effectiveProfile, allRipplingEmployees).filter(isFinalizedForHistory);
     const canonical = currentTeamNames
       ? buildCanonicalNameMap(scoped.map((sc) => sc.employeeName), currentTeamNames, effectiveProfile?.knownProfiles || [])
       : new Map<string, string>();
-    return scoped
-      .map((sc) => {
-        const name = canonical.get(sc.employeeName);
-        return name ? { ...sc, employeeName: name } : sc;
-      })
+    return scoped.map((sc) => {
+      const name = canonical.get(sc.employeeName);
+      return name ? { ...sc, employeeName: name } : sc;
+    });
+  }, [appData.scorecards, effectiveProfile, allRipplingEmployees, currentTeamNames]);
+  const historyScorecards = useMemo(() => {
+    return canonicalHistoryScorecards
       .filter((sc) => {
         if (historyFilters.teamStatus === "all" || !currentTeamNames) return true;
         return currentTeamNames.has(sc.employeeName) === (historyFilters.teamStatus === "current");
       })
       .filter((sc) => historyFilters.periodType === "all" || isQuarterLabel(sc.scorecardMonth) === (historyFilters.periodType === "quarterly"));
-  }, [appData.scorecards, effectiveProfile, allRipplingEmployees, historyFilters.teamStatus, historyFilters.periodType, currentTeamNames]);
+  }, [canonicalHistoryScorecards, historyFilters.teamStatus, historyFilters.periodType, currentTeamNames]);
 
   const filteredHistory = useMemo(() => {
     return historyScorecards.filter((scorecard) => {
@@ -2297,6 +2301,7 @@ export default function ScorecardsApp() {
       items: [
         { key: "history", label: "Historical Data", icon: History, testId: "nav-history" },
         { key: "whatif", label: "What If Scorecard", icon: Sparkles, testId: "nav-whatif" },
+        { key: "pay", label: "Effective Pay", icon: DollarSign, hidden: !isAdmin, testId: "nav-pay" },
         { key: "rippling", label: "Rippling Data", icon: ArrowDownUp, hidden: !isAdmin, testId: "nav-rippling" },
         { key: "users", label: "Users", icon: UserCog, hidden: !isAdmin, testId: "nav-users" },
       ],
@@ -2453,6 +2458,7 @@ export default function ScorecardsApp() {
               onView={setHistoryView}
             />
           )}
+          {mode === "pay" && isAdmin && <PayReportScreen scorecards={canonicalHistoryScorecards} />}
           {mode === "rippling" && (
             <RipplingScreen
               defaultMonth={workMonth}
@@ -2569,6 +2575,7 @@ function pageLabel(mode: Screen) {
     setup: "Goals & Actuals",
     scorecard: "Team Scorecards",
     history: "Historical Data",
+    pay: "Effective Pay",
     rippling: "Rippling Data",
     guide: "How To Use",
     todos: "To Do",
@@ -7796,6 +7803,9 @@ function ReportLineChart({
   function xPos(i: number) { return pad.left + (months.length > 1 ? (i / (months.length - 1)) * cW : cW / 2); }
   function yPos(v: number) { return pad.top + cH - ((v - yMin) / (yMax - yMin)) * cH; }
 
+  // Label every month up to a year's worth; past that, every few months so labels don't overlap.
+  const labelEvery = Math.max(1, Math.ceil(months.length / 12));
+
   function yLabel(t: number): string {
     if (isPercent) return t.toFixed(0) + "%";
     if (isCurrency) return t >= 1000 ? "$" + (t / 1000).toFixed(0) + "k" : "$" + t;
@@ -7814,7 +7824,7 @@ function ReportLineChart({
             </g>
           ))}
           {/* X labels */}
-          {months.map((m, i) => (
+          {months.map((m, i) => i % labelEvery === 0 && (
             <text key={m} x={xPos(i)} y={H - pad.bottom + 16} textAnchor="middle" fontSize={10} fontFamily="monospace" fill="#999">{shortMonthLabel(m)}</text>
           ))}
           {/* Axes */}
@@ -7856,6 +7866,354 @@ function ReportLineChart({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+type PayMetric = "effective" | "bonus" | "base";
+const PAY_METRICS: { key: PayMetric; label: string }[] = [
+  { key: "effective", label: "Effective hourly rate" },
+  { key: "bonus", label: "Bonus per hour" },
+  { key: "base", label: "Base hourly rate" },
+];
+
+function formatRate(v: number | null) {
+  return v === null ? "—" : formatCurrency(v);
+}
+
+function payMetricValue(totals: PayTotals | null, metric: PayMetric) {
+  if (!totals) return null;
+  return metric === "effective" ? totals.effectiveRate : metric === "bonus" ? totals.bonusPerHour : totals.baseRate;
+}
+
+function previousIsoMonth(iso: string) {
+  const [y, m] = iso.split("-").map(Number);
+  return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, "0")}`;
+}
+
+function PayDelta({ pct, label }: { pct: number | null; label?: string }) {
+  if (pct === null || Math.abs(pct) < 0.05) return null;
+  const up = pct > 0;
+  return (
+    <span className="text-[10.5px] font-medium tabular-nums" style={{ color: up ? "#2D6B1A" : "var(--brick)" }} title={label}>
+      {up ? "▲" : "▼"} {Math.abs(pct).toFixed(1)}%
+    </span>
+  );
+}
+
+// Admin report: hourly rate + scorecard bonus ÷ hours worked, month to month and year to year.
+function PayReportScreen({ scorecards }: { scorecards: Scorecard[] }) {
+  const entries = useMemo(() => buildPayReport(scorecards), [scorecards]);
+  const [year, setYear] = useState("");
+  const [dept, setDept] = useState("");
+  const [location, setLocation] = useState("");
+  const [search, setSearch] = useState("");
+  const [metric, setMetric] = useState<PayMetric>("effective");
+  const [selected, setSelected] = useState("");
+
+  const departments = useMemo(() => Array.from(new Set(entries.map((e) => e.department).filter(Boolean))).sort(), [entries]);
+  const locations = useMemo(() => Array.from(new Set(entries.map((e) => e.location).filter(Boolean))).sort(), [entries]);
+  const scoped = useMemo(() => entries.filter((e) => (!dept || e.department === dept) && (!location || e.location === location)), [entries, dept, location]);
+  const years = useMemo(() => reportYears(scoped), [scoped]);
+  const activeYear = years.includes(year) ? year : years[0] || String(new Date().getFullYear());
+  const prevYear = String(Number(activeYear) - 1);
+  const months = Array.from({ length: 12 }, (_, i) => `${activeYear}-${String(i + 1).padStart(2, "0")}`);
+  const metricLabel = PAY_METRICS.find((m) => m.key === metric)!.label;
+
+  const byEmployee = useMemo(() => {
+    const map = new Map<string, PayReportEntry[]>();
+    for (const e of scoped) map.set(e.employeeName, [...(map.get(e.employeeName) || []), e]);
+    return map;
+  }, [scoped]);
+
+  function monthTotals(list: PayReportEntry[], iso: string) {
+    const inMonth = entriesForMonth(list, iso);
+    return inMonth.length ? payTotals(inMonth) : null;
+  }
+  function yearTotals(list: PayReportEntry[], y: string) {
+    const inYear = entriesForYear(list, y);
+    return inYear.length ? payTotals(inYear) : null;
+  }
+
+  const query = search.trim().toLowerCase();
+  const names = Array.from(byEmployee.keys())
+    .filter((name) => entriesForYear(byEmployee.get(name)!, activeYear).length > 0)
+    .filter((name) => !query || name.toLowerCase().includes(query))
+    .sort((a, b) => a.localeCompare(b));
+  const selectedName = selected && byEmployee.has(selected) ? selected : "";
+  const focus = selectedName ? byEmployee.get(selectedName)! : scoped;
+
+  const teamYear = yearTotals(scoped, activeYear);
+  const teamPrevYear = yearTotals(scoped, prevYear);
+  const monthsWithData = months.filter((m) => entriesForMonth(scoped, m).length > 0);
+  const latestMonth = monthsWithData[monthsWithData.length - 1];
+  const latestTotals = latestMonth ? monthTotals(scoped, latestMonth) : null;
+  const priorToLatest = latestMonth ? monthTotals(scoped, previousIsoMonth(latestMonth)) : null;
+
+  // Every month from the first to the last scorecard in scope, for the trend chart.
+  const chartMonths = useMemo(() => {
+    const all = focus.flatMap((e) => e.months).sort();
+    if (!all.length) return [];
+    const out: string[] = [];
+    for (let m = all[0]; m <= all[all.length - 1]; m = nextIsoMonth(m)) out.push(m);
+    return out;
+  }, [focus]);
+  const chartValue = (key: string, iso: string) => {
+    const t = monthTotals(focus, iso);
+    return key === "Effective rate" ? t?.effectiveRate ?? null : t?.baseRate ?? null;
+  };
+
+  const focusYears = reportYears(focus).slice().reverse();
+  const focusPeriods = selectedName ? byEmployee.get(selectedName)! : [];
+
+  function exportCsv() {
+    const rows: unknown[][] = [["Employee", "Department", "Location", "Pay type", "Period", "Hours", "Base rate", "Base pay", "Bonus", "Bonus per hour", "Effective rate"]];
+    for (const e of scoped) rows.push([e.employeeName, e.department, e.location, e.payType, e.period, e.hours.toFixed(2), e.baseRate.toFixed(2), e.basePay.toFixed(2), e.bonus.toFixed(2), e.bonusPerHour.toFixed(2), e.effectiveRate.toFixed(2)]);
+    downloadCsv(toCsv(rows), "effective-hourly-pay.csv");
+  }
+
+  function rateCell(v: number | null, prev: number | null, quarterly: boolean, key: string) {
+    return (
+      <TableCell key={key} className="text-right tabular-nums">
+        {v === null ? <span className="text-muted-foreground">—</span> : (
+          <div className="flex flex-col items-end leading-tight">
+            <span className="font-semibold text-foreground">
+              {formatRate(v)}{quarterly && <sup className="ml-0.5 text-[9px] font-medium text-muted-foreground" title="Quarterly scorecard: the quarter's rate">Q</sup>}
+            </span>
+            <PayDelta pct={changePct(v, prev)} label="vs previous month" />
+          </div>
+        )}
+      </TableCell>
+    );
+  }
+
+  function gridRow(name: string, list: PayReportEntry[], team = false) {
+    const vals = months.map((m) => payMetricValue(monthTotals(list, m), metric));
+    const quarterly = months.map((m) => entriesForMonth(list, m).some((e) => e.periodType === "quarterly"));
+    const decPrev = payMetricValue(monthTotals(list, `${prevYear}-12`), metric);
+    const yr = payMetricValue(yearTotals(list, activeYear), metric);
+    const prevYr = payMetricValue(yearTotals(list, prevYear), metric);
+    const yoy = changePct(yr, prevYr);
+    const isSelected = !team && name === selectedName;
+    return (
+      <TableRow
+        key={team ? "__team__" : name}
+        onClick={team ? undefined : () => setSelected(isSelected ? "" : name)}
+        className={cn(team ? "bg-muted/30 hover:bg-muted/30" : "cursor-pointer", isSelected && "bg-primary/5")}
+        data-testid={team ? "pay-team-row" : "pay-row"}
+      >
+        <TableCell className={cn("sticky left-0 z-10 font-medium text-foreground", team || isSelected ? "bg-[var(--surface2)]" : "bg-card")}>
+          {team ? "Team (hours-weighted)" : name}
+        </TableCell>
+        {vals.map((v, i) => rateCell(v, i === 0 ? decPrev : vals[i - 1], quarterly[i], months[i]))}
+        <TableCell className="border-l border-border text-right font-bold tabular-nums">{formatRate(yr)}</TableCell>
+        <TableCell className="text-right tabular-nums text-muted-foreground">{formatRate(prevYr)}</TableCell>
+        <TableCell className="text-right tabular-nums">{yoy === null ? <span className="text-muted-foreground">—</span> : <PayDelta pct={yoy} label={`${activeYear} vs ${prevYear}`} />}</TableCell>
+      </TableRow>
+    );
+  }
+
+  const headerClass = "bg-muted/40 [&_th]:h-8 [&_th]:px-3 [&_th]:text-[10px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground";
+
+  return (
+    <div className="screen active">
+      <section style={{ padding: 0 }} className="overflow-hidden">
+        <div className="flex flex-wrap items-end gap-x-3 gap-y-2 p-3">
+          <ReportControl label="Year">
+            <Select value={activeYear} onValueChange={setYear}>
+              <SelectTrigger size="sm" className="min-w-[6rem] text-[12px]"><SelectValue /></SelectTrigger>
+              <SelectContent>{(years.length ? years : [activeYear]).map((y) => <SelectItem key={y} value={y}>{y}</SelectItem>)}</SelectContent>
+            </Select>
+          </ReportControl>
+          <ReportControl label="Department">
+            <Select value={dept || ALL_LOCATIONS} onValueChange={(v) => setDept(v === ALL_LOCATIONS ? "" : v)}>
+              <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_LOCATIONS}>All departments</SelectItem>
+                {departments.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </ReportControl>
+          <ReportControl label="Location">
+            <Select value={location || ALL_LOCATIONS} onValueChange={(v) => setLocation(v === ALL_LOCATIONS ? "" : v)}>
+              <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_LOCATIONS}>All locations</SelectItem>
+                {locations.map((l) => <SelectItem key={l} value={l}>{l}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </ReportControl>
+          <ReportControl label="Show">
+            <Select value={metric} onValueChange={(v) => setMetric(v as PayMetric)}>
+              <SelectTrigger size="sm" className="min-w-[10rem] text-[12px]"><SelectValue /></SelectTrigger>
+              <SelectContent>{PAY_METRICS.map((m) => <SelectItem key={m.key} value={m.key}>{m.label}</SelectItem>)}</SelectContent>
+            </Select>
+          </ReportControl>
+          <ReportControl label="Search">
+            <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Team member" className="h-8 w-[11rem] text-[12px]" />
+          </ReportControl>
+          <Button variant="outline" size="sm" className="ml-auto h-8 text-[12px]" onClick={exportCsv} disabled={!scoped.length}>
+            <Download className="size-3.5" /> Export CSV
+          </Button>
+        </div>
+      </section>
+
+      {!entries.length ? (
+        <section className="px-4 py-8 text-center text-[13px] text-muted-foreground">
+          No approved scorecards with hours yet. Effective pay shows up here once scorecards are submitted and approved.
+        </section>
+      ) : (
+        <>
+          <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <KpiTile
+              label={`${activeYear} effective rate`}
+              value={formatRate(teamYear?.effectiveRate ?? null)}
+              sub={teamPrevYear
+                ? <>{formatRate(teamPrevYear.effectiveRate)} in {prevYear} <PayDelta pct={changePct(teamYear?.effectiveRate ?? null, teamPrevYear.effectiveRate)} /></>
+                : `No ${prevYear} scorecards to compare`}
+              accent
+            />
+            <KpiTile
+              label="Bonus adds"
+              value={<>{formatRate(teamYear?.bonusPerHour ?? null)}<span className="text-[13px] font-medium text-muted-foreground"> /hr</span></>}
+              sub={teamYear ? `${formatCurrency(teamYear.bonus)} bonus over ${formatNumber(Math.round(teamYear.hours))} hours` : undefined}
+            />
+            <KpiTile
+              label="Base rate"
+              value={formatRate(teamYear?.baseRate ?? null)}
+              sub={teamYear ? `${formatCurrency(teamYear.basePay)} base pay in ${activeYear}` : undefined}
+            />
+            <KpiTile
+              label={latestMonth ? `${shortMonthLabel(latestMonth)} effective rate` : "Latest month"}
+              value={formatRate(latestTotals?.effectiveRate ?? null)}
+              sub={latestTotals
+                ? (priorToLatest
+                  ? <>{formatRate(priorToLatest.effectiveRate)} the month before <PayDelta pct={changePct(latestTotals.effectiveRate, priorToLatest.effectiveRate)} /></>
+                  : "No prior month to compare")
+                : `No ${activeYear} scorecards`}
+            />
+          </div>
+
+          <section style={{ padding: 0 }} className="overflow-hidden">
+            <div className="flex flex-wrap items-baseline gap-2 border-b border-border px-3 py-2.5">
+              <h2 className="text-[13px] font-semibold text-foreground">{metricLabel}</h2>
+              <span className="text-[11.5px] text-muted-foreground">by team member × month · {activeYear} · click a name to see their trend</span>
+            </div>
+            {/* inline-size containment keeps the wide month grid scrolling here instead of widening the page */}
+            <div className="overflow-x-auto" style={{ contain: "inline-size" }}>
+              <Table style={{ minWidth: `${190 + 12 * 82 + 3 * 92}px` }} className="text-[12px]">
+                <TableHeader className={headerClass}>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="sticky left-0 z-20 bg-[var(--surface2)]" style={{ minWidth: 180 }}>Team member</TableHead>
+                    {months.map((m) => <TableHead key={m} className="text-right">{shortMonthLabel(m).split(" ")[0]}</TableHead>)}
+                    <TableHead className="border-l border-border text-right">{activeYear}</TableHead>
+                    <TableHead className="text-right">{prevYear}</TableHead>
+                    <TableHead className="text-right">YoY</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody className="[&_td]:px-3 [&_td]:py-2">
+                  {gridRow("", scoped, true)}
+                  {names.map((name) => gridRow(name, byEmployee.get(name)!))}
+                  {!names.length && (
+                    <TableRow className="hover:bg-transparent">
+                      <TableCell colSpan={16} className="py-6 text-center text-muted-foreground">No team members match.</TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+            <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+              Effective rate = hourly rate + bonus ÷ hours worked (salaried: base earnings ÷ hours). Team and yearly figures are weighted by hours. <sup>Q</sup> marks a quarterly scorecard, whose rate covers all three months. Only approved scorecards with hours are included.
+            </div>
+          </section>
+
+          <section>
+            <div className="mb-3 flex flex-wrap items-baseline gap-2">
+              <h2 className="text-[13px] font-semibold text-foreground">{selectedName || "Team"} · month to month</h2>
+              {selectedName && <button type="button" className="text-[11.5px] text-primary underline-offset-2 hover:underline" onClick={() => setSelected("")}>Back to team</button>}
+            </div>
+            {chartMonths.length < 2 ? (
+              <div className="px-4 py-8 text-center text-[13px] text-muted-foreground">At least two months of scorecards are needed to draw a trend.</div>
+            ) : (
+              <ReportLineChart months={chartMonths} groupKeys={["Effective rate", "Base rate"]} getValue={chartValue} formatValue={formatRate} isPercent={false} isCurrency />
+            )}
+          </section>
+
+          <section style={{ padding: 0 }} className="overflow-hidden">
+            <div className="flex items-baseline gap-2 border-b border-border px-3 py-2.5">
+              <h2 className="text-[13px] font-semibold text-foreground">{selectedName || "Team"} · year over year</h2>
+            </div>
+            <Table className="text-[12px]">
+              <TableHeader className={headerClass}>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead>Year</TableHead>
+                  <TableHead className="text-right">Hours</TableHead>
+                  <TableHead className="text-right">Base rate</TableHead>
+                  <TableHead className="text-right">Bonus paid</TableHead>
+                  <TableHead className="text-right">Bonus / hr</TableHead>
+                  <TableHead className="text-right">Effective rate</TableHead>
+                  <TableHead className="text-right">Change</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody className="[&_td]:px-3 [&_td]:py-2">
+                {focusYears.map((y) => {
+                  const t = payTotals(entriesForYear(focus, y));
+                  const prev = yearTotals(focus, String(Number(y) - 1));
+                  return (
+                    <TableRow key={y} className="hover:bg-transparent">
+                      <TableCell className="font-medium">{y}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatNumber(Math.round(t.hours))}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(t.baseRate)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatCurrency(t.bonus)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(t.bonusPerHour)}</TableCell>
+                      <TableCell className="text-right font-semibold tabular-nums">{formatRate(t.effectiveRate)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{prev ? <PayDelta pct={changePct(t.effectiveRate, prev.effectiveRate)} /> : <span className="text-muted-foreground">—</span>}</TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </section>
+
+          {selectedName && (
+            <section style={{ padding: 0 }} className="overflow-hidden">
+              <div className="flex items-baseline gap-2 border-b border-border px-3 py-2.5">
+                <h2 className="text-[13px] font-semibold text-foreground">{selectedName} · each scorecard</h2>
+              </div>
+              <div className="overflow-x-auto">
+                <Table className="text-[12px]">
+                  <TableHeader className={headerClass}>
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead>Period</TableHead>
+                      <TableHead>Department</TableHead>
+                      <TableHead className="text-right">Hours</TableHead>
+                      <TableHead className="text-right">Base rate</TableHead>
+                      <TableHead className="text-right">Bonus</TableHead>
+                      <TableHead className="text-right">Bonus / hr</TableHead>
+                      <TableHead className="text-right">Effective rate</TableHead>
+                      <TableHead className="text-right">Change</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody className="[&_td]:px-3 [&_td]:py-2">
+                    {focusPeriods.slice().reverse().map((e, i, list) => (
+                      <TableRow key={e.scorecardId} className="hover:bg-transparent">
+                        <TableCell className="font-medium">{e.period}</TableCell>
+                        <TableCell className="text-muted-foreground">{e.department}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatNumber(Math.round(e.hours * 100) / 100)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(e.baseRate)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatCurrency(e.bonus)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(e.bonusPerHour)}</TableCell>
+                        <TableCell className="text-right font-semibold tabular-nums">{formatRate(e.effectiveRate)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{list[i + 1] ? <PayDelta pct={changePct(e.effectiveRate, list[i + 1].effectiveRate)} /> : <span className="text-muted-foreground">—</span>}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </section>
+          )}
+        </>
+      )}
     </div>
   );
 }
