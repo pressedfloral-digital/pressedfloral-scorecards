@@ -5,6 +5,15 @@ import { scorecardPayrollMonths } from "./score";
 import { isFinalizedForHistory } from "./scorecardCompletion";
 import type { PayType, Scorecard } from "./types";
 
+// Only production team members are in the report. Uses the department on each scorecard, so
+// someone who moved into or out of production counts only for their production periods.
+export const PAY_REPORT_DEPARTMENTS = ["Resin", "Recreation", "Design", "Fulfillment", "Preservation", "Client Care"];
+const PAY_REPORT_DEPARTMENT_SET = new Set(PAY_REPORT_DEPARTMENTS.map((d) => d.toLowerCase()));
+
+export function isPayReportDepartment(department: string | undefined) {
+  return PAY_REPORT_DEPARTMENT_SET.has((department || "").trim().toLowerCase());
+}
+
 export type PayReportEntry = {
   scorecardId: string;
   employeeName: string;
@@ -34,7 +43,7 @@ export type PayTotals = {
 };
 
 export function payReportEntry(scorecard: Scorecard): PayReportEntry | null {
-  if (!isFinalizedForHistory(scorecard)) return null;
+  if (!isFinalizedForHistory(scorecard) || !isPayReportDepartment(scorecard.department)) return null;
   const hours = Number(scorecard.hours) || 0;
   if (hours <= 0) return null;
   const months = scorecardPayrollMonths(scorecard.scorecardMonth);

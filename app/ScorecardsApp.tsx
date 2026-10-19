@@ -8123,7 +8123,7 @@ function PayReportScreen({ scorecards }: { scorecards: Scorecard[] }) {
               </Table>
             </div>
             <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
-              Effective rate = hourly rate + bonus ÷ hours worked (salaried: base earnings ÷ hours). Team and yearly figures are weighted by hours. <sup>Q</sup> marks a quarterly scorecard, whose rate covers all three months. Only approved scorecards with hours are included.
+              Effective rate = hourly rate + bonus ÷ hours worked (salaried: base earnings ÷ hours). Team and yearly figures are weighted by hours. <sup>Q</sup> marks a quarterly scorecard, whose rate covers all three months. Includes approved scorecards with hours from Resin, Recreation, Design, Fulfillment, Preservation and Client Care.
             </div>
           </section>
 

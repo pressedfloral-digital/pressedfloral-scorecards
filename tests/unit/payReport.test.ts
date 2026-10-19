@@ -50,6 +50,15 @@ describe("payReportEntry", () => {
     expect(payReportEntry(card({ reviewStatus: "approved" }))).not.toBeNull();
   });
 
+  it("only includes production departments", () => {
+    expect(payReportEntry(card({ department: "Marketing" }))).toBeNull();
+    expect(payReportEntry(card({ department: "General & Administrative" }))).toBeNull();
+    expect(payReportEntry(card({ department: "" }))).toBeNull();
+    for (const department of ["Resin", "Recreation", "Design", "Fulfillment", "Preservation", "client care"]) {
+      expect(payReportEntry(card({ department }))).not.toBeNull();
+    }
+  });
+
   it("spreads a quarterly scorecard over its three months", () => {
     const entry = payReportEntry(card({ scorecardMonth: "Q2 2026", periodType: "quarterly" }))!;
     expect(entry.months).toEqual(["2026-04", "2026-05", "2026-06"]);
