@@ -845,12 +845,19 @@ export default function ScorecardsApp() {
 
   // PostgREST caps unpaginated selects at 1000 rows. The actuals table already exceeds that,
   // so a plain .select("*") silently drops rows (which ones is undefined without an ORDER BY) —
-  // page through in batches so no actuals get lost as the table keeps growing.
-  async function fetchAllRows(client: SupabaseClient, table: string, pageSize = 1000) {
+  // page through in batches so no actuals get lost as the table keeps growing. Scorecards passed
+  // 1000 too — the last months by text sort ("April …") were silently missing from Historical Data.
+  // `build` adds filters/ordering; order by a unique key so pages can't overlap or skip rows.
+  async function fetchAllRows(
+    client: SupabaseClient,
+    table: string,
+    build: (q: any) => any = (q) => q,
+    pageSize = 1000
+  ) {
     const rows: Record<string, any>[] = [];
     let from = 0;
     for (;;) {
-      const { data, error } = await client.from(table).select("*").range(from, from + pageSize - 1);
+      const { data, error } = await build(client.from(table).select("*")).range(from, from + pageSize - 1);
       if (error) return { data: rows, error };
       rows.push(...(data || []));
       if (!data || data.length < pageSize) break;
@@ -864,9 +871,9 @@ export default function ScorecardsApp() {
 
     if (isUser) {
       const linkedName = loadedProfile.linkedEmployeeName;
-      const scQuery = linkedName
-        ? client.from("scorecards").select("*").eq("employee_name", linkedName).order("scorecard_month", { ascending: false })
-        : client.from("scorecards").select("*").order("scorecard_month", { ascending: false });
+      const scQuery = fetchAllRows(client, "scorecards", (q) =>
+        (linkedName ? q.eq("employee_name", linkedName) : q).order("id")
+      );
 
       const [scResult, goalsResult, actualsResult, ripplingResult, assignmentsResult, settingsResult, overridesResult] = await Promise.all([
         scQuery,
@@ -888,7 +895,7 @@ export default function ScorecardsApp() {
       // Empty (not an error) until the employee_overrides migration has run.
       const employeeOverrides = overridesResult.error ? [] : (overridesResult.data || []).map(employeeOverrideFromRow);
 
-      const scorecards = (scResult.data || []).map(scorecardFromRow);
+      const scorecards = sortScorecardsNewestFirst((scResult.data || []).map(scorecardFromRow));
       const goals = (goalsResult.data || []).map(goalFromRow);
 
       const rippling: Record<string, Employee[]> = {};
@@ -919,7 +926,7 @@ export default function ScorecardsApp() {
 
     const [goalsResult, scorecardsResult, ripplingResult, actualsResult, assignmentsResult, settingsResult, overridesResult, manualResult] = await Promise.all([
       client.from("goals_bank").select("*").order("goal_tier").order("department").order("name"),
-      client.from("scorecards").select("*").order("scorecard_month", { ascending: false }).order("employee_name"),
+      fetchAllRows(client, "scorecards", (q) => q.order("id")),
       client.from("rippling_employees").select("*").order("period", { ascending: false }),
       fetchAllRows(client, "actuals"),
       client.from("goal_assignments").select("*").order("created_at", { ascending: false }),
@@ -975,7 +982,7 @@ export default function ScorecardsApp() {
     ];
     // Row-level security already limits which scorecards come back; the screens re-scope by
     // the viewer (including View As) downstream.
-    const scorecards = (scorecardsResult.data || []).map(scorecardFromRow);
+    const scorecards = sortScorecardsNewestFirst((scorecardsResult.data || []).map(scorecardFromRow));
     const goalAssignments: GoalAssignment[] = (assignmentsResult.data || []).map(goalAssignmentFromRow);
     const employeeScorecardSettings: EmployeeScorecardSettings[] = (settingsResult.data || []).map(employeeScorecardSettingsFromRow);
     setAppData((current) => ({ ...current, goals, scorecards, rippling, actuals: { ...current.actuals, ...actuals }, goalAssignments, employeeScorecardSettings, employeeOverrides, manualEmployees }));
@@ -1357,7 +1364,7 @@ export default function ScorecardsApp() {
     // Fall back to most recent submitted scorecard for role/dept/location
     const latestSc = [...appData.scorecards]
       .filter((sc) => sc.employeeName === effectiveProfile.linkedEmployeeName)
-      .sort((a, b) => b.scorecardMonth.localeCompare(a.scorecardMonth))[0];
+      .sort((a, b) => historyPeriodKey(b.scorecardMonth).localeCompare(historyPeriodKey(a.scorecardMonth)))[0];
     if (latestSc) {
       return {
         id: latestSc.employeeName,
@@ -5482,6 +5489,12 @@ function ScorecardsScreen(props: {
     return goals.some((g) => g.periodType !== "quarterly") || !!e.uploaded || !!e.manual;
   }
 
+  // A submitted scorecard (anything but returned) renders as a normal card with no hours lock,
+  // so "Hide ineligible" must not hide it — hours can drop under the minimum after approval.
+  function hasSubmittedScorecard(employeeName: string, label: string): boolean {
+    return props.scorecards.some((s) => s.employeeName === employeeName && s.scorecardMonth === label && s.reviewStatus !== "returned");
+  }
+
   const sortedTeam = [...teamEmployees].sort((a, b) => a.name.localeCompare(b.name));
   const filteredEmployees = sortedTeam.filter((e) => {
     if (filterEmployees.length > 0 && !filterEmployees.includes(e.name)) return false;
@@ -5490,7 +5503,7 @@ function ScorecardsScreen(props: {
     if (singleMonthMode && isDeactivatedForMonth(props.allActuals, e.name, selectedMonth)) return false;
     // A manual entry after an old last day (e.g. a rehire) keeps them visible.
     if (singleMonthMode && leftBeforeMonth(props.allActuals, e.name, selectedMonth) && lastDayStillApplies(e, employeeLastDay(props.allActuals, e.name)!)) return false;
-    if (hideIneligible && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
+    if (hideIneligible && !hasSubmittedScorecard(e.name, periodLabel) && isBelowMinHours(scorecardHours(withActualEarnings(e), props.allActuals[formatMonthLabel(selectedMonth)]))) return false;
     if (directOnly && !isDirectReport(e)) return false;
     if (hideCompleted) {
       const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === periodLabel);
@@ -5858,7 +5871,7 @@ function ScorecardsScreen(props: {
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
                   if (leftBeforeMonth(props.allActuals, e.name, m) && lastDayStillApplies(e, employeeLastDay(props.allActuals, e.name)!)) return false;
-                  if (hideIneligible && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
+                  if (hideIneligible && !hasSubmittedScorecard(e.name, mLabel) && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);
@@ -7221,6 +7234,13 @@ function parseMonthLabel(label: string): string {
   const y = parseInt(yearStr ?? "");
   if (m === -1 || isNaN(y)) return "";
   return `${y}-${String(m + 1).padStart(2, "0")}`;
+}
+
+// Newest period first, then by name. Month labels can't be sorted as text ("September" > "October").
+function sortScorecardsNewestFirst<T extends { scorecardMonth: string; employeeName: string }>(scorecards: T[]): T[] {
+  return [...scorecards].sort((a, b) =>
+    historyPeriodKey(b.scorecardMonth).localeCompare(historyPeriodKey(a.scorecardMonth)) || a.employeeName.localeCompare(b.employeeName)
+  );
 }
 
 function isQuarterLabel(label: string): boolean {
