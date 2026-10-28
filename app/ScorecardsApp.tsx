@@ -552,7 +552,7 @@ export default function ScorecardsApp() {
     period: "",
     search: "",
     location: "",
-    department: "",
+    departments: [],
     goal: "",
     employees: [],
     teamStatus: "current",
@@ -1445,7 +1445,7 @@ export default function ScorecardsApp() {
     return historyScorecards.filter((scorecard) => {
       if (historyFilters.period && scorecard.scorecardMonth !== historyFilters.period) return false;
       if (historyFilters.location && scorecard.location !== historyFilters.location) return false;
-      if (historyFilters.department && scorecard.department !== historyFilters.department) return false;
+      if (historyFilters.departments.length && !historyFilters.departments.includes(scorecard.department || "")) return false;
       if (historyFilters.goal && !scorecard.goals.some((goal) => goal.name === historyFilters.goal)) return false;
       if (historyFilters.employees.length && !historyFilters.employees.includes(scorecard.employeeName)) return false;
       if (historyFilters.search) {
@@ -7540,13 +7540,14 @@ function HistoryScreen(props: {
                     <SelectItem value="Remote">Remote</SelectItem>
                   </SelectContent>
                 </Select>
-                <Select value={props.filters.department || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, department: v === ALL_LOCATIONS ? "" : v })}>
-                  <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_LOCATIONS}>All departments</SelectItem>
-                    {departments.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <MultiSelectDropdown
+                  label="All departments"
+                  emptyLabel="All departments"
+                  triggerClassName="min-w-[8rem] text-[12px]"
+                  options={departments.map((d) => ({ value: d, label: d }))}
+                  selected={props.filters.departments}
+                  onChange={(values) => props.onFilters({ ...props.filters, departments: values.length === departments.length ? [] : values })}
+                />
                 <Select value={props.filters.goal || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, goal: v === ALL_LOCATIONS ? "" : v })}>
                   <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -7619,13 +7620,14 @@ function HistoryScreen(props: {
                     <SelectItem value="Remote">Remote</SelectItem>
                   </SelectContent>
                 </Select>
-                <Select value={props.filters.department || ALL_LOCATIONS} onValueChange={(v) => props.onFilters({ ...props.filters, department: v === ALL_LOCATIONS ? "" : v })}>
-                  <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_LOCATIONS}>All departments</SelectItem>
-                    {departments.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <MultiSelectDropdown
+                  label="All departments"
+                  emptyLabel="All departments"
+                  triggerClassName="min-w-[8rem] text-[12px]"
+                  options={departments.map((d) => ({ value: d, label: d }))}
+                  selected={props.filters.departments}
+                  onChange={(values) => props.onFilters({ ...props.filters, departments: values.length === departments.length ? [] : values })}
+                />
               </div>
             </section>
           )}
