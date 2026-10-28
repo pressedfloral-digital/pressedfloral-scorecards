@@ -185,7 +185,7 @@ export type HistoryFilters = {
   period: string;
   search: string;
   location: string;
-  department: string;
+  departments: string[];
   goal: string;
   employees: string[]; // empty = all employees
   teamStatus: "current" | "former" | "all"; // current = in the latest Rippling upload
