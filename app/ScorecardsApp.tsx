@@ -2356,7 +2356,7 @@ export default function ScorecardsApp() {
           {mode === "landing" && <DashboardScreen data={dashboard} profile={effectiveProfile} onMode={mountScreen} />}
           {mode === "personal" && (
             <div className="screen active">
-              <div style={{ maxWidth: "720px" }}>
+              <div>
                 <PersonalScorecardPanel
                   scorecards={myOwnScorecards}
                   employeeName={effectiveProfile?.linkedEmployeeName || ""}
@@ -2966,8 +2966,8 @@ function PersonalScorecardPanel({
 
       {/* Goals table */}
       {displayGoals.length > 0 ? (
-        <div className="overflow-x-auto">
-        <Table className="text-[12px] min-w-[640px]">
+        <div className="w-full">
+        <Table className="text-[12px] w-full">
           <TableHeader className="bg-muted/40 [&_th]:h-9 [&_th]:px-2.5 [&_th]:text-[10px] [&_th]:font-medium [&_th]:uppercase [&_th]:tracking-wide [&_th]:text-muted-foreground">
             <TableRow className="hover:bg-transparent">
               <TableHead className="w-[72px]">Type</TableHead>
