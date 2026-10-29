@@ -7319,7 +7319,7 @@ function HistoryScreen(props: {
   const [fromMonth, setFromMonth] = useState("");
   const [toMonth, setToMonth] = useState("");
   const [selLocation, setSelLocation] = useState("");
-  const [selDept, setSelDept] = useState("");
+  const [selDept, setSelDept] = useState<string[]>([]);
   const [metric, setMetric] = useState<"achievement" | "bonus" | "goal">("achievement");
   const [metricGoal, setMetricGoal] = useState("");
   const [groupBy, setGroupBy] = useState<"employee" | "department" | "location">("employee");
@@ -7414,7 +7414,7 @@ function HistoryScreen(props: {
       if (fromMonth && order < historyPeriodOrder(fromMonth)) return false;
       if (toMonth && order > historyPeriodOrder(toMonth)) return false;
       if (selLocation && sc.location !== selLocation) return false;
-      if (selDept && sc.department !== selDept) return false;
+      if (selDept.length && !selDept.includes(sc.department || "")) return false;
       if (selEmployees.length && !selEmployees.includes(sc.employeeName)) return false;
       return true;
     }),
@@ -7672,13 +7672,14 @@ function HistoryScreen(props: {
                 </Select>
               </ReportControl>
               <ReportControl label="Department">
-                <Select value={selDept || ALL_LOCATIONS} onValueChange={(v) => setSelDept(v === ALL_LOCATIONS ? "" : v)}>
-                  <SelectTrigger size="sm" className="min-w-[8rem] text-[12px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_LOCATIONS}>All departments</SelectItem>
-                    {allDepts.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <MultiSelectDropdown
+                  label="All departments"
+                  emptyLabel="All departments"
+                  triggerClassName="min-w-[8rem] text-[12px]"
+                  options={allDepts.map((d) => ({ value: d, label: d }))}
+                  selected={selDept}
+                  onChange={(values) => setSelDept(values.length === allDepts.length ? [] : values)}
+                />
               </ReportControl>
               <ReportControl label="Team members">
                 {teamStatusPicker}
