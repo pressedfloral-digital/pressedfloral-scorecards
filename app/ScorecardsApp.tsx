@@ -5762,11 +5762,13 @@ function ScorecardsScreen(props: {
                     filterDepts.length > 0 && filterDepts.length < teamDepts.length ? filterDepts.join(", ") : "",
                   ].filter(Boolean).join(" · ") || periodLabel}
             </span>
-            <div className="ml-auto flex gap-1">
-              <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setCardOpenOverride(true); setCardOpenNonce((n) => n + 1); }}>Open all</button>
-              <span className="text-[11px] text-muted-foreground">·</span>
-              <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setCardOpenOverride(false); setCardOpenNonce((n) => n + 1); }}>Close all</button>
-            </div>
+            {filteredEmployees.length <= 30 && (
+              <div className="ml-auto flex gap-1">
+                <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setCardOpenOverride(true); setCardOpenNonce((n) => n + 1); }}>Open all</button>
+                <span className="text-[11px] text-muted-foreground">·</span>
+                <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setCardOpenOverride(false); setCardOpenNonce((n) => n + 1); }}>Close all</button>
+              </div>
+            )}
           </div>
           <div className="scorecard-list" style={{ padding: 0 }}>
             {noRippling && (
@@ -7648,7 +7650,7 @@ function HistoryScreen(props: {
             </section>
           )}
           <section style={{ background: "transparent", border: "none", boxShadow: "none", padding: 0 }}>
-            {props.scorecards.length > 0 && (
+            {props.scorecards.length > 0 && props.scorecards.length <= 30 && (
               <div className="flex justify-end gap-1 px-0.5 pb-2">
                 <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setHistCardOpenOverride(true); setHistCardOpenNonce((n) => n + 1); }}>Open all</button>
                 <span className="text-[11px] text-muted-foreground">·</span>
