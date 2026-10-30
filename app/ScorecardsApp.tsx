@@ -5371,6 +5371,8 @@ function ScorecardsScreen(props: {
   const [directReportsOnly, setDirectReportsOnly] = useState(false);
   const [viewMode, setViewMode] = useState<"cards" | "progress">("cards");
   const [progressStatusFilter, setProgressStatusFilter] = useState<ScorecardCompletionStatus[]>([]);
+  const [cardOpenOverride, setCardOpenOverride] = useState<boolean | undefined>(undefined);
+  const [cardOpenNonce, setCardOpenNonce] = useState(0);
 
   // Deep-link from a "Go to scorecard" to-do: switch to the right period type/view, then
   // scroll to the target employee's card once it's rendered (double rAF — one to let the
@@ -5760,6 +5762,11 @@ function ScorecardsScreen(props: {
                     filterDepts.length > 0 && filterDepts.length < teamDepts.length ? filterDepts.join(", ") : "",
                   ].filter(Boolean).join(" · ") || periodLabel}
             </span>
+            <div className="ml-auto flex gap-1">
+              <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setCardOpenOverride(true); setCardOpenNonce((n) => n + 1); }}>Open all</button>
+              <span className="text-[11px] text-muted-foreground">·</span>
+              <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setCardOpenOverride(false); setCardOpenNonce((n) => n + 1); }}>Close all</button>
+            </div>
           </div>
           <div className="scorecard-list" style={{ padding: 0 }}>
             {noRippling && (
@@ -5822,6 +5829,8 @@ function ScorecardsScreen(props: {
                     isDirectReport={isDirectReport(emp)}
                     autoOpen={!!props.focusEmployeeKey && props.focusEmployeeKey === (emp.id || emp.name)}
                     autoOpenNonce={props.focusNonce}
+                    openOverride={cardOpenOverride}
+                    openOverrideNonce={cardOpenNonce}
                   />
                 </div>
               );
@@ -6126,7 +6135,7 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, isDirectReport, reviewChainIds, reviewerName, autoOpen, autoOpenNonce
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, isDirectReport, reviewChainIds, reviewerName, autoOpen, autoOpenNonce, openOverride, openOverrideNonce
 }: {
   employee: Employee;
   isoMonth: string;
@@ -6167,6 +6176,8 @@ function LiveScorecardCard({
   isDirectReport?: boolean; // whether the viewer is this team member's direct manager for the period
   autoOpen?: boolean;
   autoOpenNonce?: number;
+  openOverride?: boolean;
+  openOverrideNonce?: number;
 }) {
   // --- helpers for computing goalIds from settings + baseGoals ---
   function baseIdsForPeriod(pt: "monthly" | "quarterly"): string[] {
@@ -6357,7 +6368,7 @@ function LiveScorecardCard({
   // read-only review card takes over again.
   const displayedSubmitted = (submittedScorecard && submittedScorecard.reviewStatus !== "returned") ? submittedScorecard : lastSubmitted;
   if (displayedSubmitted) {
-    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} reviewerName={reviewerName} />;
+    return <ScorecardCard scorecard={displayedSubmitted} onDeleteGoal={onDeleteGoal} onApprove={onApprove} onReturn={onReturn} onReopen={onReturn} isAdmin={isAdmin} canReopen={isAdmin || !!reopenableEmployeeNames?.has(displayedSubmitted.employeeName)} currentUserProfileId={currentUserProfileId} reviewChainIds={reviewChainIds} reviewerName={reviewerName} openOverride={openOverride} openOverrideNonce={openOverrideNonce} />;
   }
   const returnedScorecard = !lastSubmitted && submittedScorecard?.reviewStatus === "returned" ? submittedScorecard : null;
   // Under the minimum-hours threshold: the card stays visible with a "Not Eligible" badge but
@@ -6991,7 +7002,7 @@ function Metric({ label, value, highlight }: { label: string; value: string; hig
   return <div className="metric-card"><div className="mlabel">{label}</div><div className={`mval ${highlight ? "highlight" : ""}`}>{value}</div></div>;
 }
 
-function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName }: {
+function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName, openOverride, openOverrideNonce }: {
   scorecard: Scorecard;
   onDeleteGoal: (value: { scorecardId: string; goalName: string }) => void;
   onApprove: (scorecardId: string) => void;
@@ -7008,8 +7019,11 @@ function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen,
   // viewer's own supervisor, since that's who any scorecard they (or their reports) submit
   // routes to. Shown on the "Pending Review" state in Team Scorecards.
   reviewerName?: string;
+  openOverride?: boolean;
+  openOverrideNonce?: number;
 }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => { if (openOverride !== undefined) setOpen(openOverride); }, [openOverrideNonce]); // eslint-disable-line react-hooks/exhaustive-deps
   const [returning, setReturning] = useState(false);
   const [returnNote, setReturnNote] = useState("");
   const [reopening, setReopening] = useState(false);
@@ -7323,6 +7337,8 @@ function HistoryScreen(props: {
   const [metric, setMetric] = useState<"achievement" | "bonus" | "goal">("achievement");
   const [metricGoal, setMetricGoal] = useState("");
   const [groupBy, setGroupBy] = useState<"employee" | "department" | "location">("employee");
+  const [histCardOpenOverride, setHistCardOpenOverride] = useState<boolean | undefined>(undefined);
+  const [histCardOpenNonce, setHistCardOpenNonce] = useState(0);
   // The range options change with the scorecard type (months vs quarters), so start over.
   useEffect(() => { setFromMonth(""); setToMonth(""); }, [props.filters.periodType]);
 
@@ -7632,7 +7648,14 @@ function HistoryScreen(props: {
             </section>
           )}
           <section style={{ background: "transparent", border: "none", boxShadow: "none", padding: 0 }}>
-            <div className="scorecard-list" style={{ padding: 0 }}>{props.scorecards.map((sc) => <ScorecardCard key={sc.id} scorecard={sc} onDeleteGoal={() => {}} onApprove={() => {}} onReturn={() => {}} />)}</div>
+            {props.scorecards.length > 0 && (
+              <div className="flex justify-end gap-1 px-0.5 pb-2">
+                <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setHistCardOpenOverride(true); setHistCardOpenNonce((n) => n + 1); }}>Open all</button>
+                <span className="text-[11px] text-muted-foreground">·</span>
+                <button className="text-[11px] text-muted-foreground hover:text-foreground transition-colors" onClick={() => { setHistCardOpenOverride(false); setHistCardOpenNonce((n) => n + 1); }}>Close all</button>
+              </div>
+            )}
+            <div className="scorecard-list" style={{ padding: 0 }}>{props.scorecards.map((sc) => <ScorecardCard key={sc.id} scorecard={sc} onDeleteGoal={() => {}} onApprove={() => {}} onReturn={() => {}} openOverride={histCardOpenOverride} openOverrideNonce={histCardOpenNonce} />)}</div>
             {!props.scorecards.length && <div className="px-4 py-6 text-center text-[13px] text-muted-foreground">No scorecards match the current filters.</div>}
           </section>
         </>
