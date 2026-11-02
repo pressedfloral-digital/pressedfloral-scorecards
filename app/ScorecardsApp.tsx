@@ -7004,7 +7004,7 @@ function Metric({ label, value, highlight }: { label: string; value: string; hig
   return <div className="metric-card"><div className="mlabel">{label}</div><div className={`mval ${highlight ? "highlight" : ""}`}>{value}</div></div>;
 }
 
-function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName, openOverride, openOverrideNonce }: {
+function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName, openOverride, openOverrideNonce, openOverrideIndex }: {
   scorecard: Scorecard;
   onDeleteGoal: (value: { scorecardId: string; goalName: string }) => void;
   onApprove: (scorecardId: string) => void;
