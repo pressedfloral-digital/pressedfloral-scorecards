@@ -6136,7 +6136,8 @@ function GoalRowMenu({ goalName, currentWeight, onApplyWeight, onRemove }: {
 }
 
 function LiveScorecardCard({
-  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, isDirectReport, reviewChainIds, reviewerName, autoOpen, autoOpenNonce, openOverride, openOverrideNonce, openOverrideIndex
+  employee, isoMonth, month, baseGoals, allGoals, periodActuals, allRippling, submittedScorecard, globalPeriodType, forcePeriodType, payrollAvailable, empSettings, onSettingsChange, onSubmit, onDeleteGoal, onApprove, onReturn, onSaveGoal, onSaveTargetPair, onSaveProrate, overrideControls, teamEmployees, isAdmin, companyGoalAccess, allowedDepartments, allowedLocations, reopenableEmployeeNames, currentUserEmail, currentUserProfileId, isDirectReport, reviewChainIds, reviewerName, autoOpen, autoOpenNonce, openOverride, openOverrideNonce,
+  openOverrideIndex
 }: {
   employee: Employee;
   isoMonth: string;
@@ -6210,6 +6211,11 @@ function LiveScorecardCard({
     if (autoOpen) setOpen(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoOpen, autoOpenNonce]);
+  useEffect(() => {
+    if (openOverride === undefined) return;
+    const t = setTimeout(() => setOpen(openOverride), (openOverrideIndex ?? 0) * 15);
+    return () => clearTimeout(t);
+  }, [openOverrideNonce]); // eslint-disable-line react-hooks/exhaustive-deps
   const [creatingGoal, setCreatingGoal] = useState<Goal | null>(null);
   const [addingGoals, setAddingGoals] = useState(false);
   const ratioTierTargets = React.useContext(RatioTierTargetsContext);
@@ -7004,7 +7010,7 @@ function Metric({ label, value, highlight }: { label: string; value: string; hig
   return <div className="metric-card"><div className="mlabel">{label}</div><div className={`mval ${highlight ? "highlight" : ""}`}>{value}</div></div>;
 }
 
-function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName, openOverride, openOverrideNonce }: {
+function ScorecardCard({ scorecard, onDeleteGoal, onApprove, onReturn, onReopen, isAdmin, canReopen, currentUserProfileId, reviewChainIds, reviewerName, openOverride, openOverrideNonce, openOverrideIndex }: {
   scorecard: Scorecard;
   onDeleteGoal: (value: { scorecardId: string; goalName: string }) => void;
   onApprove: (scorecardId: string) => void;
