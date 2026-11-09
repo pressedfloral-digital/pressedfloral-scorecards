@@ -20,7 +20,7 @@ import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/report
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
-import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, isBelowMinHours, isFinalizedForHistory, opsScorecardHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
+import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, flagRipplingManagers, isBelowMinHours, isFinalizedForHistory, opsScorecardHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { PAY_SKIP_LABELS, buildPayReport, changePct, entriesForMonth, entriesForYear, payTotals, payrollLookupFromRippling, reportYears, type PayReportEntry, type PaySkipReason, type PayTotals } from "../lib/payReport";
 import { baseEarnings, buildScorecard, calculateGoal, formatCurrency, formatNumber, refreshScorecardEarnings, scorecardPayrollMonths, sumQuarterlyEmployee, type EditableGoal } from "../lib/score";
 import {
@@ -271,7 +271,8 @@ function metaKey(type: "target" | "min", goal: Pick<Goal, "goalTier" | "location
 // Employees who worked fewer than MIN_HOURS_FOR_SCORECARD hours in the period don't need a
 // scorecard — they're excluded from "not submitted" counts/todos and shown as "Not Eligible"
 // rather than flagged as outstanding work. Their scorecard card is locked (can't be opened or
-// edited). Production team members' hours come from Ops Dashboard (see scorecardHours).
+// edited). Production team members' hours come from Ops Dashboard, except managers', which come
+// from the Rippling upload (see scorecardHours).
 
 // Company-wide ratio targets by department × seniority (admin-editable in Users & Settings),
 // used for the cross-department Individual Ratio split — see lib/crossDeptRatio.ts.
@@ -571,7 +572,8 @@ export default function ScorecardsApp() {
 
   useEffect(() => {
     if (isFixture) {
-      const hydrated = hydrateFromLocalStorage(cloneData(fixtureData));
+      const stored = hydrateFromLocalStorage(cloneData(fixtureData));
+      const hydrated = { ...stored, rippling: Object.fromEntries(Object.entries(stored.rippling).map(([period, rows]) => [period, flagRipplingManagers(rows)])) };
       setAppData(hydrated);
       setProfile(hydrated.profile);
       setCurrentUserEmail(hydrated.profile.email);
@@ -906,6 +908,7 @@ export default function ScorecardsApp() {
         const [emp] = applyEmployeeOverrides(period, [employeeFromRow(row)], employeeOverrides);
         rippling[period] = [...(rippling[period] || []), emp];
       }
+      for (const period of Object.keys(rippling)) rippling[period] = flagRipplingManagers(rippling[period]);
 
       const actualsByPeriod: Record<string, Record<string, any>[]> = {};
       for (const row of actualsResult.data || []) {
@@ -952,6 +955,7 @@ export default function ScorecardsApp() {
       rippling[period] = [...(rippling[period] || []), emp];
       allEmployees.push(emp);
     }
+    for (const period of Object.keys(rippling)) rippling[period] = flagRipplingManagers(rippling[period]);
 
     // Group actuals rows by period and convert to ActualsByKey maps
     const actualsByPeriod: Record<string, Record<string, any>[]> = {};
@@ -1988,7 +1992,8 @@ export default function ScorecardsApp() {
     setAppData((c) => ({ ...c, actuals: { ...c.actuals, [DEACT_PERIOD]: next } }));
   }
 
-  async function saveRipplingForMonth(month: string, employees: Employee[]) {
+  async function saveRipplingForMonth(month: string, uploadedEmployees: Employee[]) {
+    const employees = flagRipplingManagers(uploadedEmployees);
     if (!isFixture && sb) {
       const deleteResult = await sb.from("rippling_employees").delete().eq("period", month);
       if (deleteResult.error) {
@@ -5888,7 +5893,7 @@ function ScorecardsScreen(props: {
                   if (filterDepts.length > 0 && !filterDepts.includes(e.department)) return false;
                   if (filterLocations.length > 0 && !filterLocations.includes(e.location)) return false;
                   if (leftBeforeMonth(props.allActuals, e.name, m) && lastDayStillApplies(e, employeeLastDay(props.allActuals, e.name)!)) return false;
-                  if (hideIneligible && !hasSubmittedScorecard(e.name, mLabel) && isBelowMinHours(scorecardHours({ name: e.name, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
+                  if (hideIneligible && !hasSubmittedScorecard(e.name, mLabel) && isBelowMinHours(scorecardHours({ name: e.name, isManager: e.isManager, hoursWorked: e.manual ? e.hoursWorked : (props.rippling[m] || []).find((r) => r.name === e.name)?.hoursWorked }, props.allActuals[formatMonthLabel(m)]))) return false;
                   if (directOnly && !isDirectReport(e, m)) return false;
                   if (hideCompleted) {
                     const sc = props.scorecards.find((s) => s.employeeName === e.name && s.scorecardMonth === mLabel);

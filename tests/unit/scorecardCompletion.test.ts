@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeScorecardCompletion, isFinalizedForHistory, scorecardHours } from "../../lib/scorecardCompletion";
+import { computeScorecardCompletion, flagRipplingManagers, isFinalizedForHistory, scorecardHours } from "../../lib/scorecardCompletion";
 import { opsHoursKey } from "../../lib/crossDeptRatio";
 import type { Employee, EmployeeScorecardSettings, Goal, Scorecard } from "../../lib/types";
 
@@ -110,6 +110,16 @@ describe("computeScorecardCompletion", () => {
     expect(opsOver.status).not.toBe("no_scorecard_required");
   });
 
+  it("uses Rippling hours, not Ops Dashboard's, for managers", () => {
+    const manager = { ...employee, isManager: true, hoursWorked: 168 };
+    const actuals = { [opsHoursKey(employee.name)]: 12 };
+    expect(scorecardHours(manager, actuals)).toBe(168);
+    expect(computeScorecardCompletion({ ...baseInput, employee: manager, actuals }).status).not.toBe("no_scorecard_required");
+
+    const partTimeManager = { ...manager, hoursWorked: 30 };
+    expect(computeScorecardCompletion({ ...baseInput, employee: partTimeManager, actuals: { [opsHoursKey(employee.name)]: 60 } }).status).toBe("no_scorecard_required");
+  });
+
   it("excludes a goal via employee settings even though it's in the base set", () => {
     const settings: EmployeeScorecardSettings = {
       id: "settings-1",
@@ -173,5 +183,22 @@ describe("isFinalizedForHistory", () => {
     expect(isFinalizedForHistory({ reviewStatus: undefined })).toBe(true);
     expect(isFinalizedForHistory({ reviewStatus: "pending_review" })).toBe(false);
     expect(isFinalizedForHistory({ reviewStatus: "returned" })).toBe(false);
+  });
+});
+
+describe("flagRipplingManagers", () => {
+  const row = (name: string, manager?: string, extra: Partial<Employee> = {}): Employee =>
+    ({ id: name, name, role: "", department: "Design", location: "Utah", payType: "hourly", manager, ...extra });
+
+  it("flags anyone the upload's Manager column names, and no one else", () => {
+    const flagged = flagRipplingManagers([row("Lead", "Director"), row("Ava", "Lead"), row("Director"), row("Solo", undefined, { isManager: true })]);
+    expect(Object.fromEntries(flagged.map((e) => [e.name, e.isManager]))).toEqual({ Lead: true, Ava: false, Director: true, Solo: false });
+  });
+
+  it("uses the uploaded manager, not an admin override", () => {
+    const moved = row("Ava", "New Lead", { uploaded: { department: "Design", manager: "Lead" } });
+    const flagged = flagRipplingManagers([row("Lead"), row("New Lead"), moved]);
+    expect(flagged.find((e) => e.name === "Lead")?.isManager).toBe(true);
+    expect(flagged.find((e) => e.name === "New Lead")?.isManager).toBe(false);
   });
 });

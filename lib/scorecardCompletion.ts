@@ -22,10 +22,27 @@ export const MIN_HOURS_FOR_SCORECARD = 40;
 
 // Hours a month's scorecard counts for an employee. Production team members (anyone Ops Dashboard
 // tracks) use Ops Dashboard's hours for the business month — weeks bucketed by their Monday — so
-// eligibility matches their KPIs; everyone else uses the Rippling upload's hours. Pay is unaffected:
-// earnings always come from Rippling. `monthActuals` is that month's actuals map.
-export function scorecardHours(employee: Pick<Employee, "name" | "hoursWorked">, monthActuals: ActualsByKey | undefined): number | undefined {
+// eligibility matches their KPIs; managers and everyone else use the Rippling upload's hours. Pay is
+// unaffected: earnings always come from Rippling. `monthActuals` is that month's actuals map.
+export function scorecardHours(employee: Pick<Employee, "name" | "hoursWorked" | "isManager">, monthActuals: ActualsByKey | undefined): number | undefined {
+  if (employee.isManager) return employee.hoursWorked;
   return opsScorecardHours(employee.name, monthActuals) ?? employee.hoursWorked;
+}
+
+// Sets isManager on one month's Rippling rows: true for anyone that upload's Manager column names
+// (as uploaded, before admin overrides). Managers' scorecard hours then come from Rippling rather
+// than Ops Dashboard, which only covers the time they clock into production. Derived from the
+// stored Manager column so it's the same before and after a reload.
+export function flagRipplingManagers(employees: Employee[]): Employee[] {
+  const managerNames = new Set<string>();
+  for (const emp of employees) {
+    const manager = (emp.uploaded ? emp.uploaded.manager : emp.manager)?.trim();
+    if (manager) managerNames.add(manager);
+  }
+  return employees.map((emp) => {
+    const isManager = managerNames.has(emp.name);
+    return emp.isManager === isManager ? emp : { ...emp, isManager };
+  });
 }
 
 // Production team members whose Ops Dashboard hours don't cover their real time worked (e.g. most
