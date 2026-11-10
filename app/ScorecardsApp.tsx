@@ -19,6 +19,7 @@ import { currentMonthValue, formatMonthLabel, monthValueFromLabel, nextMonthValu
 import { getReportingTree, latestRowInQuarter, profileNode } from "../lib/reportingTree";
 import { activeOverride, applyEmployeeOverrides, applyEmployeeOverridesToAll, employeeOverrideFromRow, employeeOverrideToRow } from "../lib/employeeOverrides";
 import { lockMonthStartProfiles, unlockMonthStartProfile } from "../lib/monthStartLock";
+import { findMissingSalaried, withCarriedForward, type MissingSalaried, type MissingSalariedDecision } from "../lib/ripplingCarryForward";
 import { LEAVE_UNASSIGNED, applyManagerChoices, describeIssue, normalizePersonName, resolveUploadManagers, type AssignableUser, type ManagerIssue } from "../lib/managerAssignment";
 import { MIN_HOURS_FOR_SCORECARD, computeScorecardCompletion, flagRipplingManagers, isBelowMinHours, isFinalizedForHistory, opsScorecardHours, personalActualKey, scorecardHours, type ScorecardCompletion, type ScorecardCompletionStatus } from "../lib/scorecardCompletion";
 import { PAY_SKIP_LABELS, buildPayReport, changePct, entriesForMonth, entriesForYear, payTotals, payrollLookupFromRippling, reportYears, type PayReportEntry, type PaySkipReason, type PayTotals } from "../lib/payReport";
@@ -476,6 +477,8 @@ export default function ScorecardsApp() {
   // hide goals from that person's own scorecard, so it's tracked separately here.
   const [myGoals, setMyGoals] = useState<Goal[]>(() => cloneData(fixtureData).goals);
   const [toast, setToast] = useState<{ message: string; type?: "success" | "error" } | null>(null);
+  // A Rippling upload waiting on the uploader: salaried employees from the previous month are missing from it.
+  const [pendingMissingSalaried, setPendingMissingSalaried] = useState<{ month: string; employees: Employee[]; missing: MissingSalaried[] } | null>(null);
   const [adminUsers, setAdminUsers] = useState<AdminManagedUser[]>([]);
   const [adminUsersLoading, setAdminUsersLoading] = useState(false);
   const [viewAsProfile, setViewAsProfile] = useState<ManagerProfile | null>(null);
@@ -1960,39 +1963,80 @@ export default function ScorecardsApp() {
   }
 
   async function deactivateEmployee(employeeName: string, isoMonth: string, mode: "month" | "from" | "reactivate") {
+    return deactivateEmployees([{ employeeName, mode }], isoMonth);
+  }
+
+  // One write for several people, so a batch (e.g. from a Rippling upload) can't overwrite itself.
+  async function deactivateEmployees(entries: { employeeName: string; mode: "month" | "from" | "reactivate" }[], isoMonth: string): Promise<boolean> {
     const current = appData.actuals[DEACT_PERIOD] || {};
     const rows: { period: string; goal_tier: string; location: null; department: null; goal_name: string; actual_value: number | null }[] = [];
 
-    if (mode === "month") {
-      rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: deactMonthKey(employeeName, isoMonth), actual_value: 1 });
-      if (current[deactFromKey(employeeName)] != null)
-        rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: deactFromKey(employeeName), actual_value: null });
-    } else if (mode === "from") {
-      rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: deactFromKey(employeeName), actual_value: isoMonthToNum(isoMonth) });
-      for (const key of Object.keys(current)) {
-        if (key.startsWith("__inactive_month__") && key.endsWith(`|${employeeName}`))
-          rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: key, actual_value: null });
-      }
-    } else {
-      for (const key of Object.keys(current)) {
-        if (key === deactFromKey(employeeName) || (key.startsWith("__inactive_month__") && key.endsWith(`|${employeeName}`)))
-          rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: key, actual_value: null });
+    for (const { employeeName, mode } of entries) {
+      if (mode === "month") {
+        rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: deactMonthKey(employeeName, isoMonth), actual_value: 1 });
+        if (current[deactFromKey(employeeName)] != null)
+          rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: deactFromKey(employeeName), actual_value: null });
+      } else if (mode === "from") {
+        rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: deactFromKey(employeeName), actual_value: isoMonthToNum(isoMonth) });
+        for (const key of Object.keys(current)) {
+          if (key.startsWith("__inactive_month__") && key.endsWith(`|${employeeName}`))
+            rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: key, actual_value: null });
+        }
+      } else {
+        for (const key of Object.keys(current)) {
+          if (key === deactFromKey(employeeName) || (key.startsWith("__inactive_month__") && key.endsWith(`|${employeeName}`)))
+            rows.push({ period: DEACT_PERIOD, goal_tier: "__meta__", location: null, department: null, goal_name: key, actual_value: null });
+        }
       }
     }
+    if (rows.length === 0) return true;
 
     if (!isFixture && sb) {
       const result = await sb.from("actuals").upsert(rows, { onConflict: "period,goal_tier,location,department,goal_name" });
-      if (result.error) { showSupabaseError(result.error, "Could not save scorecard deactivation."); return; }
+      if (result.error) { showSupabaseError(result.error, "Could not save scorecard deactivation."); return false; }
     }
 
-    const next = { ...current };
-    for (const row of rows) {
-      if (row.actual_value == null) delete next[row.goal_name]; else next[row.goal_name] = row.actual_value;
-    }
-    setAppData((c) => ({ ...c, actuals: { ...c.actuals, [DEACT_PERIOD]: next } }));
+    setAppData((c) => {
+      const next = { ...(c.actuals[DEACT_PERIOD] || {}) };
+      for (const row of rows) {
+        if (row.actual_value == null) delete next[row.goal_name]; else next[row.goal_name] = row.actual_value;
+      }
+      return { ...c, actuals: { ...c.actuals, [DEACT_PERIOD]: next } };
+    });
+    return true;
   }
 
+  // Salaried employees in the previous month's upload but not this one are asked about before
+  // saving; see lib/ripplingCarryForward.ts.
   async function saveRipplingForMonth(month: string, uploadedEmployees: Employee[]) {
+    const deactivations = appData.actuals[DEACT_PERIOD] || {};
+    const missing = findMissingSalaried(appData.rippling, month, uploadedEmployees, (name) => {
+      const fromNum = deactivations[deactFromKey(name)];
+      return fromNum != null && Number(fromNum) <= isoMonthToNum(month);
+    });
+    if (missing.length > 0) {
+      setPendingMissingSalaried({ month, employees: uploadedEmployees, missing });
+      return;
+    }
+    await writeRipplingForMonth(month, uploadedEmployees);
+  }
+
+  async function finishMissingSalaried(decisions: Record<string, MissingSalariedDecision>) {
+    const pending = pendingMissingSalaried;
+    if (!pending) return;
+    const deactivate = pending.missing
+      .map((m) => ({ employeeName: m.employee.name, mode: decisions[m.employee.name] ?? "keep" }))
+      .filter((d): d is { employeeName: string; mode: "month" | "from" } => d.mode !== "keep");
+    if (deactivate.length > 0 && !(await deactivateEmployees(deactivate, pending.month))) return;
+    setPendingMissingSalaried(null);
+    const kept = pending.missing.length - deactivate.length;
+    await writeRipplingForMonth(pending.month, withCarriedForward(pending.employees, pending.missing, decisions), [
+      kept > 0 ? `carried forward ${kept} salaried employee${kept === 1 ? "" : "s"} from the previous month` : "",
+      deactivate.length > 0 ? `deactivated ${deactivate.length} scorecard${deactivate.length === 1 ? "" : "s"}` : ""
+    ]);
+  }
+
+  async function writeRipplingForMonth(month: string, uploadedEmployees: Employee[], extraNotes: string[] = []) {
     const employees = flagRipplingManagers(uploadedEmployees);
     if (!isFixture && sb) {
       const deleteResult = await sb.from("rippling_employees").delete().eq("period", month);
@@ -2012,6 +2056,7 @@ export default function ScorecardsApp() {
     const held = lockMonthStartProfiles({ ...appData.rippling, [month]: applyEmployeeOverrides(month, employees, appData.employeeOverrides) })[month]
       .filter((e) => e.monthStartHeld).length;
     const notes = [
+      ...extraNotes,
       refreshed > 0 ? `updated earnings on ${refreshed} submitted scorecard${refreshed === 1 ? "" : "s"}` : "",
       held > 0 ? `${held} mid-month title/department change${held === 1 ? "" : "s"} will apply from ${formatMonthLabel(nextIsoMonth(month))}` : ""
     ].filter(Boolean);
@@ -2568,6 +2613,14 @@ export default function ScorecardsApp() {
           {mode === "migrate" && <MigrateScreen />}
         </main>
       </AppShell>
+      {pendingMissingSalaried && (
+        <MissingSalariedModal
+          month={pendingMissingSalaried.month}
+          missing={pendingMissingSalaried.missing}
+          onSave={finishMissingSalaried}
+          onCancel={() => setPendingMissingSalaried(null)}
+        />
+      )}
       <div className={`toast ${toast ? `show ${toast.type || ""}` : ""}`}>{toast?.message}</div>
       {deleteModal && (
         <DeleteScorecardGoalModal
@@ -10185,6 +10238,82 @@ function WhatIfScreen(props: {
 function MigrateScreen() {
   return (
     <div className="screen active"><section><div className="section-title">Migrate Local Data to Supabase</div><p>This React version preserves the same legacy localStorage keys. Use this only from a browser that contains the original local data.</p><button className="submit-btn" onClick={() => alert("Migration uses the preserved Supabase table contracts and should be run only after a real Supabase smoke test.")}>Start Migration</button></section></div>
+  );
+}
+
+// Pop-up shown before a Rippling upload is saved when salaried employees from the previous
+// month are missing from it. Each must be answered: keep (carried forward unchanged), deactivate
+// their scorecard for just this month, or for this month and every month after.
+function MissingSalariedModal(props: {
+  month: string;
+  missing: MissingSalaried[];
+  onSave: (decisions: Record<string, MissingSalariedDecision>) => Promise<void> | void;
+  onCancel: () => void;
+}) {
+  const [decisions, setDecisions] = useState<Record<string, MissingSalariedDecision>>({});
+  const [saving, setSaving] = useState(false);
+  const monthLabel = formatMonthLabel(props.month);
+  const answered = props.missing.filter((m) => decisions[m.employee.name]).length;
+  const options: { value: MissingSalariedDecision; label: string }[] = [
+    { value: "keep", label: "No, keep their scorecard" },
+    { value: "month", label: `Deactivate for ${monthLabel} only` },
+    { value: "from", label: `Deactivate for ${monthLabel} and all future months` }
+  ];
+
+  async function save() {
+    setSaving(true);
+    try { await props.onSave(decisions); } finally { setSaving(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-labelledby="missing-salaried-title">
+      <div className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl">
+        <div className="border-b border-border px-5 py-4">
+          <div id="missing-salaried-title" className="text-[15px] font-semibold text-foreground">Salaried employees missing from the {monthLabel} upload</div>
+          <p className="mt-1 text-[12.5px] text-muted-foreground">
+            Anyone you keep is carried forward with the same title, department, location, manager and salary as their last upload.
+          </p>
+        </div>
+        <div className="flex-1 divide-y divide-border overflow-y-auto">
+          {props.missing.map(({ employee, fromMonth }) => {
+            const choice = decisions[employee.name];
+            return (
+              <div key={employee.name} className={cn("px-5 py-3.5", !choice && "bg-destructive/5")}>
+                <p className="text-[13px] text-foreground">
+                  <span className="font-semibold">{employee.name}</span> was not found in the rippling data upload for {monthLabel}. Do you want to deactivate their scorecard?
+                </p>
+                <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                  {[employee.role, employee.department, employee.location, employee.annualPay ? `${formatCurrency(employee.annualPay)}/yr` : ""].filter(Boolean).join(" · ")} — last in {formatMonthLabel(fromMonth)}
+                </div>
+                <div className="mt-2 flex flex-wrap gap-2" role="radiogroup" aria-label={`${employee.name} scorecard`}>
+                  {options.map((o) => (
+                    <Button
+                      key={o.value}
+                      type="button"
+                      size="sm"
+                      role="radio"
+                      aria-checked={choice === o.value}
+                      variant={choice === o.value ? "default" : "outline"}
+                      className="h-8 text-[12px]"
+                      onClick={() => setDecisions((d) => ({ ...d, [employee.name]: o.value }))}
+                    >
+                      {o.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-3">
+          <span className="text-[12.5px] text-muted-foreground">{answered} of {props.missing.length} answered</span>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" className="text-[12px]" disabled={saving} onClick={props.onCancel}>Cancel upload</Button>
+            <Button size="sm" disabled={saving || answered < props.missing.length} onClick={save}>{saving ? "Saving…" : "Save upload"}</Button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
